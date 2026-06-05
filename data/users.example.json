@@ -1,0 +1,18 @@
+{
+  "users": [
+    {
+      "id": "user-admin",
+      "name": "Project Admin",
+      "email": "admin@moddular.local",
+      "role": "admin",
+      "password_hash": "5c06eb3d5a05a19f49476d694ca81a36344660e9d5b98e3d6a6630f31c2422e7"
+    },
+    {
+      "id": "user-member",
+      "name": "Project Member",
+      "email": "member@moddular.local",
+      "role": "member",
+      "password_hash": "e27293f621c392b8c9febe251a8fceb6f4fbbe5ebef61190056ddad2764f6779"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "modular-graph": {
+      "command": "python",
+      "args": ["-m", "moddular_graph.mcp_server"],
+      "cwd": "D:\\02.AI 코딩\\20.Moddular Graph",
+      "env": {
+        "MODDULAR_GRAPH_ROOT": "D:\\02.AI 코딩\\20.Moddular Graph"
+      }
+    }
+  }
+}

@@ -1,0 +1,16 @@
+node_modules
+dist
+.pytest_cache
+__pycache__
+*.log
+*.sqlite3
+*.sqlite3-*
+*.db
+*.zip
+google_drive_staging
+data
+tools/*.exe
+backups
+original file
+*.tar.gz
+*.pdf

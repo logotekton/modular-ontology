@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "manus-harness"
+version = "1.3.8"
+description = "Local Manus-style agent harness core engine and design harness."
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.93.0,<2.0.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+    "pydantic>=2.0.0",
+    "python-multipart>=0.0.9",
+    "Pillow>=10.0.0,<12.0.0",
+    "mcp>=1.9.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["manus_harness*", "moddular_graph*"]

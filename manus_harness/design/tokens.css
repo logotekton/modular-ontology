@@ -1,0 +1,43 @@
+/**
+ * Manus UI Design Harness - Global CSS Motion & Tactile Tokens
+ * 
+ * AI Slop(양산형 템플릿)의 느리고 밋밋한 트랜지션을 금지하고,
+ * 물리 법칙에 기반한 탄성적이고 반응성이 극대화된 모션을 전역 주입합니다.
+ */
+
+@theme inline {
+  /* 1. 물리 기반 커스텀 이징 (Cubic-Bezier) 정의 */
+  --ease-snappy-out: cubic-bezier(0.23, 1, 0.32, 1);    /* 진입 및 즉각 반응용 */
+  --ease-elastic-out: cubic-bezier(0.34, 1.56, 0.64, 1); /* 탄성 바운스 피드백용 */
+  --ease-smooth-in-out: cubic-bezier(0.77, 0, 0.175, 1); /* 크기 변형 및 이동용 */
+
+  /* 2. 촉각 트랜지션 지속시간 정의 */
+  --duration-tactile-press: 120ms;
+  --duration-tactile-release: 180ms;
+  --duration-menu-reveal: 200ms;
+  --duration-modal-fade: 250ms;
+}
+
+/* 3. 촉각 반응 유틸리티 클래스 (Tactile Feedback Helper) */
+.tactile-press-effect {
+  transition: transform var(--duration-tactile-release) var(--ease-snappy-out),
+              opacity var(--duration-tactile-release) var(--ease-snappy-out);
+}
+
+.tactile-press-effect:active {
+  transform: scale(0.97);
+  opacity: 0.92;
+  transition-duration: var(--duration-tactile-press);
+}
+
+/* 4. 미세 기하 격자망 (Subtle Grid Texture) - 네오 테크니컬 디자인 메타포 */
+.harness-grid-bg {
+  background-size: 24px 24px;
+  background-image: linear-gradient(to right, rgba(0, 0, 0, 0.03) 1px, transparent 1px),
+                    linear-gradient(to bottom, rgba(0, 0, 0, 0.03) 1px, transparent 1px);
+}
+
+.dark .harness-grid-bg {
+  background-image: linear-gradient(to right, rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+                    linear-gradient(to bottom, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+}
