@@ -26,3 +26,5 @@ backups/
 original file/
 *.tar.gz
 *.pdf
+
+.vercel

@@ -2,8 +2,8 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "functions": {
-    "api/index.py": {
-      "runtime": "python3.12"
+    "api/**/*.py": {
+      "excludeFiles": "{tests/**,__tests__/**,**/*.test.py,fixtures/**,__fixtures__/**,testdata/**,sample-data/**,docs/**,manus_harness/**,scripts/**,tools/**,google_drive_staging/**,backups/**,original file/**,dist/**,node_modules/**}"
     }
   },
   "rewrites": [

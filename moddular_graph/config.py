@@ -5,7 +5,8 @@ from pathlib import Path
 
 
 ROOT = Path(os.environ.get("MODDULAR_GRAPH_ROOT", Path(__file__).resolve().parents[1])).resolve()
-DATA_DIR = Path(os.environ.get("MODDULAR_GRAPH_DATA_DIR", ROOT / "data")).resolve()
+DEFAULT_DATA_DIR = Path("/tmp/modular-ontology") if os.environ.get("VERCEL") else ROOT / "data"
+DATA_DIR = Path(os.environ.get("MODDULAR_GRAPH_DATA_DIR", DEFAULT_DATA_DIR)).resolve()
 USE_STRUCTURED_DATA_DIR = (
     os.environ.get("MODDULAR_GRAPH_STRUCTURED_DATA_DIR") == "1"
     or (DATA_DIR / "01_Database").exists()
