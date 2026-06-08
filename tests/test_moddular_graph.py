@@ -838,6 +838,43 @@ def test_local_graph_rag_answers_module_weight_when_document_search_misses(tmp_p
     assert answer["graphContext"]["facts"][0]["total_weight_kg"] == 5800.246
 
 
+def test_korean_question_retrieves_grounded_context(tmp_path) -> None:
+    db_path = tmp_path / "korean-index.sqlite3"
+    index_all_packs(db_path=db_path)
+
+    # Natural-language Korean must surface evidence (token/bigram search), not the
+    # old whole-phrase substring behavior that returned nothing.
+    weight = answer_pack_question(
+        "advance-steel-samcheok-bldg-b-bm25-evidence-pack",
+        "가장 무거운 모듈은 무엇이고 중량은 얼마야?",
+        limit=6,
+        db_path=db_path,
+    )
+    assert weight["evidence"]
+    assert any(fact.get("kind") == "module_weight_list" for fact in weight["graphContext"]["facts"])
+
+    beam = answer_pack_question(
+        "advance-steel-samcheok-bldg-b-bm25-evidence-pack",
+        "보 부재의 단면 정보를 알려줘",
+        limit=6,
+        db_path=db_path,
+    )
+    assert beam["evidence"] or beam["graphContext"]["nodes"]
+
+
+def test_vague_question_falls_back_to_pack_context_for_every_pack(tmp_path) -> None:
+    db_path = tmp_path / "fallback-index.sqlite3"
+    index_all_packs(db_path=db_path)
+
+    for pack_id in (
+        "advance-steel-samcheok-bldg-b-bm25-evidence-pack",
+        "revit-yeoju-ar-ifc-workset-module-localcrab-pack",
+    ):
+        answer = answer_pack_question(pack_id, "이 프로젝트 개요를 설명해줘", limit=6, db_path=db_path)
+        # Every pack must hand the LLM something grounded to reason over.
+        assert answer["evidence"] or answer["graphContext"]["nodes"]
+
+
 def test_openai_graph_rag_path_uses_injected_client(monkeypatch, tmp_path) -> None:
     class FakeResponse:
         output_text = "Synthesized answer from provided ontology evidence."
@@ -920,7 +957,7 @@ def test_ollama_chat_request_uses_token_and_message_content(monkeypatch) -> None
     assert calls[0]["url"] == "https://ai.example.test/api/chat"
     assert calls[0]["payload"]["model"] == "gemma4:12b-it-q4_K_M"
     assert calls[0]["payload"]["think"] is False
-    assert calls[0]["payload"]["options"]["num_predict"] == 512
+    assert calls[0]["payload"]["options"]["num_predict"] == 2048
     assert calls[0]["payload"]["messages"][0]["role"] == "system"
     assert calls[0]["payload"]["messages"][1]["role"] == "user"
     assert qa._ollama_headers()["X-Modular-AI-Token"] == "secret-token"

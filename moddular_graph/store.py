@@ -8,7 +8,15 @@ from pathlib import Path
 from typing import Any
 
 from .config import DB_PATH
-from .pack_index import PackFile, build_graph_from_pack, discover_pack_files, summarize_pack
+from .pack_index import (
+    PackFile,
+    build_graph_from_pack,
+    discover_pack_files,
+    first_term_hit,
+    query_terms,
+    score_terms,
+    summarize_pack,
+)
 
 
 def connect(db_path: Path | None = None) -> sqlite3.Connection:
@@ -199,92 +207,102 @@ def _count(conn: sqlite3.Connection, table: str) -> int:
 
 
 def search_documents(pack_id: str, query: str, limit: int = 8, db_path: Path | None = None) -> list[dict[str, Any]]:
-    normalized = query.strip()
-    if not normalized:
+    terms = query_terms(query)
+    if not terms:
         return []
     conn = connect(db_path)
     try:
         init_db(conn)
-        pattern = f"%{normalized}%"
-        rows = conn.execute(
-            """
-            SELECT path, title, body
-            FROM documents
-            WHERE pack_id = ? AND (body LIKE ? OR title LIKE ? OR path LIKE ?)
-            ORDER BY length(body) ASC
-            LIMIT ?
-            """,
-            (pack_id, pattern, pattern, pattern, limit),
-        ).fetchall()
+        clauses = []
+        params: list[Any] = [pack_id]
+        for term in terms:
+            like = f"%{term}%"
+            clauses.append("(body LIKE ? OR title LIKE ? OR path LIKE ?)")
+            params.extend([like, like, like])
+        sql = (
+            "SELECT path, title, body FROM documents "
+            f"WHERE pack_id = ? AND ({' OR '.join(clauses)})"
+        )
+        rows = conn.execute(sql, params).fetchall()
     finally:
         conn.close()
 
-    results = []
-    lower_query = normalized.lower()
+    scored: list[tuple[float, dict[str, Any]]] = []
     for row in rows:
-        body = row["body"]
-        hit = body.lower().find(lower_query)
+        body = row["body"] or ""
+        lower = body.lower()
+        score = score_terms(lower + " " + str(row["title"]).lower() + " " + str(row["path"]).lower(), terms)
+        if score <= 0:
+            continue
+        hit = first_term_hit(lower, terms)
         if hit < 0:
             hit = 0
         start = max(0, hit - 120)
         end = min(len(body), hit + 260)
-        results.append(
-            {
-                "path": row["path"],
-                "title": row["title"],
-                "snippet": re.sub(r"\s+", " ", body[start:end]).strip(),
-                "score": 1.0,
-                "source": "sqlite-index",
-            }
+        scored.append(
+            (
+                score,
+                {
+                    "path": row["path"],
+                    "title": row["title"],
+                    "snippet": re.sub(r"\s+", " ", body[start:end]).strip(),
+                    "score": round(score, 3),
+                    "source": "sqlite-index",
+                },
+            )
         )
-    return results
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [item[1] for item in scored[:limit]]
 
 
 def search_nodes(pack_id: str, query: str, limit: int = 8, db_path: Path | None = None) -> list[dict[str, Any]]:
-    normalized = query.strip()
-    if not normalized:
+    terms = query_terms(query)
+    if not terms:
         return []
     conn = connect(db_path)
     try:
         init_db(conn)
-        pattern = f"%{normalized}%"
-        rows = conn.execute(
-            """
-            SELECT id, label, type, properties_json
-            FROM nodes
-            WHERE pack_id = ? AND (label LIKE ? OR id LIKE ? OR properties_json LIKE ?)
-            ORDER BY
-              CASE type
-                WHEN 'Module' THEN 1
-                WHEN 'Assembly' THEN 2
-                WHEN 'SinglePart' THEN 3
-                WHEN 'Document' THEN 4
-                ELSE 5
-              END,
-              length(label) ASC
-            LIMIT ?
-            """,
-            (pack_id, pattern, pattern, pattern, limit),
-        ).fetchall()
+        clauses = []
+        params: list[Any] = [pack_id]
+        for term in terms:
+            like = f"%{term}%"
+            clauses.append("(label LIKE ? OR id LIKE ? OR properties_json LIKE ?)")
+            params.extend([like, like, like])
+        sql = (
+            "SELECT id, label, type, properties_json FROM nodes "
+            f"WHERE pack_id = ? AND ({' OR '.join(clauses)})"
+        )
+        rows = conn.execute(sql, params).fetchall()
     finally:
         conn.close()
 
-    results = []
+    type_rank = {"Module": 1, "Assembly": 2, "SinglePart": 3, "Document": 4}
+    scored: list[tuple[float, int, int, dict[str, Any]]] = []
     for row in rows:
         try:
             properties = json.loads(row["properties_json"])
         except json.JSONDecodeError:
             properties = {}
-        results.append(
-            {
-                "id": row["id"],
-                "label": row["label"],
-                "type": row["type"],
-                "properties": properties,
-                "source": "sqlite-index",
-            }
+        haystack = (str(row["label"]) + " " + str(row["id"]) + " " + str(row["properties_json"])).lower()
+        score = score_terms(haystack, terms)
+        if score <= 0:
+            continue
+        scored.append(
+            (
+                score,
+                type_rank.get(row["type"], 5),
+                len(str(row["label"] or "")),
+                {
+                    "id": row["id"],
+                    "label": row["label"],
+                    "type": row["type"],
+                    "properties": properties,
+                    "source": "sqlite-index",
+                },
+            )
         )
-    return results
+    scored.sort(key=lambda item: (-item[0], item[1], item[2]))
+    return [item[3] for item in scored[:limit]]
 
 
 def node_neighborhood(pack_id: str, node_id: str, limit: int = 12, db_path: Path | None = None) -> list[dict[str, Any]]:

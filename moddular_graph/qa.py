@@ -8,11 +8,14 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from .pack_index import get_module, list_modules, search_pack
+from .pack_index import get_module, list_modules, list_nodes, search_pack
 from .store import node_neighborhood, search_documents, search_nodes
 
 MODULE_ID_RE = re.compile(r"\b\d+-\d{2}-[A-Z][A-Z0-9-]*\b", flags=re.I)
-WEIGHT_TERMS = ("weight", "mass", "kg", "ton", "중량", "총중량", "무게", "톤")
+WEIGHT_TERMS = (
+    "weight", "weigh", "mass", "heaviest", "lightest", "kg", "ton",
+    "중량", "총중량", "무게", "무거", "가벼", "톤",
+)
 MODULE_TERMS = ("module", "모듈")
 
 
@@ -39,6 +42,14 @@ def answer_pack_question(
     nodes = search_nodes(pack_id, question, limit=limit, db_path=db_path)
     specialized = _specialized_weight_context(pack_id, question, limit=max(limit, 12))
     evidence = _merge_evidence(evidence, specialized["evidence"])
+    if not evidence and not nodes and not specialized["facts"]:
+        # Keyword search found nothing (e.g. a broad/vague question). Give the LLM a
+        # representative slice of the pack so it can still reason instead of replying
+        # that no data exists.
+        fallback = _fallback_pack_context(pack_id, limit=limit)
+        evidence = _merge_evidence(evidence, fallback["evidence"])
+        if not nodes:
+            nodes = fallback["nodes"]
     neighborhoods = []
     for node in nodes[:3]:
         neighborhoods.append(
@@ -205,6 +216,45 @@ def _specialized_weight_context(pack_id: str, question: str, limit: int = 12) ->
     return {"evidence": evidence, "facts": facts}
 
 
+def _fallback_pack_context(pack_id: str, limit: int = 6) -> dict[str, list[dict[str, Any]]]:
+    """Representative pack context used when keyword search returns nothing, so the
+    LLM always has grounded data to reason over (works for any pack)."""
+    evidence: list[dict[str, Any]] = []
+    nodes: list[dict[str, Any]] = []
+    try:
+        modules = list_modules(pack_id, limit=200).get("modules", [])
+    except Exception:
+        modules = []
+    if modules:
+        rows = modules[: max(limit, 20)]
+        lines = []
+        for module in rows:
+            parts = [str(module.get("module_id") or module.get("id") or "?")]
+            for key, label in (
+                ("module_type", "type"),
+                ("total_weight_kg", "weight_kg"),
+                ("assembly_count", "assemblies"),
+                ("single_part_count", "parts"),
+            ):
+                if module.get(key) is not None:
+                    parts.append(f"{label}={module.get(key)}")
+            lines.append(" | ".join(parts))
+        evidence.append(
+            {
+                "path": "documents/modules/ (overview)",
+                "title": "Module overview",
+                "snippet": "\n".join(lines),
+                "score": 0.5,
+                "source": "pack-overview",
+            }
+        )
+    try:
+        nodes = list_nodes(pack_id, limit=max(limit, 12)).get("nodes", [])[: max(limit, 10)]
+    except Exception:
+        nodes = []
+    return {"evidence": evidence, "nodes": nodes}
+
+
 def _openai_enabled() -> bool:
     return bool(os.environ.get("OPENAI_API_KEY") and os.environ.get("MODDULAR_GRAPH_OPENAI_MODEL"))
 
@@ -286,18 +336,23 @@ def _compose_ollama_answer(
                 {
                     "role": "system",
                     "content": (
-                        "You answer questions about BIM/Revit/Advance Steel ontology packs. "
-                        "Use only the supplied evidence and graph context. Answer in Korean when the user asks in Korean."
+                        "You are a BIM/Revit/Advance Steel ontology analyst. The supplied graph nodes, "
+                        "edges, relationships, facts, and evidence are the authoritative source of truth. "
+                        "Reason over them — follow relationships, combine multiple items, and compute or "
+                        "infer to derive the answer; do not just quote single snippets. Ground every "
+                        "conclusion in the provided data: no outside knowledge, no invented values. If a "
+                        "requested value is genuinely absent, say what is missing. "
+                        "Answer in Korean when the user asks in Korean."
                     ),
                 },
                 {"role": "user", "content": prompt},
             ],
             "stream": False,
-            "think": False,
+            "think": os.environ.get("MODDULAR_GRAPH_OLLAMA_THINK", "0") == "1",
             "options": {
-                "temperature": float(os.environ.get("MODDULAR_GRAPH_OLLAMA_TEMPERATURE", "0.2")),
+                "temperature": float(os.environ.get("MODDULAR_GRAPH_OLLAMA_TEMPERATURE", "0.3")),
                 "num_ctx": int(os.environ.get("MODDULAR_GRAPH_OLLAMA_NUM_CTX", "8192")),
-                "num_predict": int(os.environ.get("MODDULAR_GRAPH_OLLAMA_NUM_PREDICT", "512")),
+                "num_predict": int(os.environ.get("MODDULAR_GRAPH_OLLAMA_NUM_PREDICT", "2048")),
             },
         },
         timeout=float(os.environ.get("MODDULAR_GRAPH_OLLAMA_TIMEOUT", "180")),
@@ -371,16 +426,25 @@ def _build_llm_prompt(
 ) -> str:
     payload = {
         "question": question,
-        "localAnswer": local_answer,
-        "evidence": evidence[:6],
-        "graphNodes": nodes[:6],
-        "relationships": neighborhoods[:3],
+        "draftAnswer": local_answer,
+        "evidence": evidence[:8],
+        "graphNodes": nodes[:10],
+        "relationships": neighborhoods[:6],
         "facts": facts or [],
     }
     return (
-        "You answer questions about BIM/Revit/Advance Steel ontology packs. "
-        "Use only the provided evidence and graph context. If the context is insufficient, say what is missing. "
-        "Keep the answer concise and cite evidence paths or node IDs when useful.\n\n"
+        "You are a BIM/Revit/Advance Steel ontology analyst. The provided graph nodes, edges, "
+        "relationships, facts, and evidence are the authoritative source of truth for this project.\n"
+        "Reason over them: follow relationships across nodes, combine multiple pieces of evidence, "
+        "and compute or infer whatever is needed to derive the answer. Do not limit yourself to quoting "
+        "single snippets — connect the data.\n"
+        "Grounding rule: every conclusion must follow from the provided graph/evidence. Do not bring in "
+        "outside world knowledge and do not invent node values that are not present. If a value the user "
+        "asks for is genuinely absent from the graph, say exactly what is missing.\n"
+        "`draftAnswer` is a non-authoritative heuristic draft — verify, correct, and improve it with your "
+        "own reasoning over the graph; do not just repeat it.\n"
+        "Explain the reasoning chain that connects the data to the result, cite evidence paths or node IDs, "
+        "then state the final answer. Answer in Korean when the user asks in Korean.\n\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
 

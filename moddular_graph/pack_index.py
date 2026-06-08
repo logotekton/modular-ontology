@@ -560,19 +560,90 @@ def get_section_weight_index(pack_id: str) -> dict[str, Any]:
     }
 
 
+_QUERY_TOKEN_RE = re.compile(r"[a-z0-9]+|[가-힣]+")
+_QUERY_STOPWORDS = {
+    "the", "and", "for", "with", "what", "which", "how", "are", "is", "of", "to",
+    "this", "that", "from", "about", "tell", "show", "list", "give", "please",
+    "설명", "알려", "무엇", "어떤", "어떻게", "그리고", "그것", "대해", "해줘", "주세요", "입니까", "인가요",
+}
+
+
+def query_terms(query: str) -> list[str]:
+    """Tokenize a query into searchable substrings.
+
+    ASCII/number words are kept whole; Hangul runs are kept whole (when short) and
+    also split into character bigrams so morphological variants (조사 등) still match
+    document text. Without this, substring search requires the whole phrase verbatim,
+    which makes natural-language Korean questions return nothing.
+    """
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    def push(term: str) -> None:
+        if term and term not in seen:
+            seen.add(term)
+            terms.append(term)
+
+    for token in _QUERY_TOKEN_RE.findall(query.lower()):
+        if "가" <= token[0] <= "힣":  # Hangul run
+            if 2 <= len(token) <= 4 and token not in _QUERY_STOPWORDS:
+                push(token)
+            for i in range(len(token) - 1):
+                push(token[i : i + 2])
+        elif token.isdigit():
+            push(token)
+        elif len(token) >= 2 and token not in _QUERY_STOPWORDS:
+            push(token)
+    return terms
+
+
+def score_terms(text_lower: str, terms: list[str]) -> float:
+    """Score text by how many distinct query terms it contains, weighting longer
+    terms and rewarding coverage of more distinct terms."""
+    if not terms:
+        return 0.0
+    score = 0.0
+    matched = 0
+    for term in terms:
+        count = text_lower.count(term)
+        if count:
+            matched += 1
+            length_weight = 1.0 + 0.4 * (len(term) - 1)
+            score += length_weight * (1.0 + 0.2 * min(count, 5))
+    if not matched:
+        return 0.0
+    return score * (1.0 + 0.5 * matched)
+
+
+def first_term_hit(text_lower: str, terms: list[str]) -> int:
+    first = -1
+    for term in terms:
+        pos = text_lower.find(term)
+        if pos >= 0 and (first < 0 or pos < first):
+            first = pos
+    return first
+
+
 def search_packs(query: str = "", limit: int = 20) -> list[dict[str, Any]]:
-    normalized = query.strip().lower()
     packs = list_packs()
-    if not normalized:
+    terms = query_terms(query)
+    if not terms:
         return packs[:limit]
-    return [
-        pack
-        for pack in packs
-        if normalized in pack["id"].lower()
-        or normalized in pack["title"].lower()
-        or normalized in pack["source"].lower()
-        or normalized in str(pack.get("description", "")).lower()
-    ][:limit]
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for pack in packs:
+        haystack = " ".join(
+            [
+                str(pack.get("id", "")),
+                str(pack.get("title", "")),
+                str(pack.get("source", "")),
+                str(pack.get("description", "")),
+            ]
+        ).lower()
+        score = score_terms(haystack, terms)
+        if score > 0:
+            scored.append((score, pack))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [pack for _, pack in scored][:limit]
 
 
 def list_sources(pack_id: str | None = None) -> dict[str, Any]:
@@ -613,18 +684,21 @@ def list_nodes(pack_id: str, node_type: str | None = None, limit: int = 100) -> 
 
 
 def search_nodes(pack_id: str, query: str, limit: int = 20) -> dict[str, Any]:
-    normalized = query.strip().lower()
-    if not normalized:
+    terms = query_terms(query)
+    if not terms:
         return {"pack_id": pack_id, "count": 0, "nodes": []}
     graph = build_graph(pack_id, max_nodes=5000, max_edges=0)
-    matches = [
-        node
-        for node in graph["nodes"]
-        if normalized in str(node.get("id", "")).lower()
-        or normalized in str(node.get("label", "")).lower()
-        or normalized in json.dumps(node.get("properties", {}), ensure_ascii=False).lower()
-    ]
-    matches.sort(key=lambda node: (str(node.get("type")) != "Module", len(str(node.get("label", "")))))
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for node in graph["nodes"]:
+        haystack = (
+            str(node.get("id", "")) + " " + str(node.get("label", "")) + " "
+            + json.dumps(node.get("properties", {}), ensure_ascii=False)
+        ).lower()
+        score = score_terms(haystack, terms)
+        if score > 0:
+            scored.append((score, node))
+    scored.sort(key=lambda item: (-item[0], str(item[1].get("type")) != "Module", len(str(item[1].get("label", "")))))
+    matches = [node for _, node in scored]
     return {
         "pack_id": graph["pack"]["id"],
         "query": query,
@@ -772,32 +846,37 @@ def list_projects() -> list[dict[str, Any]]:
 
 def search_pack(pack_id: str, query: str, limit: int = 8) -> list[dict[str, Any]]:
     pack = find_pack(pack_id)
-    normalized = query.strip().lower()
-    if not normalized:
+    terms = query_terms(query)
+    if not terms:
         return []
-    results: list[dict[str, Any]] = []
+    scored: list[tuple[float, dict[str, Any]]] = []
     with zipfile.ZipFile(pack.path) as zf:
         for info in zf.infolist():
-            if len(results) >= limit:
-                break
             if not (info.filename.startswith("documents/") and info.filename.endswith(".md")):
                 continue
             text = zf.read(info.filename).decode("utf-8-sig", errors="replace")
             lower = text.lower()
-            hit = lower.find(normalized)
-            if hit < 0:
+            score = score_terms(lower + " " + info.filename.lower(), terms)
+            if score <= 0:
                 continue
+            hit = first_term_hit(lower, terms)
+            if hit < 0:
+                hit = 0
             start = max(0, hit - 120)
             end = min(len(text), hit + 260)
-            results.append(
-                {
-                    "path": info.filename,
-                    "title": Path(info.filename).stem,
-                    "snippet": re.sub(r"\s+", " ", text[start:end]).strip(),
-                    "score": 1.0,
-                }
+            scored.append(
+                (
+                    score,
+                    {
+                        "path": info.filename,
+                        "title": Path(info.filename).stem,
+                        "snippet": re.sub(r"\s+", " ", text[start:end]).strip(),
+                        "score": round(score, 3),
+                    },
+                )
             )
-    return results
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [item[1] for item in scored[:limit]]
 
 
 def save_uploaded_pack(filename: str, content: bytes) -> dict[str, Any]:
