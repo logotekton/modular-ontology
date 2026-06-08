@@ -123,12 +123,13 @@ def _kg(value: Any) -> str:
 
 
 def _specialized_weight_context(pack_id: str, question: str, limit: int = 12) -> dict[str, list[dict[str, Any]]]:
-    if not _has_any_term(question, WEIGHT_TERMS):
+    module_ids = _extract_module_ids(question)
+    if not module_ids and not _has_any_term(question, WEIGHT_TERMS):
         return {"evidence": [], "facts": []}
 
     evidence: list[dict[str, Any]] = []
     facts: list[dict[str, Any]] = []
-    for module_id in _extract_module_ids(question):
+    for module_id in module_ids:
         try:
             module = get_module(pack_id, module_id, max_chars=8000)
         except Exception:
