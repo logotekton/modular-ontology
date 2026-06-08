@@ -46,8 +46,26 @@ Runtime data files:
 - `00_Admin/mcp_remote.json`: public MCP endpoint settings
 - `02_Ontology_Packs/indexed/*.zip`: ingested ontology pack ZIP files
 
+Vercel runtime sync:
+
+- Set `MODDULAR_GRAPH_GOOGLE_DRIVE_FOLDER_ID=1qBTaqsuRbKL-DdUG8EHtwpdpIo7EO2en`.
+- Set `MODDULAR_GRAPH_STRUCTURED_DATA_DIR=1`.
+- Preferred auth: set `MODDULAR_GRAPH_GOOGLE_SERVICE_ACCOUNT_JSON` to a Google service-account JSON value and share the Drive folder with that service account email as Editor.
+- Alternatives: `MODDULAR_GRAPH_GOOGLE_DRIVE_ACCESS_TOKEN` for a short-lived OAuth token, or `MODDULAR_GRAPH_GOOGLE_DRIVE_API_KEY` only if the folder/files are publicly readable.
+- Optional cache control: `MODDULAR_GRAPH_GOOGLE_DRIVE_SYNC_TTL_SECONDS`, default `300`.
+
+The Vercel function downloads Drive files into `/tmp/modular-ontology` on startup, then the existing SQLite and ZIP-pack code reads that local copy.
+
+Runtime write-back:
+
+- Auth/admin writes update `00_Admin/users.json`.
+- Project and pack-link writes update `01_Database/moddular_graph.sqlite3`.
+- Pack uploads update or create ZIP files in `02_Ontology_Packs/indexed/`.
+- `POST /api/admin/storage/google-drive/write-back` pushes the current users file and SQLite DB.
+- `POST /api/admin/storage/google-drive/write-back?include_packs=true` also pushes indexed ZIP packs.
+
 Important:
 
 SQLite should not be edited concurrently from multiple PCs through Google Drive sync.
 For production multi-user access, move runtime storage to PostgreSQL or a server disk.
-Use Google Drive as a document, pack, and backup store unless a single server is the only writer.
+Use Google Drive as the runtime backing store only while one server is the active writer.

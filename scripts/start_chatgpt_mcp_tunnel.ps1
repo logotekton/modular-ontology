@@ -55,12 +55,15 @@ if (-not $PublicBaseUrl) {
 }
 
 $PublicMcpUrl = "$PublicBaseUrl/mcp"
+$PublicUserUrlTemplate = "$PublicBaseUrl/mcp/{token}"
 $PublicHost = ([Uri]$PublicBaseUrl).Host
 
 $RemotePayload = [ordered]@{
   publicUrl = $PublicMcpUrl
   publicBaseUrl = $PublicBaseUrl
   localUrl = "http://127.0.0.1:8011/mcp"
+  publicUserUrlTemplate = $PublicUserUrlTemplate
+  localUserUrlTemplate = "http://127.0.0.1:8011/mcp/{token}"
   host = $PublicHost
   createdAt = (Get-Date).ToString("o")
   tunnelProcessId = $TunnelProcess.Id
@@ -80,7 +83,7 @@ $McpProcess = Start-Process `
     "--transport", "streamable-http",
     "--host", "127.0.0.1",
     "--port", "8011",
-    "--path", "/mcp",
+    "--path", "/mcp/{mcp_token}",
     "--allowed-host", $AllowedHosts,
     "--allowed-origin", $AllowedOrigins
   ) `
@@ -93,6 +96,7 @@ $McpProcess = Start-Process `
 $RemotePayload["mcpProcessId"] = $McpProcess.Id
 $RemotePayload | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 $RemoteFile
 
-Write-Host "ChatGPT MCP URL: $PublicMcpUrl"
+Write-Host "MCP public base URL: $PublicMcpUrl"
+Write-Host "User MCP URL template: $PublicUserUrlTemplate"
 Write-Host "Tunnel PID: $($TunnelProcess.Id)"
 Write-Host "MCP PID: $($McpProcess.Id)"

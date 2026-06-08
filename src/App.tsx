@@ -3,9 +3,8 @@ import type { DragEvent } from "react";
 import { createPortal } from "react-dom";
 import {
   Activity,
-  Bot,
-  Box,
-  Braces,
+  AlertTriangle,
+  Building2,
   ChevronDown,
   CheckCircle2,
   CircleUserRound,
@@ -14,6 +13,7 @@ import {
   FolderKanban,
   GitBranch,
   KeyRound,
+  LoaderCircle,
   LockKeyhole,
   Network,
   PackageCheck,
@@ -21,16 +21,15 @@ import {
   RefreshCw,
   ServerCog,
   ShieldCheck,
-  Send,
   Upload,
   Users,
+  Waypoints,
 } from "lucide-react";
 import Graph from "graphology";
 import Sigma from "sigma";
 
 const API_BASE = "";
 const NODE_COLLISION_PADDING = 1.45;
-const MIDDLE_PAN_SENSITIVITY = 0.003;
 const GRAPH_EDGE_COLOR = "rgba(84, 84, 84, 0.48)";
 const GRAPH_EDGE_SELECTED_COLOR = "rgba(13, 148, 136, 0.78)";
 const GRAPH_EDGE_DIMMED_COLOR = "rgba(84, 84, 84, 0.28)";
@@ -124,6 +123,18 @@ type McpStatus = {
     transport: string;
     localUrl: string;
     publicUrl?: string | null;
+    publicBaseUrl?: string | null;
+    localUserUrlTemplate?: string | null;
+    publicUserUrlTemplate?: string | null;
+    userUrl?: {
+      localUrl: string;
+      publicUrl?: string | null;
+      token: string;
+      userEmail: string;
+      userName: string;
+      company: string;
+      role: string;
+    } | null;
     command: string;
   };
   tools: string[];
@@ -170,11 +181,20 @@ type SignupForm = {
   password: string;
 };
 
+type ConfirmDialogOptions = {
+  title: string;
+  message: string;
+  confirmLabel?: string;
+  cancelLabel?: string;
+  tone?: "danger" | "default";
+  onConfirm: () => void;
+};
+
 const nav = [
   { label: "Dashboard", icon: Activity },
   { label: "Projects", icon: FolderKanban },
   { label: "Ontology Packs", icon: FileArchive },
-  { label: "Graph Explorer", icon: Network },
+  { label: "Graph Explorer", icon: Waypoints },
   { label: "MCP Connections", icon: ServerCog },
   { label: "Admin", icon: LockKeyhole },
 ];
@@ -263,6 +283,7 @@ function App() {
   const [managedUsers, setManagedUsers] = useState<ManagedUser[]>([]);
   const [companies, setCompanies] = useState<string[]>([]);
   const [companyProjectAccess, setCompanyProjectAccess] = useState<CompanyProjectAccess>({});
+  const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogOptions | null>(null);
   const [uploadProjectTarget, setUploadProjectTarget] = useState<UploadProjectTarget>({
     mode: "existing",
     projectId: "",
@@ -273,6 +294,20 @@ function App() {
     description: "",
   });
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  function confirmAction(options: ConfirmDialogOptions) {
+    setConfirmDialog(options);
+  }
+
+  function closeConfirmDialog() {
+    setConfirmDialog(null);
+  }
+
+  function runConfirmedAction() {
+    const action = confirmDialog?.onConfirm;
+    setConfirmDialog(null);
+    action?.();
+  }
 
   useEffect(() => {
     refreshPublicStatus().catch(() => undefined);
@@ -299,6 +334,29 @@ function App() {
     setCompanies([]);
     setCompanyProjectAccess({});
   }, [currentUser?.role, authToken]);
+
+  useEffect(() => {
+    if (activeTab !== "Admin" || currentUser?.role !== "admin" || !authToken) return;
+    let cancelled = false;
+    const refresh = () => {
+      refreshAdminDirectory().catch(() => {
+        if (!cancelled) setUploadStatus("관리자 목록 새로고침 실패");
+      });
+    };
+    const refreshOnVisible = () => {
+      if (document.visibilityState === "visible") refresh();
+    };
+    refresh();
+    const intervalId = window.setInterval(refresh, 10000);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refreshOnVisible);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refreshOnVisible);
+    };
+  }, [activeTab, currentUser?.role, authToken]);
 
   useEffect(() => {
     if (!projects.length) return;
@@ -332,10 +390,10 @@ function App() {
     };
   }, [selectedPackId, authToken]);
 
-  async function refreshPublicStatus() {
+  async function refreshPublicStatus(token = authToken) {
     await Promise.all([
       getJson<IndexStats>("/api/index/status").then(setIndexStats),
-      getJson<McpStatus>("/api/mcp/status").then(setMcpStatus),
+      getJson<McpStatus>("/api/mcp/status", token || undefined).then(setMcpStatus),
     ]);
   }
 
@@ -346,7 +404,7 @@ function App() {
     ]);
     setPacks(packData);
     setProjects(projectData);
-    refreshPublicStatus().catch(() => undefined);
+    refreshPublicStatus(token).catch(() => undefined);
     const nextVisiblePackId = nextPackId && packData.some((pack) => pack.id === nextPackId) ? nextPackId : packData[0]?.id;
     setSelectedPackId(nextVisiblePackId || "");
     setStatus("Ready");
@@ -725,7 +783,7 @@ function App() {
         llmError?: string | null;
         mode?: string;
       };
-      const warning = payload.llmError ? `\n\nQwen 연결 경고: ${payload.llmError}` : "";
+      const warning = payload.llmError ? `\n\n${formatLocalAiWarning(payload.llmError)}` : "";
       setAiMessages((messages) => [
         ...messages,
         {
@@ -751,9 +809,9 @@ function App() {
 
   if (!sessionReady) {
     return (
-      <div className="landing-page loading">
+      <div className="landing-page boot-loading">
         <div className="brand-mark">
-          <Network size={24} />
+          <LoaderCircle className="loading-spinner" size={24} />
         </div>
       </div>
     );
@@ -781,12 +839,10 @@ function App() {
   }
 
   return (
+    <>
     <div className="app-shell">
       <aside className={activeTab === "Graph Explorer" ? "sidebar graph-sidebar-active" : "sidebar"}>
         <div className="brand">
-          <div className="brand-mark">
-            <Network size={22} />
-          </div>
           <div>
             <strong>Modular Ontology</strong>
             <span>BIM 온톨로지 플랫폼</span>
@@ -884,6 +940,7 @@ function App() {
             packs={packs}
             projects={projects}
             selectedPackId={selectedPackId}
+            onConfirm={confirmAction}
             onDeleteProject={deleteProject}
             onOpenPack={selectPackForGraph}
             onSaveProject={saveProject}
@@ -906,7 +963,7 @@ function App() {
         )}
 
         {activeTab === "MCP Connections" && (
-          <McpConnectionsView mcpStatus={mcpStatus} />
+          <McpConnectionsView mcpStatus={mcpStatus} onGenerateUrl={() => refreshPublicStatus(authToken)} />
         )}
 
         {activeTab === "Admin" && currentUser?.role !== "admin" && <AdminLockedView />}
@@ -922,6 +979,7 @@ function App() {
             uploadStatus={uploadStatus}
             onAddCompany={addManagedCompany}
             onApproveUser={approveManagedUser}
+            onConfirm={confirmAction}
             onDeleteCompany={deleteManagedCompany}
             onDeleteUser={deleteManagedUser}
             onMoveUserCompany={moveManagedUserCompany}
@@ -956,32 +1014,30 @@ function App() {
           </div>
 
           <aside className="inspector">
-            <div className="panel-header slim">
+            <div className="panel-header slim graph-inspector-header">
               <div>
-                <h2>{inspectorTab === "node" ? "노드 인스펙터" : "AI Query"}</h2>
+                <h2>{inspectorTab === "node" ? "Node Inspector" : "AI Query"}</h2>
                 <span>
                   {inspectorTab === "node"
                     ? selectedNode
                       ? nodeTypeLabel(selectedNode.type)
                       : "노드를 선택하세요"
-                    : "Qwen3-14B Graph RAG"}
+                    : "AI Query"}
                 </span>
               </div>
-              {inspectorTab === "node" ? <Braces size={19} /> : <Bot size={19} />}
             </div>
             <div className="inspector-tabs" role="tablist" aria-label="그래프 우측 패널">
               <button className={inspectorTab === "node" ? "active" : ""} type="button" onClick={() => setInspectorTab("node")}>
-                노드 인스펙터
+                노드 정보
               </button>
               <button className={inspectorTab === "ai" ? "active" : ""} type="button" onClick={() => setInspectorTab("ai")}>
-                AI Query
+                AI 질문
               </button>
             </div>
             {inspectorTab === "ai" ? (
               <AiQueryPanel
                 loading={aiLoading}
                 messages={aiMessages}
-                packTitle={graph?.pack.title ?? packs.find((pack) => pack.id === selectedPackId)?.title ?? ""}
                 question={aiQuestion}
                 onQuestionChange={setAiQuestion}
                 onSubmit={askGraphAi}
@@ -989,8 +1045,7 @@ function App() {
             ) : selectedNode ? (
               <NodeDetails node={selectedNode} />
             ) : (
-              <div className="empty-state">
-                <Network size={34} />
+              <div className="empty-state node-empty-state">
                 <strong>그래프 노드를 선택하세요</strong>
                 <span>속성, evidence, 관계 타입이 이 패널에 표시됩니다.</span>
               </div>
@@ -1002,6 +1057,48 @@ function App() {
         )}
       </main>
     </div>
+    <ConfirmDialog dialog={confirmDialog} onCancel={closeConfirmDialog} onConfirm={runConfirmedAction} />
+    </>
+  );
+}
+
+function ConfirmDialog({
+  dialog,
+  onCancel,
+  onConfirm,
+}: {
+  dialog: ConfirmDialogOptions | null;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  if (!dialog) return null;
+  const isDanger = dialog.tone !== "default";
+  return createPortal(
+    <div className="confirm-overlay" role="presentation" onMouseDown={onCancel}>
+      <section
+        aria-modal="true"
+        className={isDanger ? "confirm-dialog danger" : "confirm-dialog"}
+        role="dialog"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="confirm-dialog-icon">
+          <AlertTriangle size={22} />
+        </div>
+        <div className="confirm-dialog-copy">
+          <h2>{dialog.title}</h2>
+          <p>{dialog.message}</p>
+        </div>
+        <div className="confirm-dialog-actions">
+          <button className="secondary-button" type="button" onClick={onCancel}>
+            {dialog.cancelLabel ?? "취소"}
+          </button>
+          <button className={isDanger ? "danger-confirm-button" : "primary-button"} type="button" onClick={onConfirm}>
+            {dialog.confirmLabel ?? "확인"}
+          </button>
+        </div>
+      </section>
+    </div>,
+    document.body,
   );
 }
 
@@ -1162,7 +1259,7 @@ function MetricsStrip({
   if (activeTab === "Admin") {
     return (
       <section className="metrics">
-        <Metric icon={FolderKanban} label="회사" value={numberLabel(companies.length)} />
+        <Metric icon={Building2} label="회사" value={numberLabel(companies.length)} />
         <Metric icon={Users} label="회원" value={numberLabel(users.length)} />
         <Metric icon={CircleUserRound} label="승인 대기" value={numberLabel(users.filter((user) => user.status === "pending").length)} />
         <Metric icon={ShieldCheck} label="관리자" value={numberLabel(users.filter((user) => user.role === "admin").length)} tone="green" />
@@ -1172,10 +1269,10 @@ function MetricsStrip({
 
   return (
     <section className="metrics">
-      <Metric icon={FolderKanban} label="회사명" value={currentUser?.company || "미지정"} />
-      <Metric icon={Network} label="프로젝트" value={numberLabel(projects.length)} />
+      <Metric icon={Building2} label="회사명" value={currentUser?.company || "미지정"} />
+      <Metric icon={FolderKanban} label="프로젝트" value={numberLabel(projects.length)} />
       <Metric icon={FileArchive} label="팩" value={numberLabel(packs.length)} />
-      <Metric icon={Box} label="그래프 노드" value={numberLabel(packs.reduce((sum, pack) => sum + (pack.counts.nodes ?? 0), 0))} tone="green" />
+      <Metric icon={Waypoints} label="그래프 노드" value={numberLabel(packs.reduce((sum, pack) => sum + (pack.counts.nodes ?? 0), 0))} tone="green" />
     </section>
   );
 }
@@ -1215,9 +1312,9 @@ function DashboardView({
         </div>
         <div className="status-grid">
           <StatusTile icon={FolderKanban} label="할당 프로젝트" value={numberLabel(projects.length)} />
-          <StatusTile icon={PackageCheck} label="할당 팩" value={numberLabel(scopedPacks.length)} />
-          <StatusTile icon={Database} label="문서" value={numberLabel(scopedStats.documents)} />
-          <StatusTile icon={GitBranch} label="관계 엣지" value={numberLabel(scopedStats.edges)} />
+          <StatusTile icon={FileArchive} label="할당 팩" value={numberLabel(scopedPacks.length)} />
+          <StatusTile icon={FileArchive} label="문서" value={numberLabel(scopedStats.documents)} />
+          <StatusTile icon={Waypoints} label="관계 엣지" value={numberLabel(scopedStats.edges)} />
         </div>
       </div>
 
@@ -1267,10 +1364,10 @@ function DashboardView({
           <ShieldCheck size={19} />
         </div>
         <div className="status-grid">
-          <StatusTile icon={FolderKanban} label="회사" value={numberLabel(scopedCompanyCount)} />
-          <StatusTile icon={Network} label="프로젝트" value={numberLabel(projects.length)} />
+          <StatusTile icon={Building2} label="회사" value={numberLabel(scopedCompanyCount)} />
+          <StatusTile icon={FolderKanban} label="프로젝트" value={numberLabel(projects.length)} />
           <StatusTile icon={FileArchive} label="팩" value={numberLabel(scopedPacks.length)} />
-          <StatusTile icon={Box} label="노드" value={numberLabel(scopedStats.nodes)} />
+          <StatusTile icon={Waypoints} label="노드" value={numberLabel(scopedStats.nodes)} />
         </div>
       </div>
     </section>
@@ -1282,6 +1379,7 @@ function ProjectsView({
   packs,
   projects,
   selectedPackId,
+  onConfirm,
   onDeleteProject,
   onOpenPack,
   onSaveProject,
@@ -1291,6 +1389,7 @@ function ProjectsView({
   packs: Pack[];
   projects: Project[];
   selectedPackId: string;
+  onConfirm: (options: ConfirmDialogOptions) => void;
   onDeleteProject: (projectId: string) => void;
   onOpenPack: (packId: string) => void;
   onSaveProject: (form: ProjectForm) => void;
@@ -1356,9 +1455,14 @@ function ProjectsView({
 
   function deleteSelectedProject() {
     if (!draft.id) return;
-    const confirmed = window.confirm(`${draft.name} 프로젝트를 삭제하시겠습니까? 연결된 팩은 삭제되지 않습니다.`);
-    if (!confirmed) return;
-    onDeleteProject(draft.id);
+    const projectId = draft.id;
+    onConfirm({
+      title: "프로젝트 삭제",
+      message: `${draft.name} 프로젝트를 삭제하시겠습니까? 연결된 팩은 삭제되지 않습니다.`,
+      confirmLabel: "삭제",
+      tone: "danger",
+      onConfirm: () => onDeleteProject(projectId),
+    });
   }
 
   function savePackLinksOnly() {
@@ -1627,46 +1731,36 @@ function OntologyPacksView({
   );
 }
 
-function McpConnectionsView({ mcpStatus }: { mcpStatus: McpStatus | null }) {
+function McpConnectionsView({ mcpStatus, onGenerateUrl }: { mcpStatus: McpStatus | null; onGenerateUrl: () => Promise<void> }) {
   return (
     <section className="mcp-workspace-grid">
-      <div className="overview-panel">
-        <div className="panel-header slim">
-          <div>
-            <h2>MCP 서버</h2>
-            <span>{mcpStatus?.server ?? "서버 명령 불러오는 중"}</span>
-          </div>
-          <ServerCog size={19} />
-        </div>
-        <pre className="code-block">{`{
-  "command": "python",
-  "args": ["-m", "moddular_graph.mcp_server"]
-}`}</pre>
-        <div className="tool-chip-row">
-          {(mcpStatus?.tools ?? []).map((tool) => (
-            <span className="tool-chip" key={tool}>{tool}</span>
-          ))}
-        </div>
-      </div>
-
-      <McpUrlPanel mcpStatus={mcpStatus} />
+      <McpUrlPanel mcpStatus={mcpStatus} onGenerateUrl={onGenerateUrl} />
     </section>
   );
 }
 
-function McpUrlPanel({ mcpStatus }: { mcpStatus: McpStatus | null }) {
-  const [urlMode, setUrlMode] = useState<"local" | "chatgpt">("local");
+function McpUrlPanel({ mcpStatus, onGenerateUrl }: { mcpStatus: McpStatus | null; onGenerateUrl: () => Promise<void> }) {
   const [copied, setCopied] = useState(false);
-  const localUrl = mcpStatus?.remote?.localUrl ?? "http://127.0.0.1:8011/mcp";
-  const chatGptUrl = mcpStatus?.remote?.publicUrl ?? "HTTPS 터널 주소 생성 필요";
-  const activeUrl = urlMode === "local" ? localUrl : chatGptUrl;
-  const canCopy = activeUrl.startsWith("http");
+  const [generating, setGenerating] = useState(false);
+  const userUrl = mcpStatus?.remote?.userUrl;
+  const personalUrl = userUrl?.publicUrl || userUrl?.localUrl || "로그인 후 개인 MCP URL이 발급됩니다.";
+  const activeUrl = personalUrl;
+  const canCopy = activeUrl.startsWith("http") && !activeUrl.includes("{token}");
 
   async function copyUrl() {
     if (!canCopy) return;
     await navigator.clipboard?.writeText(activeUrl);
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1400);
+  }
+
+  async function generateUrl() {
+    setGenerating(true);
+    try {
+      await onGenerateUrl();
+    } finally {
+      setGenerating(false);
+    }
   }
 
   return (
@@ -1676,38 +1770,30 @@ function McpUrlPanel({ mcpStatus }: { mcpStatus: McpStatus | null }) {
           <h2>MCP URL</h2>
           <span>{mcpStatus?.remote?.transport ?? "streamable-http"}</span>
         </div>
-        <PlugZap size={19} />
-      </div>
-
-      <div className="url-tabs" role="tablist" aria-label="MCP URL">
-        <button
-          className={urlMode === "local" ? "active" : ""}
-          type="button"
-          onClick={() => setUrlMode("local")}
-        >
-          로컬
-        </button>
-        <button
-          className={urlMode === "chatgpt" ? "active" : ""}
-          type="button"
-          onClick={() => setUrlMode("chatgpt")}
-        >
-          ChatGPT
-        </button>
+        <div className="mcp-url-actions">
+          <button type="button" onClick={generateUrl} disabled={generating}>
+            {generating ? "생성 중" : "URL 생성"}
+          </button>
+          <PlugZap size={19} />
+        </div>
       </div>
 
       <div className="mcp-url-card">
-        <span>{urlMode === "local" ? "현재 서버 URL" : "등록 URL 형식"}</span>
+        <span>사용자별 MCP URL</span>
         <code>{activeUrl}</code>
         <button type="button" disabled={!canCopy} onClick={copyUrl}>
           {copied ? "복사됨" : "복사"}
         </button>
       </div>
 
-      <div className="mcp-url-notes">
-        <span>공개 주소 생성: .\scripts\start_chatgpt_mcp_tunnel.ps1</span>
-        <span>ChatGPT 등록은 HTTPS 공개 주소의 /mcp 엔드포인트를 사용합니다</span>
-      </div>
+      {userUrl ? (
+        <div className="mcp-url-scope">
+          <span>사용자 {userUrl.userEmail}</span>
+          <span>회사 {userUrl.company || "전체"}</span>
+          <span>권한 {roleLabel(userUrl.role)}</span>
+        </div>
+      ) : null}
+
     </div>
   );
 }
@@ -1730,6 +1816,7 @@ function AdminView({
   uploadStatus,
   onAddCompany,
   onApproveUser,
+  onConfirm,
   onDeleteCompany,
   onDeleteUser,
   onMoveUserCompany,
@@ -1749,6 +1836,7 @@ function AdminView({
   uploadStatus: string;
   onAddCompany: (name: string) => void;
   onApproveUser: (email: string, role?: "admin" | "member") => void;
+  onConfirm: (options: ConfirmDialogOptions) => void;
   onDeleteCompany: (name: string, deleteUsers?: boolean) => void;
   onDeleteUser: (email: string) => void;
   onMoveUserCompany: (email: string, company: string) => void;
@@ -1761,6 +1849,7 @@ function AdminView({
 }) {
   const [selectedCompany, setSelectedCompany] = useState("all");
   const [companyDraft, setCompanyDraft] = useState("");
+  const [selectedUserEmail, setSelectedUserEmail] = useState("");
   const unknownCompany = "미지정";
   const selectedProjectIds = companyProjectAccess[selectedCompany] ?? [];
   const selectedCompanyIsInternal =
@@ -1772,6 +1861,12 @@ function AdminView({
   useEffect(() => {
     setCompanyDraft(selectedCompany === "all" ? "" : selectedCompany);
   }, [selectedCompany]);
+
+  useEffect(() => {
+    if (selectedUserEmail && !users.some((user) => user.email === selectedUserEmail)) {
+      setSelectedUserEmail("");
+    }
+  }, [selectedUserEmail, users]);
 
   function companyStats(company: string) {
     const companyUsers = company === "all" ? users : users.filter((user) => (user.company || "미지정") === company);
@@ -1798,25 +1893,48 @@ function AdminView({
   function deleteCompany() {
     if (selectedCompany === "all") return;
     const stats = companyStats(selectedCompany);
-    if (stats.total > 0) {
-      const confirmed = window.confirm(`${stats.total}명의 사용자가 함께 삭제됩니다. 삭제하시겠습니까?`);
-      if (!confirmed) return;
-    }
-    onDeleteCompany(selectedCompany, stats.total > 0);
-    setSelectedCompany("all");
+    onConfirm({
+      title: "회사 삭제",
+      message: stats.total > 0
+        ? `${selectedCompany} 회사와 소속 사용자 ${stats.total}명을 함께 삭제하시겠습니까?`
+        : `${selectedCompany} 회사를 삭제하시겠습니까?`,
+      confirmLabel: "삭제",
+      tone: "danger",
+      onConfirm: () => {
+        onDeleteCompany(selectedCompany, stats.total > 0);
+        setSelectedCompany("all");
+      },
+    });
   }
 
   function deleteUser(user: ManagedUser) {
-    const confirmed = window.confirm(`${user.name} (${user.email}) 회원을 삭제하시겠습니까?`);
-    if (!confirmed) return;
-    onDeleteUser(user.email);
+    onConfirm({
+      title: "회원 삭제",
+      message: `${user.name} (${user.email}) 회원을 삭제하시겠습니까?`,
+      confirmLabel: "삭제",
+      tone: "danger",
+      onConfirm: () => onDeleteUser(user.email),
+    });
   }
 
   function dropUserOnCompany(event: DragEvent<HTMLElement>, company: string) {
     event.preventDefault();
     if (company === "all") return;
     const email = event.dataTransfer.getData("text/plain");
-    if (email) onMoveUserCompany(email, company);
+    if (email) {
+      onMoveUserCompany(email, company);
+      setSelectedUserEmail(email);
+      setSelectedCompany(company);
+    }
+  }
+
+  function selectCompanyCard(company: string) {
+    setSelectedCompany(company);
+  }
+
+  function selectUserCard(user: ManagedUser) {
+    setSelectedUserEmail(user.email);
+    if (user.company) setSelectedCompany(user.company);
   }
 
   function toggleCompanyProject(projectId: string) {
@@ -1896,7 +2014,7 @@ function AdminView({
                     if (company !== "all") event.preventDefault();
                   }}
                   onDrop={(event) => dropUserOnCompany(event, company)}
-                  onClick={() => setSelectedCompany(company)}
+                  onClick={() => selectCompanyCard(company)}
                 >
                   <strong>{company === "all" ? "전체 회사" : company}</strong>
                   <span>{stats.total}명 / 승인 대기 {stats.pending}명 / 관리자 {stats.admins}명</span>
@@ -1908,12 +2026,14 @@ function AdminView({
           <div className="user-table">
             {visibleUsers.map((user) => (
               <div
-                className="user-row"
+                className={selectedUserEmail === user.email ? "user-row selected" : "user-row"}
                 draggable={user.email !== currentUser.email}
                 key={user.email}
+                onClick={() => selectUserCard(user)}
                 onDragStart={(event) => {
                   event.dataTransfer.effectAllowed = "move";
                   event.dataTransfer.setData("text/plain", user.email);
+                  setSelectedUserEmail(user.email);
                 }}
               >
                 <div>
@@ -1924,6 +2044,7 @@ function AdminView({
                 <select
                   value={user.role}
                   disabled={user.email === currentUser.email}
+                  onClick={(event) => event.stopPropagation()}
                   onChange={(event) => onSetUserRole(user.email, event.target.value as "admin" | "member")}
                 >
                   <option value="member">멤버</option>
@@ -1931,7 +2052,13 @@ function AdminView({
                 </select>
                 <div className="user-actions">
                   {user.status === "pending" ? (
-                    <button type="button" onClick={() => onApproveUser(user.email, user.role)}>
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onApproveUser(user.email, user.role);
+                      }}
+                    >
                       승인
                     </button>
                   ) : null}
@@ -1939,7 +2066,10 @@ function AdminView({
                     className="danger-button"
                     disabled={user.email === currentUser.email}
                     type="button"
-                    onClick={() => deleteUser(user)}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      deleteUser(user);
+                    }}
                   >
                     삭제
                   </button>
@@ -2166,36 +2296,44 @@ function formatPropertyValue(key: string, value: unknown) {
   return formatter.format(value);
 }
 
+function formatLocalAiWarning(error: string) {
+  const lower = error.toLowerCase();
+  if (
+    lower.includes("failed to load clip model") ||
+    lower.includes("failed to load model") ||
+    lower.includes("no such file or directory")
+  ) {
+    return "AI Query 연결 경고: Ollama 모델 파일을 불러오지 못했습니다. 모델 저장소를 복구한 뒤 다시 시도하세요.";
+  }
+  if (lower.includes("not reachable") || lower.includes("connection refused")) {
+    return "AI Query 연결 경고: Ollama 서버에 연결할 수 없습니다. Ollama와 로컬 AI Proxy 실행 상태를 확인하세요.";
+  }
+  if (lower.includes("unauthorized") || lower.includes("401")) {
+    return "AI Query 연결 경고: 로컬 AI Proxy 인증 토큰이 맞지 않습니다.";
+  }
+  return `AI Query 연결 경고: ${error.slice(0, 180)}${error.length > 180 ? "..." : ""}`;
+}
+
 function AiQueryPanel({
   loading,
   messages,
-  packTitle,
   question,
   onQuestionChange,
   onSubmit,
 }: {
   loading: boolean;
   messages: AiMessage[];
-  packTitle: string;
   question: string;
   onQuestionChange: (value: string) => void;
   onSubmit: () => void;
 }) {
   return (
     <div className="ai-query-panel">
-      <div className="ai-context-card">
-        <Bot size={18} />
-        <div>
-          <strong>Qwen3-14B</strong>
-          <span>{packTitle || "선택한 온톨로지 팩"} 기준으로 답변합니다.</span>
-        </div>
-      </div>
-
       <div className="ai-message-list" aria-live="polite">
         {messages.length ? (
           messages.map((message) => (
             <article className={`ai-message ${message.role}`} key={message.id}>
-              <strong>{message.role === "user" ? "질문" : "Qwen"}</strong>
+              <strong>{message.role === "user" ? "질문" : "AI Query"}</strong>
               <p>{message.content}</p>
               {message.evidence?.length ? (
                 <div className="ai-evidence-list">
@@ -2210,15 +2348,17 @@ function AiQueryPanel({
           ))
         ) : (
           <div className="ai-empty-state">
-            <Bot size={30} />
             <strong>프로젝트 데이터에 바로 질문하세요</strong>
             <span>선택한 온톨로지 팩의 문서, 노드, 관계를 근거로 답변합니다.</span>
           </div>
         )}
         {loading ? (
-          <article className="ai-message assistant loading">
-            <strong>Qwen</strong>
-            <p>그래프 근거를 찾고 답변을 생성하는 중입니다.</p>
+          <article className="ai-message assistant ai-message-pending">
+            <strong>AI Query</strong>
+            <p>
+              <LoaderCircle className="inline-loading-spinner" size={14} />
+              답변을 생성중입니다.
+            </p>
           </article>
         ) : null}
       </div>
@@ -2241,10 +2381,6 @@ function AiQueryPanel({
             }
           }}
         />
-        <button type="submit" disabled={loading || !question.trim()}>
-          <Send size={16} />
-          질의
-        </button>
       </form>
     </div>
   );
@@ -2516,21 +2652,28 @@ function GraphCanvas({
 
     let middlePan:
       | {
-          startX: number;
-          startY: number;
-          camera: { x: number; y: number; angle: number; ratio: number };
+          lastX: number;
+          lastY: number;
         }
       | null = null;
+
+    const viewportPointFromMouse = (event: MouseEvent) => {
+      const rect = container.getBoundingClientRect();
+      return {
+        x: event.clientX - rect.left,
+        y: event.clientY - rect.top,
+      };
+    };
 
     const handleMouseDown = (event: MouseEvent) => {
       if (event.button !== 1) return;
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
+      const point = viewportPointFromMouse(event);
       middlePan = {
-        startX: event.clientX,
-        startY: event.clientY,
-        camera: renderer.getCamera().getState(),
+        lastX: point.x,
+        lastY: point.y,
       };
       container.classList.add("middle-panning");
     };
@@ -2539,14 +2682,17 @@ function GraphCanvas({
       if (!middlePan) return;
       event.preventDefault();
       event.stopPropagation();
-      const dx = event.clientX - middlePan.startX;
-      const dy = event.clientY - middlePan.startY;
-      const scale = middlePan.camera.ratio * MIDDLE_PAN_SENSITIVITY;
+      const point = viewportPointFromMouse(event);
+      const lastMouse = renderer.viewportToFramedGraph({ x: middlePan.lastX, y: middlePan.lastY });
+      const mouse = renderer.viewportToFramedGraph(point);
+      const cameraState = renderer.getCamera().getState();
       setCameraStateWithPan(renderer, {
-        ...middlePan.camera,
-        x: middlePan.camera.x - dx * scale,
-        y: middlePan.camera.y + dy * scale,
+        ...cameraState,
+        x: cameraState.x + lastMouse.x - mouse.x,
+        y: cameraState.y + lastMouse.y - mouse.y,
       });
+      middlePan.lastX = point.x;
+      middlePan.lastY = point.y;
     };
 
     const handleMouseUp = () => {
@@ -2703,7 +2849,11 @@ function GraphCanvas({
       <div ref={containerRef} className="sigma-stage" />
       {controlHost ? createPortal(controlPanel, controlHost) : null}
       {graphStats ? <GraphStatsPanel stats={graphStats} /> : null}
-      {!graph && <div className="loading">온톨로지 그래프를 불러오는 중</div>}
+      {!graph && (
+        <div className="graph-loading-overlay" aria-label="그래프 로딩 중">
+          <LoaderCircle className="loading-spinner" size={26} />
+        </div>
+      )}
     </div>
   );
 }

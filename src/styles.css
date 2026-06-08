@@ -174,9 +174,20 @@ nav {
   padding: 26px clamp(18px, 4vw, 64px);
 }
 
-.landing-page.loading {
+.landing-page.boot-loading {
   display: grid;
   place-items: center;
+}
+
+.loading-spinner,
+.inline-loading-spinner {
+  animation: loading-spin 0.9s linear infinite;
+}
+
+@keyframes loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .landing-nav {
@@ -738,6 +749,8 @@ h2 {
 }
 
 .inspector {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
   padding: 16px;
 }
@@ -752,6 +765,19 @@ h2 {
 
 .panel-header.slim {
   padding: 0 0 14px;
+}
+
+.panel-header.slim.graph-inspector-header > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+}
+
+.panel-header.slim.graph-inspector-header span {
+  margin-top: 0;
+  text-align: right;
 }
 
 .inspector-tabs {
@@ -783,46 +809,17 @@ h2 {
 
 .ai-query-panel {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr) auto;
+  flex: 1;
   gap: 12px;
   min-height: 0;
-}
-
-.ai-context-card {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  border: 1px solid #d8efe7;
-  border-radius: 8px;
-  background: #f1fcf8;
-  color: #0f766e;
-  padding: 10px;
-}
-
-.ai-context-card strong,
-.ai-context-card span {
-  display: block;
-}
-
-.ai-context-card strong {
-  color: #0f172a;
-  font-size: 13px;
-  font-weight: 900;
-}
-
-.ai-context-card span {
-  color: #475569;
-  font-size: 12px;
-  font-weight: 750;
-  margin-top: 2px;
 }
 
 .ai-message-list {
   display: grid;
   align-content: start;
   gap: 10px;
-  min-height: 310px;
-  max-height: calc(100vh - 390px);
+  min-height: 0;
   overflow: auto;
   padding-right: 4px;
 }
@@ -833,6 +830,8 @@ h2 {
   min-height: 300px;
   color: #64748b;
   text-align: center;
+  align-content: center;
+  gap: 8px;
 }
 
 .ai-empty-state strong,
@@ -841,16 +840,15 @@ h2 {
 }
 
 .ai-empty-state strong {
-  margin-top: 10px;
   color: #0f172a;
   font-size: 14px;
 }
 
 .ai-empty-state span {
-  max-width: 240px;
-  margin-top: 6px;
-  font-size: 12px;
+  max-width: 100%;
+  font-size: 11.5px;
   line-height: 1.45;
+  white-space: nowrap;
 }
 
 .ai-message {
@@ -863,12 +861,16 @@ h2 {
 }
 
 .ai-message.user {
+  justify-self: stretch;
   border-color: #bfe7dc;
   background: #f1fcf8;
 }
 
 .ai-message.assistant {
+  justify-self: end;
+  width: min(100%, 270px);
   background: #f8fcff;
+  text-align: right;
 }
 
 .ai-message strong {
@@ -886,13 +888,18 @@ h2 {
   white-space: pre-wrap;
 }
 
-.ai-message.loading p {
+.ai-message-pending p {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
   color: #64748b;
 }
 
 .ai-evidence-list {
   display: flex;
   flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 6px;
 }
 
@@ -912,9 +919,8 @@ h2 {
 
 .ai-chat-form {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 70px;
-  gap: 8px;
-  align-items: end;
+  grid-template-columns: minmax(0, 1fr);
+  margin-top: auto;
   border-top: 1px solid #e6edf4;
   padding-top: 12px;
 }
@@ -937,25 +943,6 @@ h2 {
 .ai-chat-form textarea:focus {
   border-color: #8edbc7;
   box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.1);
-}
-
-.ai-chat-form button {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  min-height: 40px;
-  border: 0;
-  border-radius: 8px;
-  color: #fff;
-  background: #0f766e;
-  font-size: 12px;
-  font-weight: 900;
-}
-
-.ai-chat-form button:disabled {
-  cursor: not-allowed;
-  background: #9fb6c3;
 }
 
 .panel-header span {
@@ -1238,13 +1225,14 @@ h2 {
   text-align: right;
 }
 
-.loading {
+.graph-loading-overlay {
   position: absolute;
   inset: 0;
   display: grid;
   place-items: center;
   color: #64748b;
-  font-weight: 800;
+  background: rgba(248, 252, 255, 0.72);
+  backdrop-filter: blur(1px);
 }
 
 .empty-state {
@@ -1270,6 +1258,25 @@ h2 {
   margin-top: 6px;
   font-size: 13px;
   line-height: 1.45;
+}
+
+.node-empty-state {
+  min-height: 300px;
+  align-content: center;
+  gap: 8px;
+}
+
+.node-empty-state strong {
+  margin-top: 0;
+  color: #0f172a;
+  font-size: 14px;
+}
+
+.node-empty-state span {
+  max-width: 100%;
+  margin-top: 0;
+  font-size: 11.5px;
+  white-space: nowrap;
 }
 
 .node-details {
@@ -1470,9 +1477,12 @@ dd {
 
 .dashboard-grid,
 .management-grid,
-.admin-grid,
-.mcp-workspace-grid {
+.admin-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.mcp-workspace-grid {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .management-grid {
@@ -1730,7 +1740,7 @@ dd {
 
 .user-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 84px 110px 118px;
+  grid-template-columns: minmax(0, 1fr) 84px 110px 132px;
   align-items: center;
   gap: 10px;
   min-height: 72px;
@@ -1738,10 +1748,22 @@ dd {
   border-radius: 8px;
   background: #fff;
   padding: 10px;
+  transition: border-color 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
+  user-select: none;
 }
 
 .user-row[draggable="true"] {
   cursor: grab;
+}
+
+.user-row:hover,
+.user-row.selected {
+  border-color: #7dd3c7;
+  background: #f1fcf8;
+}
+
+.user-row.selected {
+  box-shadow: 0 0 0 2px rgba(13, 148, 136, 0.16);
 }
 
 .user-row[draggable="true"]:active {
@@ -1864,14 +1886,20 @@ dd {
   font-weight: 900;
 }
 
-.user-actions {
+.user-row .user-actions {
   display: flex;
+  flex-direction: row;
+  align-items: center;
   justify-content: flex-end;
   gap: 6px;
+  width: 132px;
+  min-width: 132px;
 }
 
-.user-actions button {
+.user-row .user-actions button {
+  flex: 0 0 58px;
   min-width: 52px;
+  padding: 0 8px;
 }
 
 .danger-button {
@@ -2168,30 +2196,26 @@ dd {
   gap: 12px;
 }
 
-.url-tabs {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 6px;
-  border: 1px solid #dbe6ef;
-  border-radius: 8px;
-  background: #f5f9fd;
-  padding: 4px;
+.mcp-url-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 
-.url-tabs button {
-  min-height: 32px;
-  border: 0;
-  border-radius: 6px;
-  color: #64748b;
-  background: transparent;
-  font-size: 12px;
+.mcp-url-actions button {
+  min-height: 30px;
+  border: 1px solid #bfe7dc;
+  border-radius: 7px;
+  color: #0f766e;
+  background: #ecfbf6;
+  padding: 0 10px;
+  font-size: 11px;
   font-weight: 900;
 }
 
-.url-tabs button.active {
-  color: #0f766e;
-  background: #fff;
-  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
+.mcp-url-actions button:disabled {
+  cursor: wait;
+  opacity: 0.65;
 }
 
 .mcp-url-card {
@@ -2239,12 +2263,20 @@ dd {
   font-weight: 900;
 }
 
-.mcp-url-notes {
-  display: grid;
+.mcp-url-scope {
+  display: flex;
+  flex-wrap: wrap;
   gap: 6px;
-  color: #64748b;
+}
+
+.mcp-url-scope span {
+  border: 1px solid #d9e8f1;
+  border-radius: 999px;
+  background: #f8fcff;
+  color: #475569;
+  padding: 5px 8px;
   font-size: 11px;
-  line-height: 1.45;
+  font-weight: 850;
 }
 
 .auth-card {
@@ -2422,6 +2454,87 @@ dd {
   color: #64748b;
   font-size: 11px;
   font-style: normal;
+}
+
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  background: rgba(15, 23, 42, 0.38);
+  padding: 20px;
+  backdrop-filter: blur(8px);
+}
+
+.confirm-dialog {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 14px;
+  width: min(430px, 100%);
+  border: 1px solid #dbe5ee;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 28px 70px rgba(15, 23, 42, 0.28);
+  padding: 18px;
+}
+
+.confirm-dialog-icon {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  border-radius: 8px;
+  color: #b91c1c;
+  background: #fff1f2;
+}
+
+.confirm-dialog-copy {
+  min-width: 0;
+}
+
+.confirm-dialog h2 {
+  margin: 0;
+  color: #0f172a;
+  font-size: 16px;
+  font-weight: 900;
+  letter-spacing: 0;
+}
+
+.confirm-dialog p {
+  margin: 7px 0 0;
+  color: #475569;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.55;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+
+.confirm-dialog-actions {
+  display: flex;
+  grid-column: 1 / -1;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 6px;
+}
+
+.danger-confirm-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  border: 1px solid #dc2626;
+  border-radius: 7px;
+  color: #fff;
+  background: #dc2626;
+  padding: 0 13px;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.danger-confirm-button:hover {
+  background: #b91c1c;
 }
 
 @media (max-width: 1180px) {

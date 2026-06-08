@@ -9,7 +9,7 @@ if (-not $env:MODDULAR_GRAPH_ROOT) {
 
 $HostName = if ($env:MODULAR_GRAPH_MCP_HOST) { $env:MODULAR_GRAPH_MCP_HOST } else { "127.0.0.1" }
 $Port = if ($env:MODULAR_GRAPH_MCP_PORT) { $env:MODULAR_GRAPH_MCP_PORT } else { "8011" }
-$Path = if ($env:MODULAR_GRAPH_MCP_PATH) { $env:MODULAR_GRAPH_MCP_PATH } else { "/mcp" }
+$Path = if ($env:MODULAR_GRAPH_MCP_PATH) { $env:MODULAR_GRAPH_MCP_PATH } else { "/mcp/{mcp_token}" }
 $AllowedHosts = if ($env:MODULAR_GRAPH_MCP_ALLOWED_HOSTS) { $env:MODULAR_GRAPH_MCP_ALLOWED_HOSTS } else { "127.0.0.1:*,localhost:*,[::1]:*" }
 $AllowedOrigins = if ($env:MODULAR_GRAPH_MCP_ALLOWED_ORIGINS) { $env:MODULAR_GRAPH_MCP_ALLOWED_ORIGINS } else { "http://127.0.0.1:*,http://localhost:*,http://[::1]:*" }
 

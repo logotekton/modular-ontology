@@ -9,6 +9,8 @@ description = "Local Manus-style agent harness core engine and design harness."
 requires-python = ">=3.11"
 dependencies = [
     "openai>=1.93.0,<2.0.0",
+    "google-auth>=2.29.0,<3.0.0",
+    "requests>=2.31.0,<3.0.0",
     "fastapi>=0.100.0",
     "uvicorn>=0.20.0",
     "pydantic>=2.0.0",

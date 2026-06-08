@@ -6,6 +6,7 @@ import os
 from collections.abc import Sequence
 
 from .auth import get_company_project_access
+from .mcp_tokens import get_mcp_token_record
 from .pack_index import (
     build_graph as read_graph,
     get_assembly_mark as read_assembly_mark,
@@ -40,7 +41,7 @@ except Exception as exc:  # pragma: no cover - import-time operator hint
 
 DEFAULT_HOST = os.environ.get("MODULAR_GRAPH_MCP_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("MODULAR_GRAPH_MCP_PORT", "8011"))
-DEFAULT_PATH = os.environ.get("MODULAR_GRAPH_MCP_PATH", "/mcp")
+DEFAULT_PATH = os.environ.get("MODULAR_GRAPH_MCP_PATH", "/mcp/{mcp_token}")
 DEFAULT_ALLOWED_HOSTS = os.environ.get(
     "MODULAR_GRAPH_MCP_ALLOWED_HOSTS",
     "127.0.0.1:*,localhost:*,[::1]:*",
@@ -106,8 +107,52 @@ def _json(payload: object, *, pretty: bool = True) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2 if pretty else None)
 
 
-def _mcp_company() -> str:
+def _mcp_company_env() -> str:
     return os.environ.get("MODULAR_GRAPH_MCP_COMPANY", "").strip()
+
+
+def _request_mcp_token() -> str:
+    try:
+        request = mcp.get_context().request_context.request
+    except Exception:
+        return ""
+    if request is None:
+        return ""
+    token = ""
+    path_params = getattr(request, "path_params", None)
+    if isinstance(path_params, dict):
+        token = str(path_params.get("mcp_token") or "").strip()
+    if not token:
+        query_params = getattr(request, "query_params", None)
+        if query_params is not None:
+            token = str(query_params.get("token", "")).strip()
+    if not token:
+        path = getattr(getattr(request, "url", None), "path", "") or getattr(request, "scope", {}).get("path", "")
+        prefix = str(mcp.settings.streamable_http_path).split("{", 1)[0].rstrip("/") + "/"
+        if path.startswith(prefix):
+            token = path[len(prefix) :].split("/", 1)[0].strip()
+    return token
+
+
+def _mcp_scope() -> dict:
+    token = _request_mcp_token()
+    if token:
+        record = get_mcp_token_record(token)
+        if not record:
+            return {"authorized": False, "token": token, "company": "", "userEmail": ""}
+        return {"authorized": True, **record}
+    return {"authorized": True, "company": _mcp_company_env(), "userEmail": "", "token": ""}
+
+
+def _mcp_authorized() -> bool:
+    return bool(_mcp_scope().get("authorized"))
+
+
+def _mcp_company() -> str:
+    scope = _mcp_scope()
+    if not scope.get("authorized"):
+        return ""
+    return str(scope.get("company") or "").strip()
 
 
 def _is_internal_company(company: str) -> bool:
@@ -116,6 +161,8 @@ def _is_internal_company(company: str) -> bool:
 
 
 def _visible_projects() -> list[dict]:
+    if not _mcp_authorized():
+        return []
     company = _mcp_company()
     projects = read_projects()
     if _is_internal_company(company):
@@ -134,11 +181,15 @@ def _visible_pack_ids() -> set[str]:
 
 
 def _pack_is_visible(pack_id: str) -> bool:
+    if not _mcp_authorized():
+        return False
     company = _mcp_company()
     return _is_internal_company(company) or pack_id in _visible_pack_ids()
 
 
 def _forbidden_pack(pack_id: str) -> str:
+    if not _mcp_authorized():
+        return _json({"error": "unauthorized", "detail": "Invalid MCP user URL token."}, pretty=False)
     return _json(
         {
             "error": "forbidden",
@@ -150,6 +201,8 @@ def _forbidden_pack(pack_id: str) -> str:
 
 
 def _filter_pack_list(packs: list[dict]) -> list[dict]:
+    if not _mcp_authorized():
+        return []
     company = _mcp_company()
     if _is_internal_company(company):
         return packs
@@ -158,6 +211,8 @@ def _filter_pack_list(packs: list[dict]) -> list[dict]:
 
 
 def _filter_sources(payload: dict) -> dict:
+    if not _mcp_authorized():
+        return {**payload, "count": 0, "sources": []}
     sources = payload.get("sources")
     if not isinstance(sources, list):
         return payload
@@ -172,13 +227,24 @@ def _filter_sources(payload: dict) -> dict:
 def copycrab_status() -> str:
     """Return MCP server, pack, project, and tool status for CopyCrab/Modular Graph."""
 
+    if not _mcp_authorized():
+        return _json(
+            {
+                "status": "unauthorized",
+                "server": "Modular Graph MCP",
+                "detail": "Invalid MCP user URL token.",
+                "tools": [],
+            }
+        )
     packs = _filter_pack_list(read_packs())
     projects = _visible_projects()
+    scope = _mcp_scope()
     return _json(
         {
             "status": "ok",
             "server": "Modular Graph MCP",
             "company": _mcp_company() or "all",
+            "userEmail": scope.get("userEmail") or "",
             "pack_count": len(packs),
             "project_count": len(projects),
             "tools": TOOL_NAMES,

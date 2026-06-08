@@ -17,6 +17,8 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from moddular_graph import mcp_server
 from moddular_graph.app import app
+from moddular_graph.auth import User, _hash_password
+from moddular_graph.mcp_tokens import build_user_mcp_urls, ensure_mcp_token_for_user, get_mcp_token_record
 from moddular_graph.pack_index import (
     build_graph,
     get_fasteners,
@@ -29,6 +31,7 @@ from moddular_graph.pack_index import (
 )
 from moddular_graph.qa import answer_pack_question
 from moddular_graph.store import index_all_packs, search_documents
+from moddular_graph.google_drive_sync import DriveItem, google_drive_sync_status, sync_google_drive_storage
 
 
 client = TestClient(app)
@@ -327,6 +330,84 @@ def test_admin_can_delete_company_with_confirmed_users_and_delete_members(monkey
     )
 
 
+def test_deleted_default_user_can_re_register_and_show_for_approval(monkeypatch, tmp_path) -> None:
+    from moddular_graph.auth import _hash_password, invalidate_users_cache
+
+    users_file = tmp_path / "users.json"
+    users_file.write_text(
+        json.dumps(
+            {
+                "companies": ["Kumkang Kind"],
+                "deleted_users": ["mwhong@kumkangkind.com"],
+                "users": [
+                    {
+                        "id": "rejoin-mwhong",
+                        "name": "홍민우",
+                        "email": "mwhong@kumkangkind.com",
+                        "company": "Kumkang Kind",
+                        "role": "member",
+                        "status": "pending",
+                        "password_hash": _hash_password("member123!"),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    invalidate_users_cache()
+    admin_login = client.post(
+        "/api/auth/login",
+        json={"email": "ythong@kumkangkind.com", "password": TEST_ADMIN_PASSWORD},
+    )
+    token = admin_login.json()["token"]
+
+    users = client.get("/api/admin/users", headers={"Authorization": f"Bearer {token}"}).json()["users"]
+    rejoin_user = next(user for user in users if user["email"] == "mwhong@kumkangkind.com")
+    deleted = client.delete(
+        "/api/admin/users/mwhong@kumkangkind.com",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert rejoin_user["name"] == "홍민우"
+    assert rejoin_user["status"] == "pending"
+    assert deleted.status_code == 200
+
+
+def test_deleted_user_can_register_again_and_clears_tombstone(monkeypatch, tmp_path) -> None:
+    import json as _json
+
+    from moddular_graph import auth
+    from moddular_graph.auth import (
+        _load_deleted_users,
+        delete_user,
+        invalidate_users_cache,
+        load_users,
+        register_user,
+    )
+
+    users_file = tmp_path / "users.json"
+    users_file.write_text(_json.dumps({"companies": ["Kumkang Kind"], "users": []}), encoding="utf-8")
+    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    invalidate_users_cache()
+
+    # Delete a default admin -> creates a deletion tombstone.
+    delete_user("mwhong@kumkangkind.com", actor_email="ythong@kumkangkind.com")
+    assert "mwhong@kumkangkind.com" in _load_deleted_users(users_file.resolve())
+    assert "mwhong@kumkangkind.com" not in load_users()
+
+    # Re-registration should succeed and clear the tombstone so the pending
+    # signup is visible to admins for approval.
+    user = register_user("mwhong@kumkangkind.com", "member123!", name="홍민우")
+    assert user.status == "pending"
+    assert "mwhong@kumkangkind.com" not in _load_deleted_users(users_file.resolve())
+
+    reloaded = load_users().get("mwhong@kumkangkind.com")
+    assert reloaded is not None
+    assert reloaded.status == "pending"
+    assert reloaded.name == "홍민우"
+
+
 def test_external_company_only_sees_assigned_projects_and_graphs(monkeypatch, tmp_path) -> None:
     from moddular_graph.auth import _hash_password
 
@@ -408,13 +489,81 @@ def test_auth_can_load_users_from_json_config(monkeypatch, tmp_path) -> None:
     assert user.id == "config-admin"
 
 
+def test_auth_token_survives_empty_memory_session(monkeypatch, tmp_path) -> None:
+    import moddular_graph.auth as auth
+    from moddular_graph.auth import _hash_password, authenticate, get_user_by_token, invalidate_users_cache
+
+    users_file = tmp_path / "users.json"
+    users_file.write_text(
+        json.dumps(
+            {
+                "users": [
+                    {
+                        "id": "stateless-admin",
+                        "name": "Stateless Admin",
+                        "email": "stateless.admin@example.com",
+                        "role": "admin",
+                        "password_hash": _hash_password("stateless-admin-pass"),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODDULAR_GRAPH_SESSION_SECRET", "test-session-secret")
+    invalidate_users_cache()
+
+    token, user = authenticate("stateless.admin@example.com", "stateless-admin-pass")
+    auth.SESSIONS.clear()
+
+    assert token.startswith("v1.")
+    assert user.id == "stateless-admin"
+    assert get_user_by_token(token).id == "stateless-admin"  # type: ignore[union-attr]
+
+
+def test_auth_accepts_utf8_bom_user_files(monkeypatch, tmp_path) -> None:
+    from moddular_graph.auth import _hash_password, authenticate, invalidate_users_cache
+
+    users_file = tmp_path / "users-with-bom.json"
+    payload = json.dumps(
+        {
+            "users": [
+                {
+                    "id": "bom-admin",
+                    "name": "BOM Admin",
+                    "email": "bom.admin@example.com",
+                    "role": "admin",
+                    "password_hash": _hash_password("bom-admin-pass"),
+                }
+            ]
+        }
+    )
+    users_file.write_text(f"\ufeff{payload}", encoding="utf-8")
+    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    invalidate_users_cache()
+
+    token, user = authenticate("bom.admin@example.com", "bom-admin-pass")
+
+    assert token
+    assert user.id == "bom-admin"
+
+
 def test_pack_upload_is_session_admin_only_and_accepts_valid_zip(monkeypatch, tmp_path) -> None:
+    from moddular_graph import app as app_module
     import moddular_graph.pack_index as pack_index
     import moddular_graph.store as store
     from moddular_graph.auth import _hash_password
 
     monkeypatch.setattr(pack_index, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(store, "DB_PATH", tmp_path / "uploaded-index.sqlite3")
+    sync_forces: list[bool] = []
+
+    def fake_run_google_drive_sync(force=False):
+        sync_forces.append(force)
+        return {"status": "skipped"}
+
+    monkeypatch.setattr(app_module, "run_google_drive_sync", fake_run_google_drive_sync)
     users_file = tmp_path / "users.json"
     users_file.write_text(
         json.dumps(
@@ -464,6 +613,7 @@ def test_pack_upload_is_session_admin_only_and_accepts_valid_zip(monkeypatch, tm
     assert allowed.json()["ingest"]["nodes"] == 2
     assert allowed.json()["ingest"]["edges"] == 1
     assert (tmp_path / "sample.zip").exists()
+    assert True in sync_forces
 
 
 def test_mcp_tools_return_json_payloads() -> None:
@@ -509,6 +659,64 @@ def test_mcp_company_scope_filters_projects_and_packs(monkeypatch, tmp_path) -> 
     assert [project["id"] for project in projects] == ["yeoju-modular-dormitory"]
     assert [pack["id"] for pack in packs] == ["revit-yeoju-ar-ifc-workset-module-localcrab-pack"]
     assert allowed_graph["stats"]["visibleNodes"] > 0
+    assert blocked_graph["error"] == "forbidden"
+
+
+def test_mcp_user_token_store_reuses_active_token(tmp_path) -> None:
+    token_file = tmp_path / "00_Admin" / "mcp_tokens.json"
+    user = User(
+        id="client-member",
+        name="Client Member",
+        email="Client.Member@example.com",
+        company="Client Co",
+        role="member",
+        password_hash=_hash_password("member-pass"),
+        status="active",
+    )
+
+    first = ensure_mcp_token_for_user(user, path=token_file)
+    second = ensure_mcp_token_for_user(user, path=token_file)
+    urls = build_user_mcp_urls("https://example.trycloudflare.com", first["token"])
+
+    assert first["token"].startswith("mom_")
+    assert second["token"] == first["token"]
+    assert get_mcp_token_record(first["token"], path=token_file)["company"] == "Client Co"
+    assert urls["publicUrl"] == f"https://example.trycloudflare.com/mcp/{first['token']}"
+
+
+def test_mcp_user_token_scope_filters_projects_and_packs(monkeypatch, tmp_path) -> None:
+    users_file = tmp_path / "users.json"
+    token_file = tmp_path / "mcp_tokens.json"
+    users_file.write_text(
+        json.dumps(
+            {
+                "companies": ["Client Co"],
+                "company_project_access": {"Client Co": ["yeoju-modular-dormitory"]},
+                "users": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    user = User(
+        id="client-member",
+        name="Client Member",
+        email="client.member@example.com",
+        company="Client Co",
+        role="member",
+        password_hash=_hash_password("member-pass"),
+        status="active",
+    )
+    token = ensure_mcp_token_for_user(user, path=token_file)["token"]
+    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    monkeypatch.setattr(mcp_server, "_request_mcp_token", lambda: token)
+    monkeypatch.setattr(mcp_server, "get_mcp_token_record", lambda value: get_mcp_token_record(value, path=token_file))
+
+    projects = json.loads(mcp_server.list_projects())
+    packs = json.loads(mcp_server.list_packs())
+    blocked_graph = json.loads(mcp_server.get_graph("advance-steel-samcheok-bldg-b-bm25-evidence-pack", 5, 5))
+
+    assert [project["id"] for project in projects] == ["yeoju-modular-dormitory"]
+    assert [pack["id"] for pack in packs] == ["revit-yeoju-ar-ifc-workset-module-localcrab-pack"]
     assert blocked_graph["error"] == "forbidden"
 
 
@@ -614,6 +822,22 @@ def test_local_graph_rag_answer_uses_evidence_and_graph_context(tmp_path) -> Non
     assert answer["graphContext"]["nodes"]
 
 
+def test_local_graph_rag_answers_module_weight_when_document_search_misses(tmp_path) -> None:
+    db_path = tmp_path / "module-weight-index.sqlite3"
+    index_all_packs(db_path=db_path)
+
+    answer = answer_pack_question(
+        "advance-steel-samcheok-bldg-b-bm25-evidence-pack",
+        "1-05-ST weight",
+        limit=4,
+        db_path=db_path,
+    )
+
+    assert "5,800.246 kg" in answer["answer"]
+    assert answer["evidence"][0]["path"] == "documents/modules/1-05-ST.md"
+    assert answer["graphContext"]["facts"][0]["total_weight_kg"] == 5800.246
+
+
 def test_openai_graph_rag_path_uses_injected_client(monkeypatch, tmp_path) -> None:
     class FakeResponse:
         output_text = "Synthesized answer from provided ontology evidence."
@@ -655,11 +879,11 @@ def test_ollama_graph_rag_path_uses_injected_client(monkeypatch, tmp_path) -> No
 
     def fake_ollama(**kwargs):
         calls.append(kwargs)
-        return "Local Qwen answer from ontology evidence."
+        return "Local Gemma answer from ontology evidence."
 
     db_path = tmp_path / "ollama-qa-index.sqlite3"
     index_all_packs(db_path=db_path)
-    monkeypatch.setenv("MODDULAR_GRAPH_OLLAMA_MODEL", "qwen3:14b")
+    monkeypatch.setenv("MODDULAR_GRAPH_OLLAMA_MODEL", "gemma4:12b-it-q4_K_M")
 
     answer = answer_pack_question(
         "advance-steel-samcheok-bldg-b-bm25-evidence-pack",
@@ -670,10 +894,54 @@ def test_ollama_graph_rag_path_uses_injected_client(monkeypatch, tmp_path) -> No
         llm_client=fake_ollama,
     )
 
-    assert answer["mode"] == "ollama-qwen-graph-rag"
-    assert answer["answer"] == "Local Qwen answer from ontology evidence."
-    assert calls[0]["model"] == "qwen3:14b"
+    assert answer["mode"] == "ollama-graph-rag"
+    assert answer["answer"] == "Local Gemma answer from ontology evidence."
+    assert calls[0]["model"] == "gemma4:12b-it-q4_K_M"
     assert "evidence" in calls[0]["prompt"]
+
+
+def test_ollama_chat_request_uses_token_and_message_content(monkeypatch) -> None:
+    import moddular_graph.qa as qa
+
+    calls = []
+
+    def fake_post(url, payload, timeout):
+        calls.append({"url": url, "payload": payload, "timeout": timeout})
+        return {"message": {"role": "assistant", "content": "Gemma answer"}}
+
+    monkeypatch.setenv("MODDULAR_GRAPH_OLLAMA_URL", "https://ai.example.test")
+    monkeypatch.setenv("MODDULAR_GRAPH_OLLAMA_MODEL", "gemma4:12b-it-q4_K_M")
+    monkeypatch.setenv("MODDULAR_GRAPH_OLLAMA_TOKEN", "secret-token")
+    monkeypatch.setattr(qa, "_post_ollama_json", fake_post)
+
+    answer = qa._compose_ollama_answer("질문", [], [], [], "local fallback", [])
+
+    assert answer == "Gemma answer"
+    assert calls[0]["url"] == "https://ai.example.test/api/chat"
+    assert calls[0]["payload"]["model"] == "gemma4:12b-it-q4_K_M"
+    assert calls[0]["payload"]["think"] is False
+    assert calls[0]["payload"]["options"]["num_predict"] == 512
+    assert calls[0]["payload"]["messages"][0]["role"] == "system"
+    assert calls[0]["payload"]["messages"][1]["role"] == "user"
+    assert qa._ollama_headers()["X-Modular-AI-Token"] == "secret-token"
+
+
+def test_local_ai_proxy_requires_token(monkeypatch) -> None:
+    from fastapi.responses import Response
+    from fastapi.testclient import TestClient
+    import moddular_graph.local_ai_proxy as proxy
+
+    monkeypatch.setenv("MODDULAR_GRAPH_LOCAL_AI_TOKEN", "proxy-secret")
+    monkeypatch.setattr(proxy, "_forward_to_ollama", lambda *args, **kwargs: Response(b'{"ok":true}', media_type="application/json"))
+    proxy_client = TestClient(proxy.app)
+
+    missing = proxy_client.get("/api/tags")
+    wrong = proxy_client.get("/api/tags", headers={"X-Modular-AI-Token": "wrong"})
+    ok = proxy_client.get("/api/tags", headers={"X-Modular-AI-Token": "proxy-secret"})
+
+    assert missing.status_code == 401
+    assert wrong.status_code == 401
+    assert ok.status_code == 200
 
 
 def test_admin_reindex_api_requires_admin_session(monkeypatch, tmp_path) -> None:
@@ -721,3 +989,216 @@ def test_admin_reindex_api_requires_admin_session(monkeypatch, tmp_path) -> None
     assert forbidden.status_code == 403
     assert allowed.status_code == 200
     assert allowed.json()["stats"]["documents"] > 0
+
+
+def test_google_drive_sync_downloads_runtime_storage(tmp_path) -> None:
+    class FakeDriveClient:
+        children = {
+            "root": [
+                DriveItem("admin", "00_Admin", "application/vnd.google-apps.folder"),
+                DriveItem("database", "01_Database", "application/vnd.google-apps.folder"),
+                DriveItem("packs", "02_Ontology_Packs", "application/vnd.google-apps.folder"),
+            ],
+            "admin": [
+                DriveItem("users", "users.json", "application/json"),
+                DriveItem("mcp", "mcp_remote.json", "application/json"),
+                DriveItem("mcp_tokens", "mcp_tokens.json", "application/json"),
+            ],
+            "database": [DriveItem("db", "moddular_graph.sqlite3", "application/octet-stream")],
+            "packs": [DriveItem("indexed", "indexed", "application/vnd.google-apps.folder")],
+            "indexed": [
+                DriveItem("pack", "sample-pack.zip", "application/x-zip-compressed"),
+                DriveItem("readme", "README.md", "text/markdown"),
+            ],
+        }
+
+        payloads = {
+            "users": b'{"users":[]}',
+            "mcp": b'{"publicUrl":""}',
+            "mcp_tokens": b'{"tokens":[]}',
+            "db": b"sqlite-bytes",
+            "pack": b"zip-bytes",
+        }
+
+        def list_children(self, folder_id):
+            return self.children[folder_id]
+
+        def download_file(self, file_id, target):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(self.payloads[file_id])
+
+    result = sync_google_drive_storage(
+        client=FakeDriveClient(),
+        root_folder_id="root",
+        data_dir=tmp_path,
+        force=True,
+    )
+
+    assert result["status"] == "synced"
+    assert (tmp_path / "00_Admin" / "users.json").read_text(encoding="utf-8") == '{"users":[]}'
+    assert (tmp_path / "00_Admin" / "mcp_remote.json").exists()
+    assert (tmp_path / "00_Admin" / "mcp_tokens.json").exists()
+    assert (tmp_path / "01_Database" / "moddular_graph.sqlite3").read_bytes() == b"sqlite-bytes"
+    assert (tmp_path / "02_Ontology_Packs" / "indexed" / "sample-pack.zip").read_bytes() == b"zip-bytes"
+    assert not (tmp_path / "02_Ontology_Packs" / "indexed" / "README.md").exists()
+
+
+def test_login_syncs_google_drive_users_before_auth(monkeypatch, tmp_path) -> None:
+    from moddular_graph.auth import _hash_password, invalidate_users_cache, load_users
+    from moddular_graph import app as app_module
+
+    users_file = tmp_path / "00_Admin" / "users.json"
+    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODDULAR_GRAPH_GOOGLE_DRIVE_FOLDER_ID", "root")
+    invalidate_users_cache()
+    assert "drive.admin@example.com" not in load_users()
+
+    def fake_sync_google_drive_users_file():
+        users_file.parent.mkdir(parents=True, exist_ok=True)
+        users_file.write_text(
+            json.dumps(
+                {
+                    "users": [
+                        {
+                            "id": "drive-admin",
+                            "name": "Drive Admin",
+                            "email": "drive.admin@example.com",
+                            "company": "Kumkang Kind",
+                            "role": "admin",
+                            "password_hash": _hash_password("drive-admin-pass"),
+                            "status": "active",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {"status": "synced", "downloaded": [str(users_file)], "missing": []}
+
+    monkeypatch.setattr(app_module, "sync_google_drive_users_file", fake_sync_google_drive_users_file)
+
+    response = client.post(
+        "/api/auth/login",
+        json={"email": "drive.admin@example.com", "password": "drive-admin-pass"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["user"]["role"] == "admin"
+
+
+def test_admin_users_syncs_google_drive_users_before_listing(monkeypatch, tmp_path) -> None:
+    from moddular_graph.auth import invalidate_users_cache
+    from moddular_graph import app as app_module
+
+    users_file = tmp_path / "00_Admin" / "users.json"
+    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODDULAR_GRAPH_GOOGLE_DRIVE_FOLDER_ID", "root")
+    invalidate_users_cache()
+    sync_calls = 0
+
+    def fake_sync_google_drive_users_file():
+        nonlocal sync_calls
+        sync_calls += 1
+        pending_users = []
+        if sync_calls >= 2:
+            pending_users.append(
+                {
+                    "id": "drive-pending",
+                    "name": "Drive Pending",
+                    "email": "drive.pending@example.com",
+                    "company": "External Co",
+                    "role": "member",
+                    "password_hash": "unused",
+                    "status": "pending",
+                }
+            )
+        users_file.parent.mkdir(parents=True, exist_ok=True)
+        users_file.write_text(json.dumps({"users": pending_users}), encoding="utf-8")
+        return {"status": "synced", "downloaded": [str(users_file)], "missing": []}
+
+    monkeypatch.setattr(app_module, "sync_google_drive_users_file", fake_sync_google_drive_users_file)
+
+    admin = client.post(
+        "/api/auth/login",
+        json={"email": "ythong@kumkangkind.com", "password": TEST_ADMIN_PASSWORD},
+    )
+    response = client.get("/api/admin/users", headers={"Authorization": f"Bearer {admin.json()['token']}"})
+
+    assert response.status_code == 200
+    assert sync_calls >= 2
+    assert any(user["email"] == "drive.pending@example.com" for user in response.json()["users"])
+
+
+def test_google_drive_status_reads_marker_without_syncing(tmp_path) -> None:
+    marker = tmp_path / ".google-drive-sync.json"
+    marker.write_text(json.dumps({"status": "synced", "downloaded": ["db"], "missing": []}), encoding="utf-8")
+
+    status = google_drive_sync_status(data_dir=tmp_path)
+
+    assert status["status"] == "synced"
+    assert status["downloaded"] == ["db"]
+
+
+def test_google_drive_sync_rejects_duplicate_folder_names(tmp_path) -> None:
+    class FakeDriveClient:
+        def list_children(self, folder_id):
+            return [
+                DriveItem("admin-a", "00_Admin", "application/vnd.google-apps.folder"),
+                DriveItem("admin-b", "00_Admin", "application/vnd.google-apps.folder"),
+            ]
+
+        def download_file(self, file_id, target):
+            raise AssertionError("download should not run when folder names are ambiguous")
+
+    try:
+        sync_google_drive_storage(
+            client=FakeDriveClient(),
+            root_folder_id="root",
+            data_dir=tmp_path,
+            force=True,
+        )
+    except RuntimeError as exc:
+        assert "Duplicate Google Drive item names" in str(exc)
+    else:
+        raise AssertionError("Expected duplicate folder names to fail sync")
+
+
+def test_google_drive_status_requires_admin(monkeypatch) -> None:
+    monkeypatch.setenv("MODDULAR_GRAPH_GOOGLE_DRIVE_FOLDER_ID", "root")
+
+    response = client.get("/api/storage/google-drive/status")
+
+    assert response.status_code == 403
+
+
+def test_google_drive_sync_rejects_unsafe_pack_filename(tmp_path) -> None:
+    class FakeDriveClient:
+        children = {
+            "root": [
+                DriveItem("admin", "00_Admin", "application/vnd.google-apps.folder"),
+                DriveItem("database", "01_Database", "application/vnd.google-apps.folder"),
+                DriveItem("packs", "02_Ontology_Packs", "application/vnd.google-apps.folder"),
+            ],
+            "admin": [],
+            "database": [],
+            "packs": [DriveItem("indexed", "indexed", "application/vnd.google-apps.folder")],
+            "indexed": [DriveItem("pack", "../evil.zip", "application/x-zip-compressed")],
+        }
+
+        def list_children(self, folder_id):
+            return self.children[folder_id]
+
+        def download_file(self, file_id, target):
+            raise AssertionError("unsafe filenames must be rejected before download")
+
+    try:
+        sync_google_drive_storage(
+            client=FakeDriveClient(),
+            root_folder_id="root",
+            data_dir=tmp_path,
+            force=True,
+        )
+    except RuntimeError as exc:
+        assert "Unsafe Google Drive filename" in str(exc)
+    else:
+        raise AssertionError("Expected unsafe Drive filename to fail sync")

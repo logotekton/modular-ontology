@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, AsyncIterator, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,6 +23,7 @@ from .auth import (
     extract_bearer_token,
     get_company_project_access,
     get_user_by_token,
+    invalidate_users_cache,
     is_internal_user,
     list_companies,
     list_users,
@@ -32,8 +35,19 @@ from .auth import (
     set_user_role,
 )
 from .config import MCP_REMOTE_FILE, ROOT
+from .google_drive_sync import (
+    google_drive_sync_enabled,
+    google_drive_sync_status,
+    sync_google_drive_storage,
+    sync_google_drive_users_file,
+    write_back_database_file,
+    write_back_mcp_tokens_file,
+    write_back_pack_file,
+    write_back_users_file,
+)
 from .mcp_server import TOOL_NAMES
-from .pack_index import PackFile, build_graph, list_packs, list_projects, save_uploaded_pack
+from .mcp_tokens import build_user_mcp_urls, ensure_mcp_token_for_user
+from .pack_index import PackFile, build_graph, discover_pack_files, list_packs, list_projects, save_uploaded_pack
 from .project_store import (
     attach_pack_to_project,
     create_project,
@@ -49,10 +63,104 @@ from .store import connect, index_all_packs, index_pack, index_stats, init_db
 DIST_DIR = ROOT / "dist"
 
 
+def run_google_drive_sync(force: bool = False) -> dict[str, Any]:
+    try:
+        result = sync_google_drive_storage(force=force)
+        if result.get("status") == "synced":
+            invalidate_users_cache()
+        return result
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+
+
+def run_google_drive_users_sync() -> dict[str, Any]:
+    if not google_drive_sync_enabled():
+        return {"enabled": False, "status": "disabled"}
+    try:
+        result = sync_google_drive_users_file()
+        if result.get("status") == "synced":
+            invalidate_users_cache()
+        return {"enabled": True, **result}
+    except Exception as exc:
+        return {"enabled": True, "status": "error", "error": str(exc)}
+
+
+def require_google_drive_sync(result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("enabled") and result.get("status") == "error":
+        raise HTTPException(status_code=502, detail=f"Google Drive sync failed: {result.get('error')}")
+    return result
+
+
+def ensure_runtime_storage() -> dict[str, Any]:
+    if not google_drive_sync_enabled():
+        return {"enabled": False, "status": "disabled"}
+    status = google_drive_sync_status()
+    if status.get("status") in {"synced", "cached"}:
+        return {"enabled": True, **status}
+    result = run_google_drive_sync()
+    if result.get("status") == "synced":
+        try:
+            stats = index_stats()
+            if stats.get("packs", 0) == 0 and list_packs():
+                reindex_result = index_all_packs()
+                result["reindexed"] = reindex_result.get("stats", {})
+        except Exception as exc:
+            result["reindexError"] = str(exc)
+    return {"enabled": True, **result}
+
+
+def storage_runtime_status(status: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not google_drive_sync_enabled():
+        return {"enabled": False, "status": "disabled"}
+    status = status or google_drive_sync_status()
+    return {
+        "enabled": True,
+        "status": status.get("status", "unknown"),
+        "downloadedCount": len(status.get("downloaded", [])) if isinstance(status.get("downloaded"), list) else 0,
+        "missing": status.get("missing", []),
+        "error": status.get("error"),
+    }
+
+
+def run_google_drive_write_back(
+    kind: Literal["users", "database", "pack", "mcp_tokens"], path: Path | None = None
+) -> dict[str, Any]:
+    if not google_drive_sync_enabled():
+        return {"enabled": False, "status": "disabled"}
+    try:
+        if kind == "users":
+            result = write_back_users_file()
+        elif kind == "database":
+            result = write_back_database_file()
+        elif kind == "mcp_tokens":
+            result = write_back_mcp_tokens_file()
+        elif kind == "pack" and path:
+            result = write_back_pack_file(path)
+        else:
+            result = {"status": "skipped", "reason": f"Unsupported write-back kind: {kind}"}
+        return {"enabled": True, **result}
+    except Exception as exc:
+        return {"enabled": True, "status": "error", "error": str(exc)}
+
+
+def require_google_drive_write_back(result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("enabled") and result.get("status") == "error":
+        raise HTTPException(status_code=502, detail=f"Google Drive write-back failed: {result.get('error')}")
+    return result
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    if google_drive_sync_enabled():
+        run_google_drive_sync()
+    yield
+
+
 app = FastAPI(
     title="Modular Graph API",
     description="Project ontology pack ingestion, graph exploration, and MCP-ready data access API.",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -121,6 +229,7 @@ class ProjectPackRequest(BaseModel):
 
 
 def require_admin(authorization: str | None):
+    ensure_runtime_storage()
     user = get_user_by_token(extract_bearer_token(authorization))
     if not user or user.role != "admin":
         raise HTTPException(status_code=403, detail="Only administrators can access this resource.")
@@ -128,6 +237,7 @@ def require_admin(authorization: str | None):
 
 
 def current_user(authorization: str | None):
+    ensure_runtime_storage()
     token = extract_bearer_token(authorization)
     if not token:
         return None
@@ -138,6 +248,7 @@ def current_user(authorization: str | None):
 
 
 def visible_projects_for_user(user) -> list[dict[str, Any]]:
+    ensure_runtime_storage()
     projects = list_projects()
     if not user or is_internal_user(user):
         return projects
@@ -146,6 +257,7 @@ def visible_projects_for_user(user) -> list[dict[str, Any]]:
 
 
 def visible_pack_ids_for_user(user) -> set[str]:
+    ensure_runtime_storage()
     return {
         pack_id
         for project in visible_projects_for_user(user)
@@ -155,6 +267,7 @@ def visible_pack_ids_for_user(user) -> set[str]:
 
 
 def ensure_pack_access(pack_id: str, user) -> None:
+    ensure_runtime_storage()
     if not user or is_internal_user(user):
         return
     if pack_id not in visible_pack_ids_for_user(user):
@@ -186,6 +299,7 @@ def web_index():
 
 @app.post("/api/auth/login")
 def login(request: LoginRequest) -> dict[str, object]:
+    require_google_drive_sync(run_google_drive_users_sync())
     try:
         token, user = authenticate(request.email, request.password)
     except PermissionError as exc:
@@ -195,15 +309,18 @@ def login(request: LoginRequest) -> dict[str, object]:
 
 @app.post("/api/auth/register")
 def register(request: RegisterRequest) -> dict[str, object]:
+    require_google_drive_sync(run_google_drive_users_sync())
     try:
         user = register_user(request.email, request.password, request.name, request.company)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"status": "pending", "user": public_user(user)}
+    write_back = require_google_drive_write_back(run_google_drive_write_back("users"))
+    return {"status": "pending", "user": public_user(user), "writeBack": write_back}
 
 
 @app.get("/api/auth/me")
 def me(authorization: str | None = Header(default=None)) -> dict[str, object]:
+    require_google_drive_sync(run_google_drive_users_sync())
     token = extract_bearer_token(authorization)
     user = get_user_by_token(token)
     if not user:
@@ -220,29 +337,34 @@ def logout(authorization: str | None = Header(default=None)) -> dict[str, str]:
 @app.get("/api/admin/users")
 def admin_users(authorization: str | None = Header(default=None)) -> dict[str, object]:
     require_admin(authorization)
+    require_google_drive_sync(run_google_drive_users_sync())
     return {"users": [public_user(user) for user in list_users()]}
 
 
 @app.get("/api/admin/companies")
 def admin_companies(authorization: str | None = Header(default=None)) -> dict[str, object]:
     require_admin(authorization)
+    require_google_drive_sync(run_google_drive_users_sync())
     return {"companies": list_companies()}
 
 
 @app.get("/api/admin/company-project-access")
 def admin_company_project_access(authorization: str | None = Header(default=None)) -> dict[str, object]:
     require_admin(authorization)
+    require_google_drive_sync(run_google_drive_users_sync())
     return {"access": get_company_project_access()}
 
 
 @app.post("/api/admin/companies")
 def admin_add_company(request: CompanyRequest, authorization: str | None = Header(default=None)) -> dict[str, object]:
     require_admin(authorization)
+    require_google_drive_sync(run_google_drive_users_sync())
     try:
         company = add_company(request.name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"company": company, "companies": list_companies()}
+    write_back = require_google_drive_write_back(run_google_drive_write_back("users"))
+    return {"company": company, "companies": list_companies(), "writeBack": write_back}
 
 
 @app.post("/api/admin/companies/rename")
@@ -251,11 +373,13 @@ def admin_rename_company(
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
     require_admin(authorization)
+    require_google_drive_sync(run_google_drive_users_sync())
     try:
         company = rename_company(request.name, request.new_name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"company": company, "companies": list_companies()}
+    write_back = require_google_drive_write_back(run_google_drive_write_back("users"))
+    return {"company": company, "companies": list_companies(), "writeBack": write_back}
 
 
 @app.delete("/api/admin/companies/{name}")
@@ -265,11 +389,13 @@ def admin_delete_company(
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
     actor = require_admin(authorization)
+    require_google_drive_sync(run_google_drive_users_sync())
     try:
         company, deleted_users = delete_company(name, delete_users=delete_users, actor_email=actor.email)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"company": company, "deletedUsers": deleted_users, "companies": list_companies()}
+    write_back = require_google_drive_write_back(run_google_drive_write_back("users"))
+    return {"company": company, "deletedUsers": deleted_users, "companies": list_companies(), "writeBack": write_back}
 
 
 @app.post("/api/admin/users/{email}/approve")
@@ -279,13 +405,15 @@ def admin_approve_user(
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
     require_admin(authorization)
+    require_google_drive_sync(run_google_drive_users_sync())
     try:
         user = approve_user(email, request.role)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"User not found: {email}") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"user": public_user(user)}
+    write_back = require_google_drive_write_back(run_google_drive_write_back("users"))
+    return {"user": public_user(user), "writeBack": write_back}
 
 
 @app.post("/api/admin/users/{email}/company")
@@ -295,25 +423,29 @@ def admin_set_user_company(
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
     require_admin(authorization)
+    require_google_drive_sync(run_google_drive_users_sync())
     try:
         user = set_user_company(email, request.company)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"User not found: {email}") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"user": public_user(user)}
+    write_back = require_google_drive_write_back(run_google_drive_write_back("users"))
+    return {"user": public_user(user), "writeBack": write_back}
 
 
 @app.delete("/api/admin/users/{email}")
 def admin_delete_user(email: str, authorization: str | None = Header(default=None)) -> dict[str, object]:
     actor = require_admin(authorization)
+    require_google_drive_sync(run_google_drive_users_sync())
     try:
         user = delete_user(email, actor_email=actor.email)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"User not found: {email}") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"user": public_user(user)}
+    write_back = require_google_drive_write_back(run_google_drive_write_back("users"))
+    return {"user": public_user(user), "writeBack": write_back}
 
 
 @app.post("/api/admin/users/{email}/role")
@@ -323,13 +455,15 @@ def admin_set_user_role(
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
     require_admin(authorization)
+    require_google_drive_sync(run_google_drive_users_sync())
     try:
         user = set_user_role(email, request.role)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"User not found: {email}") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"user": public_user(user)}
+    write_back = require_google_drive_write_back(run_google_drive_write_back("users"))
+    return {"user": public_user(user), "writeBack": write_back}
 
 
 @app.post("/api/admin/companies/{name}/projects")
@@ -339,6 +473,7 @@ def admin_set_company_projects(
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
     require_admin(authorization)
+    require_google_drive_sync(run_google_drive_users_sync())
     valid_project_ids = {project["id"] for project in list_projects()}
     invalid_project_ids = [project_id for project_id in request.project_ids if project_id not in valid_project_ids]
     if invalid_project_ids:
@@ -347,7 +482,8 @@ def admin_set_company_projects(
         project_ids = set_company_project_access(name, request.project_ids)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"company": name, "projectIds": project_ids, "access": get_company_project_access()}
+    write_back = require_google_drive_write_back(run_google_drive_write_back("users"))
+    return {"company": name, "projectIds": project_ids, "access": get_company_project_access(), "writeBack": write_back}
 
 
 @app.get("/api/projects")
@@ -358,6 +494,7 @@ def projects(authorization: str | None = Header(default=None)) -> list[dict[str,
 @app.get("/api/projects/suggestions")
 def project_suggestions(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_admin(authorization)
+    ensure_runtime_storage()
     linked_pack_ids = {pack_id for project in list_projects() for pack_id in project.get("packIds", [])}
     suggestions = []
     for pack in list_packs():
@@ -377,6 +514,7 @@ def project_suggestions(authorization: str | None = Header(default=None)) -> dic
 @app.post("/api/admin/projects")
 def admin_create_project(request: ProjectRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_admin(authorization)
+    require_google_drive_sync(run_google_drive_sync(force=True))
     valid_pack_ids = {pack["id"] for pack in list_packs()}
     invalid_pack_ids = [pack_id for pack_id in request.pack_ids if pack_id not in valid_pack_ids]
     if invalid_pack_ids:
@@ -392,7 +530,8 @@ def admin_create_project(request: ProjectRequest, authorization: str | None = He
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"project": project, "projects": list_projects()}
+    write_back = require_google_drive_write_back(run_google_drive_write_back("database"))
+    return {"project": project, "projects": list_projects(), "writeBack": write_back}
 
 
 @app.put("/api/admin/projects/{project_id}")
@@ -402,6 +541,7 @@ def admin_update_project(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_admin(authorization)
+    require_google_drive_sync(run_google_drive_sync(force=True))
     try:
         update_project(
             project_id,
@@ -416,17 +556,24 @@ def admin_update_project(
         raise HTTPException(status_code=404, detail=f"Project not found: {project_id}") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"project": next(project for project in list_projects() if project["id"] == project_id), "projects": list_projects()}
+    write_back = require_google_drive_write_back(run_google_drive_write_back("database"))
+    return {
+        "project": next(project for project in list_projects() if project["id"] == project_id),
+        "projects": list_projects(),
+        "writeBack": write_back,
+    }
 
 
 @app.delete("/api/admin/projects/{project_id}")
 def admin_delete_project(project_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_admin(authorization)
+    require_google_drive_sync(run_google_drive_sync(force=True))
     try:
         delete_stored_project(project_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Project not found: {project_id}") from exc
-    return {"projectId": project_id, "projects": list_projects()}
+    write_back = require_google_drive_write_back(run_google_drive_write_back("database"))
+    return {"projectId": project_id, "projects": list_projects(), "writeBack": write_back}
 
 
 @app.post("/api/admin/projects/{project_id}/packs")
@@ -436,6 +583,7 @@ def admin_set_project_pack_links(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_admin(authorization)
+    require_google_drive_sync(run_google_drive_sync(force=True))
     valid_pack_ids = {pack["id"] for pack in list_packs()}
     invalid_pack_ids = [pack_id for pack_id in request.pack_ids if pack_id not in valid_pack_ids]
     if invalid_pack_ids:
@@ -444,11 +592,13 @@ def admin_set_project_pack_links(
         pack_ids = set_project_packs(project_id, request.pack_ids)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Project not found: {project_id}") from exc
-    return {"projectId": project_id, "packIds": pack_ids, "projects": list_projects()}
+    write_back = require_google_drive_write_back(run_google_drive_write_back("database"))
+    return {"projectId": project_id, "packIds": pack_ids, "projects": list_projects(), "writeBack": write_back}
 
 
 @app.get("/api/packs")
 def packs(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    ensure_runtime_storage()
     user = current_user(authorization)
     if not user or is_internal_user(user):
         return list_packs()
@@ -457,16 +607,57 @@ def packs(authorization: str | None = Header(default=None)) -> list[dict[str, An
 
 
 @app.get("/api/index/status")
-def index_status() -> dict[str, int]:
+def index_status() -> dict[str, Any]:
+    storage_status = ensure_runtime_storage()
     stats = index_stats()
     stats["projects"] = len(list_projects())
+    stats["storage"] = storage_runtime_status(storage_status)
     return stats
+
+
+@app.get("/api/storage/google-drive/status")
+def google_drive_storage_status(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_admin(authorization)
+    if not google_drive_sync_enabled():
+        return {"enabled": False, "status": "disabled"}
+    return {"enabled": True, **google_drive_sync_status()}
+
+
+@app.post("/api/admin/storage/google-drive/sync")
+def admin_sync_google_drive_storage(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_admin(authorization)
+    if not google_drive_sync_enabled():
+        raise HTTPException(status_code=400, detail="MODDULAR_GRAPH_GOOGLE_DRIVE_FOLDER_ID is not set.")
+    return {"enabled": True, **run_google_drive_sync(force=True)}
+
+
+@app.post("/api/admin/storage/google-drive/write-back")
+def admin_write_back_google_drive_storage(
+    include_packs: bool = False,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_admin(authorization)
+    if not google_drive_sync_enabled():
+        raise HTTPException(status_code=400, detail="MODDULAR_GRAPH_GOOGLE_DRIVE_FOLDER_ID is not set.")
+    results: dict[str, Any] = {
+        "users": require_google_drive_write_back(run_google_drive_write_back("users")),
+        "database": require_google_drive_write_back(run_google_drive_write_back("database")),
+    }
+    if include_packs:
+        results["packs"] = [
+            require_google_drive_write_back(run_google_drive_write_back("pack", pack.path))
+            for pack in discover_pack_files()
+        ]
+    return {"enabled": True, "status": "written", "results": results}
 
 
 @app.post("/api/admin/reindex")
 def reindex(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_admin(authorization)
-    return index_all_packs()
+    require_google_drive_sync(run_google_drive_sync(force=True))
+    result = index_all_packs()
+    result["writeBack"] = require_google_drive_write_back(run_google_drive_write_back("database"))
+    return result
 
 
 @app.get("/api/graph/{pack_id}")
@@ -476,6 +667,7 @@ def graph(
     max_edges: int = 1600,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    ensure_runtime_storage()
     ensure_pack_access(pack_id, current_user(authorization))
     try:
         return build_graph(pack_id=pack_id, max_nodes=max_nodes, max_edges=max_edges)
@@ -496,6 +688,7 @@ async def upload_pack(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_admin(authorization)
+    require_google_drive_sync(run_google_drive_sync(force=True))
     content = await file.read()
     try:
         summary = save_uploaded_pack(file.filename or "ontology-pack.zip", content)
@@ -529,11 +722,17 @@ async def upload_pack(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"Project not found: {target_project_id}") from exc
         summary["project"] = next(project for project in list_projects() if project["id"] == target_project_id)
+    write_back: dict[str, Any] = {}
+    if pack_path:
+        write_back["pack"] = require_google_drive_write_back(run_google_drive_write_back("pack", Path(pack_path)))
+    write_back["database"] = require_google_drive_write_back(run_google_drive_write_back("database"))
+    summary["writeBack"] = write_back
     return summary
 
 
 @app.post("/api/query")
 def query_ontology(request: QueryRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    ensure_runtime_storage()
     ensure_pack_access(request.pack_id, current_user(authorization))
     try:
         result = answer_pack_question(
@@ -553,21 +752,52 @@ def ollama_llm_status() -> dict[str, Any]:
     return ollama_status()
 
 
-@app.get("/api/mcp/status")
-def mcp_status() -> dict[str, Any]:
-    public_url = os.environ.get("MODULAR_GRAPH_PUBLIC_MCP_URL")
-    if not public_url and MCP_REMOTE_FILE.exists():
+def _public_mcp_remote() -> tuple[str | None, str | None]:
+    public_url = os.environ.get("MODULAR_GRAPH_PUBLIC_MCP_URL") or os.environ.get("MODDULAR_GRAPH_PUBLIC_MCP_URL")
+    public_base_url: str | None = None
+    if MCP_REMOTE_FILE.exists():
         try:
-            public_url = json.loads(MCP_REMOTE_FILE.read_text(encoding="utf-8-sig")).get("publicUrl")
+            payload = json.loads(MCP_REMOTE_FILE.read_text(encoding="utf-8-sig"))
+            if not public_url:
+                public_url = payload.get("publicUrl")
+            public_base_url = payload.get("publicBaseUrl")
         except (OSError, json.JSONDecodeError):
-            public_url = None
+            public_base_url = None
+
+    if public_url and not public_base_url:
+        parts = urlsplit(public_url)
+        public_base_url = urlunsplit((parts.scheme, parts.netloc, "", "", "")) if parts.scheme and parts.netloc else None
+    return public_url, public_base_url
+
+
+@app.get("/api/mcp/status")
+def mcp_status(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    public_url, public_base_url = _public_mcp_remote()
+    user_url: dict[str, Any] | None = None
+    user = current_user(authorization)
+    if user and user.status == "active":
+        token_record = ensure_mcp_token_for_user(user)
+        user_urls = build_user_mcp_urls(public_base_url, token_record["token"])
+        user_url = {
+            **user_urls,
+            "token": token_record["token"],
+            "userEmail": token_record["userEmail"],
+            "userName": token_record["userName"],
+            "company": token_record["company"],
+            "role": token_record["role"],
+        }
+        run_google_drive_write_back("mcp_tokens")
     return {
         "status": "ready",
         "server": "python -m moddular_graph.mcp_server",
         "remote": {
             "transport": "streamable-http",
             "localUrl": "http://127.0.0.1:8011/mcp",
+            "localUserUrlTemplate": "http://127.0.0.1:8011/mcp/{token}",
             "publicUrl": public_url,
+            "publicBaseUrl": public_base_url,
+            "publicUserUrlTemplate": f"{public_base_url.rstrip('/')}/mcp/{{token}}" if public_base_url else None,
+            "userUrl": user_url,
             "command": ".\\scripts\\run_remote_mcp.ps1",
         },
         "tools": TOOL_NAMES,

@@ -9,6 +9,7 @@ DEFAULT_DATA_DIR = Path("/tmp/modular-ontology") if os.environ.get("VERCEL") els
 DATA_DIR = Path(os.environ.get("MODDULAR_GRAPH_DATA_DIR", DEFAULT_DATA_DIR)).resolve()
 USE_STRUCTURED_DATA_DIR = (
     os.environ.get("MODDULAR_GRAPH_STRUCTURED_DATA_DIR") == "1"
+    or bool(os.environ.get("MODDULAR_GRAPH_GOOGLE_DRIVE_FOLDER_ID"))
     or (DATA_DIR / "01_Database").exists()
     or (DATA_DIR / "02_Ontology_Packs").exists()
     or (DATA_DIR / "00_Admin").exists()
@@ -36,5 +37,11 @@ MCP_REMOTE_FILE = Path(
     os.environ.get(
         "MODDULAR_GRAPH_MCP_REMOTE_FILE",
         DATA_DIR / "00_Admin" / "mcp_remote.json" if USE_STRUCTURED_DATA_DIR else DATA_DIR / "mcp_remote.json",
+    )
+).resolve()
+MCP_TOKENS_FILE = Path(
+    os.environ.get(
+        "MODDULAR_GRAPH_MCP_TOKENS_FILE",
+        DATA_DIR / "00_Admin" / "mcp_tokens.json" if USE_STRUCTURED_DATA_DIR else DATA_DIR / "mcp_tokens.json",
     )
 ).resolve()

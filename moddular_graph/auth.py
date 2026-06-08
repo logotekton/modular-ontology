@@ -6,6 +6,7 @@ import json
 import os
 import re
 import secrets
+import base64
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -74,6 +75,7 @@ DEFAULT_USERS: dict[str, User] = {
 
 SESSIONS: dict[str, Session] = {}
 _USERS_CACHE: tuple[str, dict[str, User]] | None = None
+TOKEN_TTL_SECONDS = 12 * 60 * 60
 
 
 def _users_file_path(users_file: str | Path | None = None) -> Path:
@@ -85,6 +87,67 @@ def _normalize_email(email: str) -> str:
     if not EMAIL_RE.match(normalized):
         raise ValueError("A valid email address is required.")
     return normalized
+
+
+def _base64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _base64url_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
+def _session_secret() -> bytes:
+    configured = os.environ.get("MODDULAR_GRAPH_SESSION_SECRET") or os.environ.get("MODDULAR_GRAPH_AUTH_SECRET")
+    if configured:
+        return configured.encode("utf-8")
+    users_fingerprint = "|".join(
+        f"{user.id}:{user.email}:{user.password_hash}:{user.status}" for user in sorted(load_users().values(), key=lambda item: item.email)
+    )
+    return hashlib.sha256(f"moddular-graph-session:{users_fingerprint}".encode("utf-8")).digest()
+
+
+def _sign_token_payload(payload: str) -> str:
+    return _base64url_encode(hmac.new(_session_secret(), payload.encode("ascii"), hashlib.sha256).digest())
+
+
+def _create_signed_token(user: User, expires_at: datetime) -> str:
+    payload = _base64url_encode(
+        json.dumps(
+            {
+                "sub": user.id,
+                "email": user.email,
+                "exp": int(expires_at.timestamp()),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    signature = _sign_token_payload(payload)
+    return f"v1.{payload}.{signature}"
+
+
+def _user_from_signed_token(token: str) -> User | None:
+    parts = token.split(".")
+    if len(parts) != 3 or parts[0] != "v1":
+        return None
+    payload, signature = parts[1], parts[2]
+    if not hmac.compare_digest(signature, _sign_token_payload(payload)):
+        return None
+    try:
+        data = json.loads(_base64url_decode(payload).decode("utf-8"))
+        expires_at = int(data.get("exp", 0))
+        user_id = str(data.get("sub") or "")
+        email = _normalize_email(str(data.get("email") or ""))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+    if expires_at <= int(datetime.now(timezone.utc).timestamp()):
+        return None
+    user = load_users().get(email)
+    if user and user.id == user_id and user.status == "active":
+        return user
+    return None
 
 
 def _company_from_email(email: str) -> str:
@@ -104,7 +167,7 @@ def _normalize_company_name(name: str) -> str:
 def _load_auth_data(path: Path) -> object:
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def _coerce_user(item: dict[str, object]) -> User:
@@ -221,6 +284,10 @@ def _invalidate_users_cache() -> None:
     _USERS_CACHE = None
 
 
+def invalidate_users_cache() -> None:
+    _invalidate_users_cache()
+
+
 def public_user(user: User) -> dict[str, object]:
     return {
         "id": user.id,
@@ -247,7 +314,7 @@ def load_users(users_file: str | Path | None = None) -> dict[str, User]:
 
     deleted_users = _load_deleted_users(path)
     users = {email: user for email, user in DEFAULT_USERS.items() if email not in deleted_users}
-    users.update({email: user for email, user in _load_file_users(path).items() if email not in deleted_users})
+    users.update(_load_file_users(path))
     _USERS_CACHE = (path_value, users)
     return users
 
@@ -358,6 +425,7 @@ def register_user(email: str, password: str, name: str | None = None, company: s
 
     path = _users_file_path().resolve()
     file_users = _load_file_users(path)
+    deleted_users = _load_deleted_users(path)
     user = User(
         id=f"user-{secrets.token_hex(8)}",
         name=(name or normalized_email.split("@", 1)[0]).strip() or normalized_email,
@@ -368,7 +436,10 @@ def register_user(email: str, password: str, name: str | None = None, company: s
         status="pending",
     )
     file_users[normalized_email] = user
-    _save_file_users(path, file_users)
+    # Re-registration clears any prior deletion tombstone so the new pending
+    # signup is not hidden by a stale deleted_users entry (e.g. default admins).
+    deleted_users.discard(normalized_email)
+    _save_file_users(path, file_users, deleted_users=deleted_users)
     _invalidate_users_cache()
     return user
 
@@ -430,8 +501,9 @@ def delete_user(email: str, actor_email: str | None = None) -> User:
     path = _users_file_path().resolve()
     file_users = _load_file_users(path)
     deleted_users = _load_deleted_users(path)
-    user = file_users.pop(normalized_email, None) or DEFAULT_USERS.get(normalized_email)
-    if not user or normalized_email in deleted_users:
+    file_user = file_users.pop(normalized_email, None)
+    user = file_user or DEFAULT_USERS.get(normalized_email)
+    if not user or (file_user is None and normalized_email in deleted_users):
         raise KeyError(normalized_email)
     if normalized_email in DEFAULT_USERS:
         deleted_users.add(normalized_email)
@@ -478,11 +550,12 @@ def authenticate(email: str, password: str) -> tuple[str, User]:
     if user.status != "active":
         raise PermissionError("Account is waiting for administrator approval.")
 
-    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=TOKEN_TTL_SECONDS)
+    token = _create_signed_token(user, expires_at)
     SESSIONS[token] = Session(
         token=token,
         user_id=user.id,
-        expires_at=datetime.now(timezone.utc) + timedelta(hours=12),
+        expires_at=expires_at,
     )
     return token, user
 
@@ -491,14 +564,16 @@ def get_user_by_token(token: str | None) -> User | None:
     if not token:
         return None
     session = SESSIONS.get(token)
-    if not session:
-        return None
-    if session.expires_at <= datetime.now(timezone.utc):
-        SESSIONS.pop(token, None)
-        return None
-    for user in load_users().values():
-        if user.id == session.user_id and user.status == "active":
-            return user
+    if session:
+        if session.expires_at <= datetime.now(timezone.utc):
+            SESSIONS.pop(token, None)
+        else:
+            for user in load_users().values():
+                if user.id == session.user_id and user.status == "active":
+                    return user
+    signed_user = _user_from_signed_token(token)
+    if signed_user:
+        return signed_user
     return None
 
 
