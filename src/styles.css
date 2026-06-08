@@ -1288,7 +1288,13 @@ h2 {
 
 .node-details {
   display: grid;
+  align-content: start;
+  flex: 1;
   gap: 14px;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
 .node-title {
