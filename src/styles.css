@@ -406,7 +406,8 @@ nav {
 }
 
 .workspace.graph-workspace {
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .topbar,
@@ -718,7 +719,8 @@ h2 {
   flex: 1;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
-  min-height: calc(100vh - 214px);
+  height: calc(100vh - 214px);
+  min-height: 0;
 }
 
 .graph-explorer-grid .graph-panel {
@@ -752,6 +754,8 @@ h2 {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
   padding: 16px;
 }
 
@@ -812,7 +816,9 @@ h2 {
   grid-template-rows: minmax(0, 1fr) auto;
   flex: 1;
   gap: 12px;
+  height: 100%;
   min-height: 0;
+  overflow: hidden;
 }
 
 .ai-message-list {
@@ -820,7 +826,8 @@ h2 {
   align-content: start;
   gap: 10px;
   min-height: 0;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   padding-right: 4px;
 }
 
@@ -867,8 +874,8 @@ h2 {
 }
 
 .ai-message.assistant {
-  justify-self: end;
-  width: min(100%, 270px);
+  justify-self: stretch;
+  width: 100%;
   background: #f8fcff;
   text-align: right;
 }
