@@ -19,6 +19,7 @@ import {
   PackageCheck,
   PlugZap,
   RefreshCw,
+  SendHorizontal,
   ServerCog,
   ShieldCheck,
   Upload,
@@ -29,6 +30,7 @@ import Graph from "graphology";
 import Sigma from "sigma";
 
 const API_BASE = "";
+const OPENAI_CHAT_MODEL = "gpt-4.1-mini";
 const NODE_COLLISION_PADDING = 1.45;
 const GRAPH_EDGE_COLOR = "rgba(84, 84, 84, 0.48)";
 const GRAPH_EDGE_SELECTED_COLOR = "rgba(13, 148, 136, 0.78)";
@@ -67,6 +69,7 @@ type GraphNode = {
   id: string;
   label: string;
   type: string;
+  packId?: string;
   color: string;
   size: number;
   properties: Record<string, unknown>;
@@ -77,10 +80,14 @@ type GraphEdge = {
   source: string | { id: string };
   target: string | { id: string };
   relation: string;
+  packId?: string;
 };
 
 type GraphPayload = {
   pack: Pack;
+  project?: Project;
+  packs?: Pack[];
+  activePackIds?: string[];
   nodes: GraphNode[];
   edges: GraphEdge[];
   stats: {
@@ -94,6 +101,7 @@ type GraphPayload = {
 type GraphControls = typeof DEFAULT_GRAPH_CONTROLS;
 type LayoutQuality = "full" | "interactive";
 type DynamicGraphMode = "free" | "typeOrbit" | "radial";
+type AiKeyStatus = "missing" | "untested" | "testing" | "valid" | "invalid";
 
 type IndexStats = {
   projects?: number;
@@ -135,6 +143,8 @@ type McpStatus = {
       company: string;
       role: string;
     } | null;
+    tokenSync?: Record<string, unknown> | null;
+    tokenWriteBack?: Record<string, unknown> | null;
     command: string;
   };
   tools: string[];
@@ -197,12 +207,44 @@ const nav = [
   { label: "Graph Explorer", icon: Waypoints },
   { label: "MCP Connections", icon: ServerCog },
   { label: "Admin", icon: LockKeyhole },
-];
+] as const;
+
+type AppTab = (typeof nav)[number]["label"];
+
+const DEFAULT_TAB: AppTab = "Dashboard";
+
+const ROUTE_BY_TAB: Record<AppTab, string> = {
+  Dashboard: "/dashboard",
+  Projects: "/projects",
+  "Ontology Packs": "/upload",
+  "Graph Explorer": "/graph",
+  "MCP Connections": "/mcp-connection",
+  Admin: "/admin",
+};
+
+const TAB_BY_ROUTE = new Map<string, AppTab>(
+  Object.entries(ROUTE_BY_TAB).map(([tab, route]) => [route, tab as AppTab])
+);
+
+function normalizeRoutePath(pathname: string) {
+  const normalized = pathname.replace(/\/+$/, "");
+  return normalized || "/";
+}
+
+function tabFromPathname(pathname: string): AppTab {
+  const normalized = normalizeRoutePath(pathname);
+  if (normalized === "/") return DEFAULT_TAB;
+  return TAB_BY_ROUTE.get(normalized) ?? DEFAULT_TAB;
+}
+
+function routeForTab(tab: string) {
+  return ROUTE_BY_TAB[tab as AppTab] ?? ROUTE_BY_TAB[DEFAULT_TAB];
+}
 
 const TAB_LABELS: Record<string, string> = {
   Dashboard: "대시보드",
   Projects: "프로젝트",
-  "Ontology Packs": "온톨로지 팩",
+  "Ontology Packs": "업로드",
   "Graph Explorer": "그래프 탐색기",
   "MCP Connections": "MCP 연결",
   Admin: "관리자",
@@ -259,22 +301,29 @@ async function getJson<T>(path: string, token?: string): Promise<T> {
 }
 
 function App() {
-  const [activeTab, setActiveTab] = useState("Dashboard");
+  const [activeTab, setActiveTab] = useState<AppTab>(() => tabFromPathname(window.location.pathname));
   const [packs, setPacks] = useState<Pack[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
-  const [selectedPackId, setSelectedPackId] = useState("");
+  const [selectedProjectId, setSelectedProjectId] = useState("");
+  const [selectedGraphPackIds, setSelectedGraphPackIds] = useState<string[]>([]);
   const [graph, setGraph] = useState<GraphPayload | null>(null);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [inspectorTab, setInspectorTab] = useState<"node" | "ai">("node");
   const [aiQuestion, setAiQuestion] = useState("");
   const [aiMessages, setAiMessages] = useState<AiMessage[]>([]);
   const [aiLoading, setAiLoading] = useState(false);
+  const [openAiApiKey, setOpenAiApiKey] = useState(() => sessionStorage.getItem("modularOntologyOpenAiKey") ?? "");
+  const [openAiKeyStatus, setOpenAiKeyStatus] = useState<AiKeyStatus>(() =>
+    sessionStorage.getItem("modularOntologyOpenAiKey") ? "untested" : "missing"
+  );
+  const [openAiKeyMessage, setOpenAiKeyMessage] = useState("");
+  const [isOpenAiKeyPanelOpen, setIsOpenAiKeyPanelOpen] = useState(false);
   const [status, setStatus] = useState("불러오는 중");
   const [uploadStatus, setUploadStatus] = useState("");
   const [indexStats, setIndexStats] = useState<IndexStats | null>(null);
   const [mcpStatus, setMcpStatus] = useState<McpStatus | null>(null);
-  const [authToken, setAuthToken] = useState(() => localStorage.getItem("moddularGraphToken") ?? "");
-  const [sessionReady, setSessionReady] = useState(() => !localStorage.getItem("moddularGraphToken"));
+  const [authToken, setAuthToken] = useState(() => localStorage.getItem("modularOntologyToken") ?? "");
+  const [sessionReady, setSessionReady] = useState(() => !localStorage.getItem("modularOntologyToken"));
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [loginEmail, setLoginEmail] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
@@ -294,6 +343,34 @@ function App() {
     description: "",
   });
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? projects[0];
+  const selectedPackId = selectedGraphPackIds[0] ?? selectedProject?.packIds[0] ?? "";
+  const graphPackOptions = selectedProject
+    ? packs.filter((pack) => selectedProject.packIds.includes(pack.id))
+    : [];
+
+  function navigateToTab(tab: string, options: { replace?: boolean } = {}) {
+    const nextTab = nav.some((item) => item.label === tab) ? (tab as AppTab) : DEFAULT_TAB;
+    const nextRoute = routeForTab(nextTab);
+    setActiveTab(nextTab);
+    if (window.location.pathname !== nextRoute) {
+      const method = options.replace ? "replaceState" : "pushState";
+      window.history[method]({ tab: nextTab }, "", nextRoute);
+    }
+  }
+
+  function setAllGraphPacks() {
+    setSelectedGraphPackIds(graphPackOptions.map((pack) => pack.id));
+  }
+
+  function toggleGraphPack(packId: string) {
+    setSelectedGraphPackIds((current) => {
+      if (current.includes(packId)) {
+        return current.length > 1 ? current.filter((id) => id !== packId) : current;
+      }
+      return [...current, packId];
+    });
+  }
 
   function confirmAction(options: ConfirmDialogOptions) {
     setConfirmDialog(options);
@@ -310,9 +387,29 @@ function App() {
   }
 
   useEffect(() => {
+    navigateToTab(tabFromPathname(window.location.pathname), { replace: true });
+    const handlePopState = () => {
+      setActiveTab(tabFromPathname(window.location.pathname));
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
+  useEffect(() => {
     refreshPublicStatus().catch(() => undefined);
     refreshData().catch((error: Error) => setStatus(error.message));
   }, []);
+
+  useEffect(() => {
+    if (openAiApiKey.trim()) {
+      sessionStorage.setItem("modularOntologyOpenAiKey", openAiApiKey);
+      setOpenAiKeyStatus("untested");
+    } else {
+      sessionStorage.removeItem("modularOntologyOpenAiKey");
+      setOpenAiKeyStatus("missing");
+    }
+    setOpenAiKeyMessage("");
+  }, [openAiApiKey]);
 
   useEffect(() => {
     setSessionReady(false);
@@ -369,14 +466,48 @@ function App() {
   }, [projects]);
 
   useEffect(() => {
-    if (!selectedPackId) return;
+    if (!projects.length) {
+      setSelectedProjectId("");
+      setSelectedGraphPackIds([]);
+      return;
+    }
+    setSelectedProjectId((current) => (current && projects.some((project) => project.id === current) ? current : projects[0].id));
+  }, [projects]);
+
+  useEffect(() => {
+    const project = projects.find((item) => item.id === selectedProjectId);
+    if (!project) return;
+    setSelectedGraphPackIds((current) => {
+      const valid = current.filter((packId) => project.packIds.includes(packId));
+      return valid.length ? valid : project.packIds;
+    });
+  }, [projects, selectedProjectId]);
+
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    const project = projects.find((item) => item.id === selectedProjectId);
+    if (!project) return;
+    const activePackIds = selectedGraphPackIds.filter((packId) => project.packIds.includes(packId));
+    if (!activePackIds.length) {
+      setSelectedNode(null);
+      setAiMessages([]);
+      setAiQuestion("");
+      setGraph(null);
+      setStatus("표시할 팩을 선택하세요");
+      return;
+    }
     let active = true;
     setSelectedNode(null);
     setAiMessages([]);
     setAiQuestion("");
     setGraph(null);
     setStatus("그래프 불러오는 중");
-    getJson<GraphPayload>(`/api/graph/${encodeURIComponent(selectedPackId)}?max_nodes=760&max_edges=1400`, authToken)
+    const query = new URLSearchParams({
+      max_nodes: "760",
+      max_edges: "1400",
+      pack_ids: activePackIds.join(","),
+    });
+    getJson<GraphPayload>(`/api/projects/${encodeURIComponent(selectedProjectId)}/graph?${query.toString()}`, authToken)
       .then((payload) => {
         if (!active) return;
         setGraph(payload);
@@ -388,13 +519,31 @@ function App() {
     return () => {
       active = false;
     };
-  }, [selectedPackId, authToken]);
+  }, [projects, selectedProjectId, selectedGraphPackIds, authToken]);
 
   async function refreshPublicStatus(token = authToken) {
     await Promise.all([
       getJson<IndexStats>("/api/index/status").then(setIndexStats),
       getJson<McpStatus>("/api/mcp/status", token || undefined).then(setMcpStatus),
     ]);
+  }
+
+  async function regenerateMcpUrl() {
+    if (!authToken) {
+      setUploadStatus("로그인 후 MCP URL을 재발급할 수 있습니다.");
+      return;
+    }
+    const res = await fetch("/api/mcp/user-url/regenerate", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${authToken}` },
+    });
+    if (!res.ok) {
+      setUploadStatus(await res.text());
+      return;
+    }
+    const payload = (await res.json()) as McpStatus;
+    setMcpStatus(payload);
+    setUploadStatus("MCP URL이 재발급되었습니다.");
   }
 
   async function refreshData(nextPackId?: string, token = authToken) {
@@ -405,8 +554,17 @@ function App() {
     setPacks(packData);
     setProjects(projectData);
     refreshPublicStatus(token).catch(() => undefined);
-    const nextVisiblePackId = nextPackId && packData.some((pack) => pack.id === nextPackId) ? nextPackId : packData[0]?.id;
-    setSelectedPackId(nextVisiblePackId || "");
+    const nextProject =
+      (nextPackId && projectData.find((project) => project.packIds.includes(nextPackId))) ||
+      (selectedProjectId && projectData.find((project) => project.id === selectedProjectId)) ||
+      projectData[0];
+    if (nextProject) {
+      setSelectedProjectId(nextProject.id);
+      setSelectedGraphPackIds(nextPackId && nextProject.packIds.includes(nextPackId) ? [nextPackId] : nextProject.packIds);
+    } else {
+      setSelectedProjectId("");
+      setSelectedGraphPackIds([]);
+    }
     setStatus("Ready");
   }
 
@@ -440,7 +598,7 @@ function App() {
       return;
     }
     const payload = (await res.json()) as { token: string; user: CurrentUser };
-    localStorage.setItem("moddularGraphToken", payload.token);
+    localStorage.setItem("modularOntologyToken", payload.token);
     setAuthToken(payload.token);
     setCurrentUser(payload.user);
     await refreshData(undefined, payload.token);
@@ -690,7 +848,7 @@ function App() {
       method: "POST",
       headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
     }).catch(() => undefined);
-    localStorage.removeItem("moddularGraphToken");
+    localStorage.removeItem("modularOntologyToken");
     setAuthToken("");
     setCurrentUser(null);
     await refreshData(undefined, "");
@@ -736,6 +894,30 @@ function App() {
     );
   }
 
+  async function uploadIfc(file: File | undefined, projectId: string) {
+    if (!file) return;
+    if (currentUser?.role !== "admin") {
+      setUploadStatus("관리자 세션이 필요합니다");
+      return;
+    }
+    setUploadStatus("IFC 업로드 중");
+    const formData = new FormData();
+    formData.append("file", file);
+    if (projectId) formData.append("project_id", projectId);
+    const res = await fetch("/api/ifc/upload", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${authToken}` },
+      body: formData,
+    });
+    if (!res.ok) {
+      const payload = await res.json().catch(() => null);
+      setUploadStatus(payload?.detail ?? "IFC 업로드 실패");
+      return;
+    }
+    const payload = (await res.json()) as { filename: string; sizeBytes: number; projectName?: string | null };
+    setUploadStatus(`${payload.projectName || "프로젝트"} IFC 저장 완료: ${payload.filename}`);
+  }
+
   async function reindexPacks() {
     if (currentUser?.role !== "admin") {
       setUploadStatus("관리자 세션이 필요합니다");
@@ -756,13 +938,74 @@ function App() {
   }
 
   function selectPackForGraph(packId: string) {
-    setSelectedPackId(packId);
-    setActiveTab("Graph Explorer");
+    const project = projects.find((item) => item.packIds.includes(packId));
+    if (project) {
+      setSelectedProjectId(project.id);
+      setSelectedGraphPackIds([packId]);
+    }
+    navigateToTab("Graph Explorer");
+  }
+
+  async function validateOpenAiKey() {
+    const userOpenAiKey = openAiApiKey.trim();
+    if (!userOpenAiKey || openAiKeyStatus === "testing") return;
+    setOpenAiKeyStatus("testing");
+    setOpenAiKeyMessage("");
+    try {
+      const res = await fetch("/api/llm/openai/validate", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
+        body: JSON.stringify({
+          openai_api_key: userOpenAiKey,
+          openai_model: OPENAI_CHAT_MODEL,
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const payload = (await res.json()) as { valid?: boolean; error?: string };
+      if (payload.valid) {
+        setOpenAiKeyStatus("valid");
+        setOpenAiKeyMessage("OpenAI key validated.");
+      } else {
+        setOpenAiKeyStatus("invalid");
+        setOpenAiKeyMessage(formatAiQueryWarning(payload.error || "OpenAI key validation failed."));
+      }
+    } catch (error) {
+      setOpenAiKeyStatus("invalid");
+      setOpenAiKeyMessage(formatAiQueryWarning(error instanceof Error ? error.message : "OpenAI key validation failed."));
+    }
   }
 
   async function askGraphAi() {
     const question = aiQuestion.trim();
-    if (!question || !selectedPackId || aiLoading) return;
+    const selectedNodePackId = String(selectedNode?.properties?.pack_id || selectedNode?.packId || "");
+    const targetPackId = selectedNodePackId || selectedGraphPackIds[0] || selectedPackId;
+    if (!question || !targetPackId || aiLoading) return;
+    const userOpenAiKey = openAiApiKey.trim();
+    if (!userOpenAiKey) {
+      setAiMessages((messages) => [
+        ...messages,
+        {
+          id: `${Date.now()}-assistant-key-missing`,
+          role: "assistant",
+          content: "GPT 답변을 쓰려면 OpenAI API key를 먼저 입력해야 합니다.",
+        },
+      ]);
+      return;
+    }
+    if (openAiKeyStatus !== "valid") {
+      setAiMessages((messages) => [
+        ...messages,
+        {
+          id: `${Date.now()}-assistant-key-untested`,
+          role: "assistant",
+          content: "OpenAI API key를 먼저 Test key로 검증해야 GPT 답변을 보낼 수 있습니다.",
+        },
+      ]);
+      return;
+    }
     const userMessage: AiMessage = { id: `${Date.now()}-user`, role: "user", content: question };
     setAiMessages((messages) => [...messages, userMessage]);
     setAiQuestion("");
@@ -774,7 +1017,13 @@ function App() {
           "Content-Type": "application/json",
           ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
         },
-        body: JSON.stringify({ pack_id: selectedPackId, question, use_ollama: true }),
+        body: JSON.stringify({
+          pack_id: targetPackId,
+          question,
+          use_openai: true,
+          openai_api_key: userOpenAiKey,
+          openai_model: OPENAI_CHAT_MODEL,
+        }),
       });
       if (!res.ok) throw new Error(await res.text());
       const payload = (await res.json()) as {
@@ -783,13 +1032,16 @@ function App() {
         llmError?: string | null;
         mode?: string;
       };
-      const warning = payload.llmError ? `\n\n${formatLocalAiWarning(payload.llmError)}` : "";
+      const fallbackAnswer = payload.answer || "답변을 생성하지 못했습니다.";
+      const content = payload.llmError
+        ? `${formatAiQueryWarning(payload.llmError)}\n\nFallback Graph RAG answer:\n${fallbackAnswer}`
+        : fallbackAnswer;
       setAiMessages((messages) => [
         ...messages,
         {
           id: `${Date.now()}-assistant`,
           role: "assistant",
-          content: `${payload.answer || "답변을 생성하지 못했습니다."}${warning}`,
+          content,
           evidence: payload.evidence ?? [],
         },
       ]);
@@ -855,7 +1107,8 @@ function App() {
               <button
                 className={activeTab === item.label ? "nav-item active" : "nav-item"}
                 key={item.label}
-                onClick={() => setActiveTab(item.label)}
+                onClick={() => navigateToTab(item.label)}
+                type="button"
               >
                 <Icon size={18} />
                 {tabLabel(item.label)}
@@ -881,10 +1134,10 @@ function App() {
           </div>
           <div className="topbar-actions">
             <label className="select-wrap">
-              <select value={selectedPackId} onChange={(event) => setSelectedPackId(event.target.value)}>
-                {packs.map((pack) => (
-                  <option value={pack.id} key={pack.id}>
-                    {pack.title}
+              <select value={selectedProjectId} onChange={(event) => setSelectedProjectId(event.target.value)}>
+                {projects.map((project) => (
+                  <option value={project.id} key={project.id}>
+                    {project.name}
                   </option>
                 ))}
               </select>
@@ -929,7 +1182,7 @@ function App() {
           <DashboardView
             packs={packs}
             projects={projects}
-            onGoToTab={setActiveTab}
+            onGoToTab={navigateToTab}
             onOpenPack={selectPackForGraph}
           />
         )}
@@ -957,13 +1210,27 @@ function App() {
             uploadProjectTarget={uploadProjectTarget}
             onOpenPack={selectPackForGraph}
             onReindex={reindexPacks}
+            onUploadIfc={uploadIfc}
             onUploadProjectTargetChange={setUploadProjectTarget}
             onUpload={() => fileInputRef.current?.click()}
           />
         )}
 
         {activeTab === "MCP Connections" && (
-          <McpConnectionsView mcpStatus={mcpStatus} onGenerateUrl={() => refreshPublicStatus(authToken)} />
+          <McpConnectionsView
+            mcpStatus={mcpStatus}
+            onLoadUrl={() => refreshPublicStatus(authToken)}
+            onRegenerateUrl={() =>
+              confirmAction({
+                title: "MCP URL 재발급",
+                message: "새 MCP URL을 발급하면 기존 URL로 연결된 개인 AI Agent는 더 이상 사용할 수 없습니다.",
+                confirmLabel: "재발급",
+                cancelLabel: "취소",
+                tone: "danger",
+                onConfirm: regenerateMcpUrl,
+              })
+            }
+          />
         )}
 
         {activeTab === "Admin" && currentUser?.role !== "admin" && <AdminLockedView />}
@@ -999,7 +1266,10 @@ function App() {
             <div className="panel-header">
               <div>
                 <h2>그래프 탐색기</h2>
-                <span>{graph?.pack.title ?? status}</span>
+                <span>
+                  {selectedProject?.name ?? graph?.pack.title ?? status}
+                  {graphPackOptions.length ? ` / ${selectedGraphPackIds.length}개 팩 표시` : ""}
+                </span>
               </div>
               <div className="legend">
                 {["Module", "Assembly", "SinglePart", "Document", "Material"].map((type) => (
@@ -1010,6 +1280,25 @@ function App() {
                 ))}
               </div>
             </div>
+            {graphPackOptions.length ? (
+              <div className="graph-pack-filter" aria-label="프로젝트 팩 필터">
+                <button type="button" onClick={setAllGraphPacks}>
+                  전체 팩
+                </button>
+                <div>
+                  {graphPackOptions.map((pack) => (
+                    <label className={selectedGraphPackIds.includes(pack.id) ? "active" : ""} key={pack.id}>
+                      <input
+                        checked={selectedGraphPackIds.includes(pack.id)}
+                        type="checkbox"
+                        onChange={() => toggleGraphPack(pack.id)}
+                      />
+                      <span>{pack.title}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            ) : null}
             <GraphCanvas graph={graph} selectedNode={selectedNode} onSelectNode={setSelectedNode} />
           </div>
 
@@ -1017,13 +1306,49 @@ function App() {
             <div className="panel-header slim graph-inspector-header">
               <div>
                 <h2>{inspectorTab === "node" ? "Node Inspector" : "AI Query"}</h2>
-                <span>
-                  {inspectorTab === "node"
-                    ? selectedNode
-                      ? nodeTypeLabel(selectedNode.type)
-                      : "노드를 선택하세요"
-                    : "AI Query"}
-                </span>
+                {inspectorTab === "node" ? (
+                  <span>{selectedNode ? nodeTypeLabel(selectedNode.type) : "노드를 선택하세요"}</span>
+                ) : (
+                  <div className="openai-key-header">
+                    <button
+                      type="button"
+                      className={`openai-key-button ${openAiKeyStatus} ${isOpenAiKeyPanelOpen ? "open" : ""}`}
+                      aria-expanded={isOpenAiKeyPanelOpen}
+                      onClick={() => setIsOpenAiKeyPanelOpen((value) => !value)}
+                    >
+                      <span>OpenAI API</span>
+                    </button>
+                    {isOpenAiKeyPanelOpen ? (
+                      <div className="openai-key-popover">
+                        <div className="ai-model-row">
+                          <span>{OPENAI_CHAT_MODEL}</span>
+                          <em className={`ai-key-status ${openAiKeyStatus}`}>{openAiKeyStatusLabel(openAiKeyStatus)}</em>
+                        </div>
+                        <div className="ai-key-row">
+                          <label className="ai-key-field">
+                            <input
+                              type="password"
+                              value={openAiApiKey}
+                              placeholder="OpenAI API key"
+                              autoComplete="off"
+                              spellCheck={false}
+                              onChange={(event) => setOpenAiApiKey(event.target.value)}
+                            />
+                          </label>
+                          <button
+                            type="button"
+                            className="ai-key-test-button"
+                            disabled={!openAiApiKey.trim() || openAiKeyStatus === "testing"}
+                            onClick={validateOpenAiKey}
+                          >
+                            {openAiKeyStatus === "testing" ? "Testing" : "Test key"}
+                          </button>
+                        </div>
+                        {openAiKeyMessage ? <p className={`ai-key-message ${openAiKeyStatus}`}>{openAiKeyMessage}</p> : null}
+                      </div>
+                    ) : null}
+                  </div>
+                )}
               </div>
             </div>
             <div className="inspector-tabs" role="tablist" aria-label="그래프 우측 패널">
@@ -1036,6 +1361,7 @@ function App() {
             </div>
             {inspectorTab === "ai" ? (
               <AiQueryPanel
+                openAiKeyStatus={openAiKeyStatus}
                 loading={aiLoading}
                 messages={aiMessages}
                 question={aiQuestion}
@@ -1608,6 +1934,7 @@ function OntologyPacksView({
   uploadProjectTarget,
   onOpenPack,
   onReindex,
+  onUploadIfc,
   onUploadProjectTargetChange,
   onUpload,
 }: {
@@ -1618,22 +1945,94 @@ function OntologyPacksView({
   uploadProjectTarget: UploadProjectTarget;
   onOpenPack: (packId: string) => void;
   onReindex: () => void;
+  onUploadIfc: (file: File | undefined, projectId: string) => void;
   onUploadProjectTargetChange: (target: UploadProjectTarget) => void;
   onUpload: () => void;
 }) {
   const isAdmin = currentUser?.role === "admin";
+  const ifcInputRef = useRef<HTMLInputElement | null>(null);
+  const [ifcProjectId, setIfcProjectId] = useState(projects[0]?.id ?? "");
   const projectByPackId = new Map<string, string>();
   projects.forEach((project) => {
     project.packIds.forEach((packId) => projectByPackId.set(packId, project.name));
   });
+  const ifcProject = projects.find((project) => project.id === ifcProjectId) ?? projects[0];
+
+  useEffect(() => {
+    if (!projects.length) {
+      setIfcProjectId("");
+      return;
+    }
+    setIfcProjectId((current) => (current && projects.some((project) => project.id === current) ? current : projects[0].id));
+  }, [projects]);
 
   return (
     <section className="management-grid">
-      <div className="overview-panel">
+      <div className="overview-panel ifc-upload-panel">
         <div className="panel-header slim">
           <div>
-            <h2>팩 작업</h2>
-            <span>{isAdmin ? "관리자 팩 생성 권한 활성화" : "관리자 세션이 필요합니다"}</span>
+            <h2>IFC 업로드</h2>
+            <span>{isAdmin ? "프로젝트 기준 IFC 원본 저장" : "관리자 세션이 필요합니다"}</span>
+          </div>
+          <Database size={19} />
+        </div>
+        <div className="action-stack">
+          <label className="ifc-upload-target">
+            <span>대상 프로젝트</span>
+            <select
+              disabled={!isAdmin}
+              value={ifcProjectId}
+              onChange={(event) => setIfcProjectId(event.target.value)}
+            >
+              {projects.map((project) => (
+                <option key={project.id} value={project.id}>{project.name}</option>
+              ))}
+            </select>
+          </label>
+          <input
+            ref={ifcInputRef}
+            className="file-input"
+            type="file"
+            accept=".ifc,.ifczip,.zip"
+            onChange={(event) => {
+              onUploadIfc(event.currentTarget.files?.[0], ifcProjectId);
+              event.currentTarget.value = "";
+            }}
+          />
+          <button className="primary-button block" disabled={!isAdmin || !ifcProjectId} onClick={() => ifcInputRef.current?.click()}>
+            <Upload size={17} />
+            IFC 파일 업로드
+          </button>
+        </div>
+      </div>
+
+      <div className="overview-panel wide ifc-staging-panel">
+        <div className="panel-header slim">
+          <div>
+            <h2>IFC 모델</h2>
+            <span>뷰어 연결 전 원본 파일을 프로젝트에 매핑합니다</span>
+          </div>
+          <FileArchive size={19} />
+        </div>
+        <div className="ifc-staging-body">
+          <div>
+            <strong>{ifcProject?.name ?? "프로젝트를 선택하세요"}</strong>
+            <span>{ifcProject ? `${ifcProject.packIds.length}개 온톨로지 팩과 함께 관리` : "IFC 업로드 대상 없음"}</span>
+          </div>
+          <div className="ifc-format-list">
+            <span>.ifc</span>
+            <span>.ifczip</span>
+            <span>.zip</span>
+          </div>
+          <p>IFC 뷰어가 연결되면 이 영역에서 모델 미리보기와 그래프 노드 하이라이트를 함께 제공합니다.</p>
+        </div>
+      </div>
+
+      <div className="overview-panel ontology-upload-panel">
+        <div className="panel-header slim">
+          <div>
+            <h2>온톨로지 ZIP 업로드</h2>
+            <span>{isAdmin ? "팩 생성 및 재색인" : "관리자 세션이 필요합니다"}</span>
           </div>
           <PackageCheck size={19} />
         </div>
@@ -1699,7 +2098,7 @@ function OntologyPacksView({
         </div>
       </div>
 
-      <div className="overview-panel wide">
+      <div className="overview-panel wide ontology-pack-list-panel">
         <div className="panel-header slim">
           <div>
             <h2>온톨로지 팩</h2>
@@ -1731,17 +2130,33 @@ function OntologyPacksView({
   );
 }
 
-function McpConnectionsView({ mcpStatus, onGenerateUrl }: { mcpStatus: McpStatus | null; onGenerateUrl: () => Promise<void> }) {
+function McpConnectionsView({
+  mcpStatus,
+  onLoadUrl,
+  onRegenerateUrl,
+}: {
+  mcpStatus: McpStatus | null;
+  onLoadUrl: () => Promise<void>;
+  onRegenerateUrl: () => void;
+}) {
   return (
     <section className="mcp-workspace-grid">
-      <McpUrlPanel mcpStatus={mcpStatus} onGenerateUrl={onGenerateUrl} />
+      <McpUrlPanel mcpStatus={mcpStatus} onLoadUrl={onLoadUrl} onRegenerateUrl={onRegenerateUrl} />
     </section>
   );
 }
 
-function McpUrlPanel({ mcpStatus, onGenerateUrl }: { mcpStatus: McpStatus | null; onGenerateUrl: () => Promise<void> }) {
+function McpUrlPanel({
+  mcpStatus,
+  onLoadUrl,
+  onRegenerateUrl,
+}: {
+  mcpStatus: McpStatus | null;
+  onLoadUrl: () => Promise<void>;
+  onRegenerateUrl: () => void;
+}) {
   const [copied, setCopied] = useState(false);
-  const [generating, setGenerating] = useState(false);
+  const [loading, setLoading] = useState(false);
   const userUrl = mcpStatus?.remote?.userUrl;
   const personalUrl = userUrl?.publicUrl || userUrl?.localUrl || "로그인 후 개인 MCP URL이 발급됩니다.";
   const activeUrl = personalUrl;
@@ -1754,12 +2169,12 @@ function McpUrlPanel({ mcpStatus, onGenerateUrl }: { mcpStatus: McpStatus | null
     window.setTimeout(() => setCopied(false), 1400);
   }
 
-  async function generateUrl() {
-    setGenerating(true);
+  async function loadUrl() {
+    setLoading(true);
     try {
-      await onGenerateUrl();
+      await onLoadUrl();
     } finally {
-      setGenerating(false);
+      setLoading(false);
     }
   }
 
@@ -1771,8 +2186,11 @@ function McpUrlPanel({ mcpStatus, onGenerateUrl }: { mcpStatus: McpStatus | null
           <span>{mcpStatus?.remote?.transport ?? "streamable-http"}</span>
         </div>
         <div className="mcp-url-actions">
-          <button type="button" onClick={generateUrl} disabled={generating}>
-            {generating ? "생성 중" : "URL 생성"}
+          <button type="button" onClick={loadUrl} disabled={loading}>
+            {loading ? "불러오는 중" : "URL 불러오기"}
+          </button>
+          <button className="mcp-url-regenerate-button" type="button" onClick={onRegenerateUrl}>
+            URL 재발급
           </button>
           <PlugZap size={19} />
         </div>
@@ -2296,31 +2714,37 @@ function formatPropertyValue(key: string, value: unknown) {
   return formatter.format(value);
 }
 
-function formatLocalAiWarning(error: string) {
+function formatAiQueryWarning(error: string) {
   const lower = error.toLowerCase();
-  if (
-    lower.includes("failed to load clip model") ||
-    lower.includes("failed to load model") ||
-    lower.includes("no such file or directory")
-  ) {
-    return "AI Query 연결 경고: Ollama 모델 파일을 불러오지 못했습니다. 모델 저장소를 복구한 뒤 다시 시도하세요.";
+  if (lower.includes("incorrect api key") || lower.includes("invalid_api_key") || lower.includes("401")) {
+    return "GPT request failed: OpenAI API key가 올바르지 않거나 선택한 OpenAI project에서 사용할 수 없습니다.";
   }
-  if (lower.includes("not reachable") || lower.includes("connection refused")) {
-    return "AI Query 연결 경고: Ollama 서버에 연결할 수 없습니다. Ollama와 로컬 AI Proxy 실행 상태를 확인하세요.";
+  if (lower.includes("insufficient_quota") || lower.includes("quota") || lower.includes("billing") || lower.includes("429")) {
+    return "GPT request failed: OpenAI project의 결제/크레딧/쿼터 상태를 확인해야 합니다.";
   }
-  if (lower.includes("unauthorized") || lower.includes("401")) {
-    return "AI Query 연결 경고: 로컬 AI Proxy 인증 토큰이 맞지 않습니다.";
+  if (lower.includes("model") && (lower.includes("not found") || lower.includes("does not exist") || lower.includes("access"))) {
+    return `GPT request failed: 이 API key/project가 ${OPENAI_CHAT_MODEL} 모델에 접근하지 못합니다.`;
   }
-  return `AI Query 연결 경고: ${error.slice(0, 180)}${error.length > 180 ? "..." : ""}`;
+  return `GPT request failed: ${error.slice(0, 220)}${error.length > 220 ? "..." : ""}`;
+}
+
+function openAiKeyStatusLabel(status: AiKeyStatus) {
+  if (status === "valid") return "API key valid";
+  if (status === "invalid") return "API key invalid";
+  if (status === "testing") return "Testing key";
+  if (status === "untested") return "API key untested";
+  return "API key required";
 }
 
 function AiQueryPanel({
+  openAiKeyStatus,
   loading,
   messages,
   question,
   onQuestionChange,
   onSubmit,
 }: {
+  openAiKeyStatus: AiKeyStatus;
   loading: boolean;
   messages: AiMessage[];
   question: string;
@@ -2372,7 +2796,9 @@ function AiQueryPanel({
       >
         <textarea
           value={question}
-          placeholder="예: 2-01-A 모듈의 어셈블리와 중량을 알려줘"
+          placeholder={
+            "앱에서 질문을 하려면 먼저 OpenAI API key를 등록하세요! (비용발생)\n또는 MCP URL을 생성하고 개인의 AI Agent를 통해 질문하세요!"
+          }
           onChange={(event) => onQuestionChange(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === "Enter" && !event.shiftKey) {
@@ -2381,6 +2807,10 @@ function AiQueryPanel({
             }
           }}
         />
+        <button type="submit" disabled={loading || !question.trim() || openAiKeyStatus !== "valid"} title="Send GPT query">
+          <SendHorizontal size={16} />
+          <span>Send</span>
+        </button>
       </form>
     </div>
   );
