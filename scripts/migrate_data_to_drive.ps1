@@ -43,10 +43,10 @@ foreach ($relative in $paths) {
   }
 }
 
-$db = Join-Path $sourceData "moddular_graph.sqlite3"
+$db = Join-Path $sourceData "modular_ontology.sqlite3"
 if (Test-Path $db) {
-  Copy-Item -LiteralPath $db -Destination (Join-Path $target "01_Database\moddular_graph.sqlite3") -Force
-  Copy-Item -LiteralPath $db -Destination (Join-Path $target "01_Database\snapshots\$timestamp\moddular_graph.sqlite3") -Force
+  Copy-Item -LiteralPath $db -Destination (Join-Path $target "01_Database\modular_ontology.sqlite3") -Force
+  Copy-Item -LiteralPath $db -Destination (Join-Path $target "01_Database\snapshots\$timestamp\modular_ontology.sqlite3") -Force
 }
 
 $users = Join-Path $sourceData "users.json"
@@ -72,5 +72,5 @@ Write-Host "Drive data directory prepared:"
 Write-Host $target
 Write-Host ""
 Write-Host "Set this before starting the server:"
-Write-Host "`$env:MODDULAR_GRAPH_DATA_DIR='$target'"
-Write-Host "`$env:MODDULAR_GRAPH_STRUCTURED_DATA_DIR='1'"
+Write-Host "`$env:MODULAR_ONTOLOGY_DATA_DIR='$target'"
+Write-Host "`$env:MODULAR_ONTOLOGY_STRUCTURED_DATA_DIR='1'"

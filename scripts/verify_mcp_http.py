@@ -14,10 +14,10 @@ from mcp.client.streamable_http import streamablehttp_client
 
 
 ROOT = Path(__file__).resolve().parents[1]
-HOST = os.environ.get("MODULAR_GRAPH_MCP_HOST", "127.0.0.1")
-PORT = int(os.environ.get("MODULAR_GRAPH_MCP_PORT", "8011"))
-PATH = os.environ.get("MODULAR_GRAPH_MCP_PATH", "/mcp")
-URL = os.environ.get("MODULAR_GRAPH_MCP_URL", f"http://{HOST}:{PORT}{PATH}")
+HOST = os.environ.get("MODULAR_ONTOLOGY_MCP_HOST", "127.0.0.1")
+PORT = int(os.environ.get("MODULAR_ONTOLOGY_MCP_PORT", "8011"))
+PATH = os.environ.get("MODULAR_ONTOLOGY_MCP_PATH", "/mcp")
+URL = os.environ.get("MODULAR_ONTOLOGY_MCP_URL", f"http://{HOST}:{PORT}{PATH}")
 
 
 def port_is_open(host: str, port: int) -> bool:
@@ -69,19 +69,19 @@ def wait_until_ready(process: subprocess.Popen[str]) -> None:
 
 
 def main() -> None:
-    if os.environ.get("MODULAR_GRAPH_MCP_URL"):
+    if os.environ.get("MODULAR_ONTOLOGY_MCP_URL"):
         anyio.run(call_remote_mcp, URL)
         return
 
     env = os.environ.copy()
-    env["MODDULAR_GRAPH_ROOT"] = str(ROOT)
-    env.setdefault("MODULAR_GRAPH_MCP_ALLOWED_HOSTS", "127.0.0.1:*,localhost:*,[::1]:*")
-    env.setdefault("MODULAR_GRAPH_MCP_ALLOWED_ORIGINS", "http://127.0.0.1:*,http://localhost:*,http://[::1]:*")
+    env["MODULAR_ONTOLOGY_ROOT"] = str(ROOT)
+    env.setdefault("MODULAR_ONTOLOGY_MCP_ALLOWED_HOSTS", "127.0.0.1:*,localhost:*,[::1]:*")
+    env.setdefault("MODULAR_ONTOLOGY_MCP_ALLOWED_ORIGINS", "http://127.0.0.1:*,http://localhost:*,http://[::1]:*")
     process = subprocess.Popen(
         [
             sys.executable,
             "-m",
-            "moddular_graph.mcp_server",
+            "modular_ontology.mcp_server",
             "--transport",
             "streamable-http",
             "--host",

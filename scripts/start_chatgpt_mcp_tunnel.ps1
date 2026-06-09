@@ -70,8 +70,8 @@ $RemotePayload = [ordered]@{
 }
 $RemotePayload | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 $RemoteFile
 
-$env:MODDULAR_GRAPH_ROOT = $Root
-$env:MODULAR_GRAPH_PUBLIC_MCP_URL = $PublicMcpUrl
+$env:MODULAR_ONTOLOGY_ROOT = $Root
+$env:MODULAR_ONTOLOGY_PUBLIC_MCP_URL = $PublicMcpUrl
 
 $AllowedHosts = "$PublicHost,127.0.0.1:*,localhost:*,[::1]:*"
 $AllowedOrigins = "https://chatgpt.com,https://chat.openai.com,http://127.0.0.1:*,http://localhost:*"
@@ -79,7 +79,7 @@ $AllowedOrigins = "https://chatgpt.com,https://chat.openai.com,http://127.0.0.1:
 $McpProcess = Start-Process `
   -FilePath python `
   -ArgumentList @(
-    "-m", "moddular_graph.mcp_server",
+    "-m", "modular_ontology.mcp_server",
     "--transport", "streamable-http",
     "--host", "127.0.0.1",
     "--port", "8011",

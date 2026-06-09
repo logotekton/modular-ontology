@@ -1,11 +1,11 @@
 {
   "mcpServers": {
-    "modular-graph": {
+    "modular-ontology": {
       "command": "python",
-      "args": ["-m", "moddular_graph.mcp_server"],
-      "cwd": "D:\\02.AI 코딩\\20.Moddular Graph",
+      "args": ["-m", "modular_ontology.mcp_server"],
+      "cwd": "D:\\02.AI 코딩\\20.Modular Ontology",
       "env": {
-        "MODDULAR_GRAPH_ROOT": "D:\\02.AI 코딩\\20.Moddular Graph"
+        "MODULAR_ONTOLOGY_ROOT": "D:\\02.AI 코딩\\20.Modular Ontology"
       }
     }
   }

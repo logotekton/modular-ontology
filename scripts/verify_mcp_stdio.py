@@ -15,9 +15,9 @@ ROOT = Path(__file__).resolve().parents[1]
 async def main() -> None:
     params = StdioServerParameters(
         command=sys.executable,
-        args=["-m", "moddular_graph.mcp_server"],
+        args=["-m", "modular_ontology.mcp_server"],
         cwd=ROOT,
-        env={"MODDULAR_GRAPH_ROOT": str(ROOT)},
+        env={"MODULAR_ONTOLOGY_ROOT": str(ROOT)},
     )
     async with stdio_client(params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:

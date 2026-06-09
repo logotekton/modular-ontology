@@ -6,7 +6,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$env:MODDULAR_GRAPH_DATA_DIR = $DriveDataDir
-$env:MODDULAR_GRAPH_STRUCTURED_DATA_DIR = "1"
+$env:MODULAR_ONTOLOGY_DATA_DIR = $DriveDataDir
+$env:MODULAR_ONTOLOGY_STRUCTURED_DATA_DIR = "1"
 
-python -m uvicorn moddular_graph.app:app --host 0.0.0.0 --port $Port
+python -m uvicorn modular_ontology.app:app --host 0.0.0.0 --port $Port
