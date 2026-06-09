@@ -21,6 +21,65 @@ Production-like single-server mode:
 
 After `npm run build`, FastAPI serves both the React UI and API at `http://127.0.0.1:8010`.
 
+## Workspace routes
+
+The React workspace is a single-page app, but each major feature has a stable browser path. Keep these routes distinct so deep links, refreshes, screenshots, and issue reports point to the right workspace area.
+
+| Path | UI area | Main ownership |
+| --- | --- | --- |
+| `/dashboard` | Dashboard | operational summary and assigned project overview |
+| `/projects` | Projects | project metadata, project-pack links, and access context |
+| `/upload` | Upload | ontology ZIP upload, IFC file staging, and pack list |
+| `/graph` | Graph Explorer | project-level graph view, pack filters, node inspector, and AI Query |
+| `/mcp-connection` | MCP Connections | per-user MCP URL and connector setup |
+| `/admin` | Admin | user approval, company management, roles, and project access |
+
+`/` currently opens the dashboard. Unknown non-API paths fall back to the React app so the client route can decide what to show.
+
+## API namespaces
+
+All backend routes stay under `/api` except the streamable HTTP MCP endpoint under `/mcp`. Prefer extending the existing namespace that matches the feature instead of adding new top-level paths.
+
+| Namespace | Purpose |
+| --- | --- |
+| `/api/auth/*` | login, signup, session lookup, logout |
+| `/api/admin/*` | admin-only users, companies, project access, storage sync, and reindex actions |
+| `/api/projects*` | visible projects, project suggestions, and project graph data |
+| `/api/packs*` | visible ontology packs and ontology ZIP upload |
+| `/api/graph/{pack_id}` | legacy single-pack graph inspection |
+| `/api/ifc/upload` | IFC, IFCZIP, or ZIP model file staging by project |
+| `/api/query` | Graph RAG and user-key OpenAI AI Query |
+| `/api/llm/openai/validate` | user-provided OpenAI API key validation |
+| `/api/mcp/*` | per-user MCP URL status and token regeneration |
+| `/mcp/{token}` | streamable HTTP MCP endpoint for AI clients |
+
+The default graph experience should use `/api/projects/{project_id}/graph` because one project can contain multiple packs. Keep `/api/graph/{pack_id}` for focused pack inspection and compatibility.
+
+## Local verification
+
+Run these before handing off a local change:
+
+```powershell
+npm run build
+python -m pytest tests/test_modular_ontology.py -q
+```
+
+For route fallback checks without starting a full browser session:
+
+```powershell
+@'
+from fastapi.testclient import TestClient
+from modular_ontology.app import app
+
+client = TestClient(app)
+for path in ["/dashboard", "/projects", "/upload", "/graph", "/mcp-connection", "/admin"]:
+    response = client.get(path)
+    print(path, response.status_code, response.headers.get("content-type", ""))
+'@ | python -
+```
+
+Do not deploy or push as part of local verification unless that is explicitly requested.
+
 ## Google Drive storage for Vercel
 
 Vercel has no bundled local SQLite database or ontology ZIP packs. To hydrate the deployment from Google Drive, set these environment variables:
