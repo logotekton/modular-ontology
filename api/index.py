@@ -1,1 +1,1 @@
-from moddular_graph.app import app
+from modular_ontology.app import app

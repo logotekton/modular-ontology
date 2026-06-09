@@ -670,6 +670,104 @@ def build_graph(pack_id: str, max_nodes: int = 900, max_edges: int = 1600) -> di
     return build_graph_from_pack(pack, max_nodes=max_nodes, max_edges=max_edges)
 
 
+def build_multi_pack_graph(
+    pack_ids: list[str],
+    *,
+    title: str = "Project Graph",
+    project: dict[str, Any] | None = None,
+    max_nodes: int = 900,
+    max_edges: int = 1600,
+) -> dict[str, Any]:
+    active_pack_ids = [pack_id for pack_id in dict.fromkeys(pack_ids) if pack_id]
+    if not active_pack_ids:
+        return {
+            "pack": {
+                "id": project.get("id", "project") if project else "project",
+                "title": title,
+                "filename": "",
+                "source": "Project",
+                "validationStatus": "READY",
+                "counts": {"nodes": 0, "edges": 0, "documents": 0},
+            },
+            "project": project,
+            "packs": [],
+            "activePackIds": [],
+            "nodes": [],
+            "edges": [],
+            "stats": {"visibleNodes": 0, "visibleEdges": 0, "totalNodes": 0, "totalEdges": 0},
+        }
+
+    per_pack_nodes = max(1, max_nodes // len(active_pack_ids))
+    per_pack_edges = max(1, max_edges // len(active_pack_ids))
+    merged_nodes: list[dict[str, Any]] = []
+    merged_edges: list[dict[str, Any]] = []
+    pack_summaries: list[dict[str, Any]] = []
+    total_nodes = 0
+    total_edges = 0
+
+    for pack_id in active_pack_ids:
+        graph = build_graph(pack_id, max_nodes=per_pack_nodes, max_edges=per_pack_edges)
+        summary = graph["pack"]
+        pack_summaries.append(summary)
+        total_nodes += int(graph["stats"].get("totalNodes") or 0)
+        total_edges += int(graph["stats"].get("totalEdges") or 0)
+        node_id_map: dict[str, str] = {}
+        for node in graph["nodes"]:
+            original_id = str(node["id"])
+            merged_id = f"{summary['id']}::{original_id}"
+            node_id_map[original_id] = merged_id
+            properties = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+            merged_nodes.append(
+                {
+                    **node,
+                    "id": merged_id,
+                    "properties": {
+                        **properties,
+                        "original_id": original_id,
+                        "pack_id": summary["id"],
+                        "pack_title": summary["title"],
+                    },
+                }
+            )
+        for index, edge in enumerate(graph["edges"]):
+            source = edge_endpoint_id(edge.get("source", ""))
+            target = edge_endpoint_id(edge.get("target", ""))
+            if source not in node_id_map or target not in node_id_map:
+                continue
+            merged_edges.append(
+                {
+                    **edge,
+                    "id": f"{summary['id']}::{edge.get('id') or index}",
+                    "source": node_id_map[source],
+                    "target": node_id_map[target],
+                    "packId": summary["id"],
+                }
+            )
+
+    document_count = sum(int(pack.get("counts", {}).get("documents") or 0) for pack in pack_summaries)
+    return {
+        "pack": {
+            "id": project.get("id", "project") if project else "project",
+            "title": title,
+            "filename": "",
+            "source": "Project",
+            "validationStatus": "READY",
+            "counts": {"nodes": total_nodes, "edges": total_edges, "documents": document_count},
+        },
+        "project": project,
+        "packs": pack_summaries,
+        "activePackIds": active_pack_ids,
+        "nodes": merged_nodes,
+        "edges": merged_edges,
+        "stats": {
+            "visibleNodes": len(merged_nodes),
+            "visibleEdges": len(merged_edges),
+            "totalNodes": total_nodes,
+            "totalEdges": total_edges,
+        },
+    }
+
+
 def list_nodes(pack_id: str, node_type: str | None = None, limit: int = 100) -> dict[str, Any]:
     graph = build_graph(pack_id, max_nodes=max(1000, limit * 5), max_edges=0)
     nodes = graph["nodes"]

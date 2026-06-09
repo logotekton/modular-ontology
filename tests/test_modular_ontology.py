@@ -7,20 +7,21 @@ import sys
 import zipfile
 from pathlib import Path
 
-os.environ.setdefault("MODDULAR_GRAPH_ADMIN_YTHONG_PASSWORD", "test-admin-password")
-os.environ.setdefault("MODDULAR_GRAPH_ADMIN_MWHONG_PASSWORD", "test-admin-password-2")
+os.environ.setdefault("MODULAR_ONTOLOGY_ADMIN_YTHONG_PASSWORD", "test-admin-password")
+os.environ.setdefault("MODULAR_ONTOLOGY_ADMIN_MWHONG_PASSWORD", "test-admin-password-2")
 
 import anyio
 from fastapi.testclient import TestClient
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
-from moddular_graph import mcp_server
-from moddular_graph.app import app
-from moddular_graph.auth import User, _hash_password
-from moddular_graph.mcp_tokens import build_user_mcp_urls, ensure_mcp_token_for_user, get_mcp_token_record
-from moddular_graph.pack_index import (
+from modular_ontology import mcp_server
+from modular_ontology.app import app
+from modular_ontology.auth import User, _hash_password
+from modular_ontology.mcp_tokens import build_user_mcp_urls, ensure_mcp_token_for_user, get_mcp_token_record, regenerate_mcp_token_for_user
+from modular_ontology.pack_index import (
     build_graph,
+    build_multi_pack_graph,
     get_fasteners,
     get_module,
     list_modules,
@@ -29,13 +30,13 @@ from moddular_graph.pack_index import (
     list_projects,
     read_pack_document,
 )
-from moddular_graph.qa import answer_pack_question
-from moddular_graph.store import index_all_packs, search_documents
-from moddular_graph.google_drive_sync import DriveItem, google_drive_sync_status, sync_google_drive_storage
+from modular_ontology.qa import answer_pack_question
+from modular_ontology.store import index_all_packs, search_documents
+from modular_ontology.google_drive_sync import DriveItem, google_drive_sync_status, sync_google_drive_storage, write_back_ifc_file
 
 
 client = TestClient(app)
-TEST_ADMIN_PASSWORD = os.environ["MODDULAR_GRAPH_ADMIN_YTHONG_PASSWORD"]
+TEST_ADMIN_PASSWORD = os.environ["MODULAR_ONTOLOGY_ADMIN_YTHONG_PASSWORD"]
 
 
 def _sample_pack_bytes() -> bytes:
@@ -93,19 +94,131 @@ def test_builds_graph_from_both_pack_shapes() -> None:
     assert revit["stats"]["totalNodes"] == packs["revit-yeoju-ar-ifc-workset-module-localcrab-pack"]["counts"]["nodes"]
 
 
+def test_builds_project_graph_from_multiple_packs() -> None:
+    pack_ids = [
+        "advance-steel-samcheok-bldg-b-bm25-evidence-pack",
+        "revit-yeoju-ar-ifc-workset-module-localcrab-pack",
+    ]
+
+    graph = build_multi_pack_graph(pack_ids, title="Combined Project", max_nodes=120, max_edges=240)
+
+    assert graph["pack"]["title"] == "Combined Project"
+    assert graph["activePackIds"] == pack_ids
+    assert {pack["id"] for pack in graph["packs"]} == set(pack_ids)
+    assert {node["packId"] for node in graph["nodes"]} == set(pack_ids)
+    assert all("::" in node["id"] for node in graph["nodes"])
+    assert graph["stats"]["visibleNodes"] > 0
+    assert graph["stats"]["totalNodes"] >= graph["stats"]["visibleNodes"]
+
+
 def test_projects_replace_marketplace_with_project_pack_grouping() -> None:
     projects = list_projects()
 
-    assert {project["id"] for project in projects} == {"samcheok-building-b", "yeoju-modular-dormitory"}
+    assert {project["id"] for project in projects} >= {"samcheok-building-b", "yeoju-modular-dormitory"}
     assert all(project["packIds"] for project in projects)
     assert all(project["role"] == "Admin" for project in projects)
 
 
+def test_project_graph_api_returns_project_scoped_graph() -> None:
+    response = client.get("/api/projects/samcheok-building-b/graph?max_nodes=20&max_edges=40")
+    invalid_pack = client.get(
+        "/api/projects/samcheok-building-b/graph?pack_ids=revit-yeoju-ar-ifc-workset-module-localcrab-pack"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["project"]["id"] == "samcheok-building-b"
+    assert payload["activePackIds"] == ["advance-steel-samcheok-bldg-b-bm25-evidence-pack"]
+    assert payload["nodes"]
+    assert invalid_pack.status_code == 400
+
+
+def test_ifc_upload_stores_project_file_for_admin(monkeypatch, tmp_path) -> None:
+    from modular_ontology import app as app_module
+
+    admin_user = User(
+        id="admin-test",
+        name="Admin",
+        email="admin@example.com",
+        company="Kumkang Kind",
+        role="admin",
+        password_hash="unused",
+        status="active",
+    )
+    monkeypatch.setattr(app_module, "IFC_UPLOAD_DIR", tmp_path / "ifc")
+    monkeypatch.setattr(app_module, "require_admin", lambda authorization: admin_user)
+    monkeypatch.setattr(app_module, "current_user", lambda authorization: admin_user)
+    headers = {"Authorization": "Bearer admin-test-token"}
+
+    response = client.post(
+        "/api/ifc/upload",
+        headers=headers,
+        data={"project_id": "samcheok-building-b"},
+        files={"file": ("sample.ifc", b"ISO-10303-21;", "application/octet-stream")},
+    )
+    invalid = client.post(
+        "/api/ifc/upload",
+        headers=headers,
+        data={"project_id": "samcheok-building-b"},
+        files={"file": ("sample.txt", b"not-ifc", "text/plain")},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "stored"
+    assert payload["projectId"] == "samcheok-building-b"
+    assert payload["filename"] == "sample.ifc"
+    assert (tmp_path / "ifc" / "samcheok-building-b" / "sample.ifc").read_bytes() == b"ISO-10303-21;"
+    metadata = json.loads((tmp_path / "ifc" / "samcheok-building-b" / "sample.metadata.json").read_text(encoding="utf-8"))
+    assert metadata["projectId"] == "samcheok-building-b"
+    assert metadata["storage"] == "local"
+    assert invalid.status_code == 400
+
+
+def test_ifc_drive_write_back_creates_project_folders(monkeypatch, tmp_path) -> None:
+    class FakeDriveClient:
+        def __init__(self) -> None:
+            self.children = {"root": []}
+            self.created = []
+            self.uploads = []
+
+        def list_children(self, folder_id):
+            return self.children.get(folder_id, [])
+
+        def create_folder(self, parent_id, name):
+            folder_id = f"{parent_id}/{name}"
+            item = DriveItem(folder_id, name, "application/vnd.google-apps.folder")
+            self.children.setdefault(parent_id, []).append(item)
+            self.children.setdefault(folder_id, [])
+            self.created.append((parent_id, name))
+            return item
+
+        def upload_file_by_name(self, folder_id, source, name=None, mime_type=None):
+            self.uploads.append({"folder_id": folder_id, "source": Path(source), "name": name, "mime_type": mime_type})
+            return {"status": "created", "id": "drive-file", "name": name or Path(source).name}
+
+    ifc_path = tmp_path / "sample.ifc"
+    ifc_path.write_bytes(b"ISO-10303-21;")
+    fake_client = FakeDriveClient()
+    monkeypatch.setenv("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "root")
+
+    result = write_back_ifc_file(ifc_path, "samcheok-building-b", client=fake_client)
+
+    assert result["status"] == "written"
+    assert result["drivePath"] == "03_IFC_Models/samcheok-building-b/files/sample.ifc"
+    assert fake_client.created == [
+        ("root", "03_IFC_Models"),
+        ("root/03_IFC_Models", "samcheok-building-b"),
+        ("root/03_IFC_Models/samcheok-building-b", "files"),
+    ]
+    assert fake_client.uploads[0]["folder_id"] == "root/03_IFC_Models/samcheok-building-b/files"
+
+
 def test_admin_project_crud_and_pack_link_management(monkeypatch, tmp_path) -> None:
-    from moddular_graph import project_store
+    from modular_ontology import project_store
 
     users_file = tmp_path / "users.json"
-    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
     monkeypatch.setattr(project_store, "DB_PATH", tmp_path / "projects.sqlite3")
 
     admin = client.post(
@@ -174,12 +287,12 @@ def test_fastapi_serves_web_shell_or_build_hint() -> None:
     response = client.get("/")
 
     assert response.status_code == 200
-    assert "Modular Ontology" in response.text or "Modular Graph" in response.text
+    assert "Modular Ontology" in response.text or "Modular Ontology" in response.text
 
 
 def test_auth_sessions_distinguish_admin_and_member(monkeypatch, tmp_path) -> None:
     users_file = tmp_path / "users.json"
-    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
 
     admin = client.post(
         "/api/auth/login",
@@ -227,7 +340,7 @@ def test_auth_sessions_distinguish_admin_and_member(monkeypatch, tmp_path) -> No
 
 def test_signup_company_does_not_create_managed_company_card(monkeypatch, tmp_path) -> None:
     users_file = tmp_path / "users.json"
-    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
 
     admin = client.post(
         "/api/auth/login",
@@ -267,7 +380,7 @@ def test_signup_company_does_not_create_managed_company_card(monkeypatch, tmp_pa
 
 
 def test_admin_can_delete_company_with_confirmed_users_and_delete_members(monkeypatch, tmp_path) -> None:
-    from moddular_graph.auth import _hash_password
+    from modular_ontology.auth import _hash_password
 
     users_file = tmp_path / "users.json"
     users_file.write_text(
@@ -298,7 +411,7 @@ def test_admin_can_delete_company_with_confirmed_users_and_delete_members(monkey
         ),
         encoding="utf-8",
     )
-    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
     admin_login = client.post(
         "/api/auth/login",
         json={"email": "ythong@kumkangkind.com", "password": TEST_ADMIN_PASSWORD},
@@ -331,7 +444,7 @@ def test_admin_can_delete_company_with_confirmed_users_and_delete_members(monkey
 
 
 def test_deleted_default_user_can_re_register_and_show_for_approval(monkeypatch, tmp_path) -> None:
-    from moddular_graph.auth import _hash_password, invalidate_users_cache
+    from modular_ontology.auth import _hash_password, invalidate_users_cache
 
     users_file = tmp_path / "users.json"
     users_file.write_text(
@@ -354,7 +467,7 @@ def test_deleted_default_user_can_re_register_and_show_for_approval(monkeypatch,
         ),
         encoding="utf-8",
     )
-    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
     invalidate_users_cache()
     admin_login = client.post(
         "/api/auth/login",
@@ -377,8 +490,8 @@ def test_deleted_default_user_can_re_register_and_show_for_approval(monkeypatch,
 def test_deleted_user_can_register_again_and_clears_tombstone(monkeypatch, tmp_path) -> None:
     import json as _json
 
-    from moddular_graph import auth
-    from moddular_graph.auth import (
+    from modular_ontology import auth
+    from modular_ontology.auth import (
         _load_deleted_users,
         delete_user,
         invalidate_users_cache,
@@ -388,7 +501,7 @@ def test_deleted_user_can_register_again_and_clears_tombstone(monkeypatch, tmp_p
 
     users_file = tmp_path / "users.json"
     users_file.write_text(_json.dumps({"companies": ["Kumkang Kind"], "users": []}), encoding="utf-8")
-    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
     invalidate_users_cache()
 
     # Delete a default admin -> creates a deletion tombstone.
@@ -409,7 +522,7 @@ def test_deleted_user_can_register_again_and_clears_tombstone(monkeypatch, tmp_p
 
 
 def test_external_company_only_sees_assigned_projects_and_graphs(monkeypatch, tmp_path) -> None:
-    from moddular_graph.auth import _hash_password
+    from modular_ontology.auth import _hash_password
 
     users_file = tmp_path / "users.json"
     users_file.write_text(
@@ -432,7 +545,7 @@ def test_external_company_only_sees_assigned_projects_and_graphs(monkeypatch, tm
         ),
         encoding="utf-8",
     )
-    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
 
     login = client.post(
         "/api/auth/login",
@@ -460,7 +573,7 @@ def test_external_company_only_sees_assigned_projects_and_graphs(monkeypatch, tm
 
 
 def test_auth_can_load_users_from_json_config(monkeypatch, tmp_path) -> None:
-    from moddular_graph.auth import _hash_password, authenticate, load_users
+    from modular_ontology.auth import _hash_password, authenticate, load_users
 
     users_file = tmp_path / "users.json"
     users_file.write_text(
@@ -479,7 +592,7 @@ def test_auth_can_load_users_from_json_config(monkeypatch, tmp_path) -> None:
         ),
         encoding="utf-8",
     )
-    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
 
     users = load_users()
     token, user = authenticate("configured.admin@example.com", "configured-admin-pass")
@@ -490,8 +603,8 @@ def test_auth_can_load_users_from_json_config(monkeypatch, tmp_path) -> None:
 
 
 def test_auth_token_survives_empty_memory_session(monkeypatch, tmp_path) -> None:
-    import moddular_graph.auth as auth
-    from moddular_graph.auth import _hash_password, authenticate, get_user_by_token, invalidate_users_cache
+    import modular_ontology.auth as auth
+    from modular_ontology.auth import _hash_password, authenticate, get_user_by_token, invalidate_users_cache
 
     users_file = tmp_path / "users.json"
     users_file.write_text(
@@ -510,8 +623,8 @@ def test_auth_token_survives_empty_memory_session(monkeypatch, tmp_path) -> None
         ),
         encoding="utf-8",
     )
-    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
-    monkeypatch.setenv("MODDULAR_GRAPH_SESSION_SECRET", "test-session-secret")
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODULAR_ONTOLOGY_SESSION_SECRET", "test-session-secret")
     invalidate_users_cache()
 
     token, user = authenticate("stateless.admin@example.com", "stateless-admin-pass")
@@ -523,7 +636,7 @@ def test_auth_token_survives_empty_memory_session(monkeypatch, tmp_path) -> None
 
 
 def test_auth_accepts_utf8_bom_user_files(monkeypatch, tmp_path) -> None:
-    from moddular_graph.auth import _hash_password, authenticate, invalidate_users_cache
+    from modular_ontology.auth import _hash_password, authenticate, invalidate_users_cache
 
     users_file = tmp_path / "users-with-bom.json"
     payload = json.dumps(
@@ -540,7 +653,7 @@ def test_auth_accepts_utf8_bom_user_files(monkeypatch, tmp_path) -> None:
         }
     )
     users_file.write_text(f"\ufeff{payload}", encoding="utf-8")
-    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
     invalidate_users_cache()
 
     token, user = authenticate("bom.admin@example.com", "bom-admin-pass")
@@ -550,10 +663,10 @@ def test_auth_accepts_utf8_bom_user_files(monkeypatch, tmp_path) -> None:
 
 
 def test_pack_upload_is_session_admin_only_and_accepts_valid_zip(monkeypatch, tmp_path) -> None:
-    from moddular_graph import app as app_module
-    import moddular_graph.pack_index as pack_index
-    import moddular_graph.store as store
-    from moddular_graph.auth import _hash_password
+    from modular_ontology import app as app_module
+    import modular_ontology.pack_index as pack_index
+    import modular_ontology.store as store
+    from modular_ontology.auth import _hash_password
 
     monkeypatch.setattr(pack_index, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(store, "DB_PATH", tmp_path / "uploaded-index.sqlite3")
@@ -582,7 +695,7 @@ def test_pack_upload_is_session_admin_only_and_accepts_valid_zip(monkeypatch, tm
         ),
         encoding="utf-8",
     )
-    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
     admin_login = client.post(
         "/api/auth/login",
         json={"email": "ythong@kumkangkind.com", "password": TEST_ADMIN_PASSWORD},
@@ -648,8 +761,8 @@ def test_mcp_company_scope_filters_projects_and_packs(monkeypatch, tmp_path) -> 
         ),
         encoding="utf-8",
     )
-    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
-    monkeypatch.setenv("MODULAR_GRAPH_MCP_COMPANY", "Client Co")
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODULAR_ONTOLOGY_MCP_COMPANY", "Client Co")
 
     projects = json.loads(mcp_server.list_projects())
     packs = json.loads(mcp_server.list_packs())
@@ -684,6 +797,88 @@ def test_mcp_user_token_store_reuses_active_token(tmp_path) -> None:
     assert urls["publicUrl"] == f"https://example.trycloudflare.com/mcp/{first['token']}"
 
 
+def test_mcp_user_token_regeneration_revokes_previous_token(tmp_path) -> None:
+    token_file = tmp_path / "00_Admin" / "mcp_tokens.json"
+    user = User(
+        id="client-member",
+        name="Client Member",
+        email="Client.Member@example.com",
+        company="Client Co",
+        role="member",
+        password_hash=_hash_password("member-pass"),
+        status="active",
+    )
+
+    first = ensure_mcp_token_for_user(user, path=token_file)
+    regenerated = regenerate_mcp_token_for_user(user, path=token_file)
+    reused = ensure_mcp_token_for_user(user, path=token_file)
+    payload = json.loads(token_file.read_text(encoding="utf-8"))
+    records = [item for item in payload["tokens"] if item["userEmail"] == "client.member@example.com"]
+
+    assert regenerated["token"].startswith("mom_")
+    assert regenerated["token"] != first["token"]
+    assert reused["token"] == regenerated["token"]
+    assert get_mcp_token_record(first["token"], path=token_file) is None
+    assert get_mcp_token_record(regenerated["token"], path=token_file)["status"] == "active"
+    assert [record["status"] for record in records] == ["revoked", "active"]
+
+
+def test_mcp_status_returns_user_url_when_token_drive_write_back_fails(monkeypatch) -> None:
+    from modular_ontology import app as app_module
+
+    user = User(
+        id="client-member",
+        name="Client Member",
+        email="client.member@example.com",
+        company="Client Co",
+        role="member",
+        password_hash=_hash_password("member-pass"),
+        status="active",
+    )
+
+    monkeypatch.setattr(app_module, "current_user", lambda authorization: user)
+    monkeypatch.setattr(
+        app_module,
+        "_public_mcp_remote",
+        lambda request: ("https://modular-ontology.xyz/mcp", "https://modular-ontology.xyz"),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "run_google_drive_mcp_tokens_sync",
+        lambda: {"enabled": True, "status": "error", "error": "drive download failed"},
+    )
+    monkeypatch.setattr(
+        app_module,
+        "ensure_mcp_token_for_user",
+        lambda active_user: {
+            "token": "mom_test-token",
+            "userEmail": active_user.email,
+            "userName": active_user.name,
+            "company": active_user.company,
+            "role": active_user.role,
+        },
+    )
+    monkeypatch.setattr(
+        app_module,
+        "run_google_drive_write_back",
+        lambda kind: {"enabled": True, "status": "error", "error": "drive upload failed"},
+    )
+
+    response = client.get("/api/mcp/status", headers={"Authorization": "Bearer test-token"})
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert payload["remote"]["userUrl"]["publicUrl"] == "https://modular-ontology.xyz/mcp/mom_test-token"
+    assert payload["remote"]["tokenSync"]["status"] == "error"
+    assert payload["remote"]["tokenWriteBack"]["status"] == "error"
+
+
+def test_mcp_user_url_regenerate_requires_login() -> None:
+    response = client.post("/api/mcp/user-url/regenerate")
+
+    assert response.status_code == 401
+
+
 def test_mcp_user_token_scope_filters_projects_and_packs(monkeypatch, tmp_path) -> None:
     users_file = tmp_path / "users.json"
     token_file = tmp_path / "mcp_tokens.json"
@@ -707,7 +902,7 @@ def test_mcp_user_token_scope_filters_projects_and_packs(monkeypatch, tmp_path) 
         status="active",
     )
     token = ensure_mcp_token_for_user(user, path=token_file)["token"]
-    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
     monkeypatch.setattr(mcp_server, "_request_mcp_token", lambda: token)
     monkeypatch.setattr(mcp_server, "get_mcp_token_record", lambda value: get_mcp_token_record(value, path=token_file))
 
@@ -725,9 +920,9 @@ def test_mcp_stdio_server_lists_and_calls_tools() -> None:
         root = Path(__file__).resolve().parents[1]
         params = StdioServerParameters(
             command=sys.executable,
-            args=["-m", "moddular_graph.mcp_server"],
+            args=["-m", "modular_ontology.mcp_server"],
             cwd=root,
-            env={"MODDULAR_GRAPH_ROOT": str(root)},
+            env={"MODULAR_ONTOLOGY_ROOT": str(root)},
         )
         async with stdio_client(params) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as session:
@@ -894,7 +1089,7 @@ def test_openai_graph_rag_path_uses_injected_client(monkeypatch, tmp_path) -> No
     db_path = tmp_path / "openai-qa-index.sqlite3"
     index_all_packs(db_path=db_path)
     client_stub = FakeClient()
-    monkeypatch.setenv("MODDULAR_GRAPH_OPENAI_MODEL", "test-model")
+    monkeypatch.setenv("MODULAR_ONTOLOGY_OPENAI_MODEL", "test-model")
 
     answer = answer_pack_question(
         "advance-steel-samcheok-bldg-b-bm25-evidence-pack",
@@ -911,79 +1106,195 @@ def test_openai_graph_rag_path_uses_injected_client(monkeypatch, tmp_path) -> No
     assert "evidence" in client_stub.responses.calls[0]["input"]
 
 
-def test_ollama_graph_rag_path_uses_injected_client(monkeypatch, tmp_path) -> None:
-    calls = []
+def test_openai_graph_rag_uses_request_api_key(monkeypatch, tmp_path) -> None:
+    import modular_ontology.qa as qa
 
-    def fake_ollama(**kwargs):
-        calls.append(kwargs)
-        return "Local Gemma answer from ontology evidence."
+    class FakeResponse:
+        output_text = "Request-key OpenAI answer."
 
-    db_path = tmp_path / "ollama-qa-index.sqlite3"
+    class FakeResponses:
+        def create(self, **kwargs):
+            return FakeResponse()
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = FakeResponses()
+
+    captured_keys = []
+
+    def fake_make_openai_client(api_key=None):
+        captured_keys.append(api_key)
+        return FakeClient()
+
+    db_path = tmp_path / "openai-request-key-index.sqlite3"
     index_all_packs(db_path=db_path)
-    monkeypatch.setenv("MODDULAR_GRAPH_OLLAMA_MODEL", "gemma4:12b-it-q4_K_M")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(qa, "_make_openai_client", fake_make_openai_client)
 
     answer = answer_pack_question(
         "advance-steel-samcheok-bldg-b-bm25-evidence-pack",
         "Beam",
         limit=2,
         db_path=db_path,
-        use_ollama=True,
-        llm_client=fake_ollama,
+        use_openai=True,
+        openai_api_key="sk-user-secret-for-test",
+        openai_model="gpt-4.1-mini",
     )
 
-    assert answer["mode"] == "ollama-graph-rag"
-    assert answer["answer"] == "Local Gemma answer from ontology evidence."
-    assert calls[0]["model"] == "gemma4:12b-it-q4_K_M"
-    assert "evidence" in calls[0]["prompt"]
+    assert answer["mode"] == "openai-graph-rag"
+    assert answer["answer"] == "Request-key OpenAI answer."
+    assert captured_keys == ["sk-user-secret-for-test"]
 
 
-def test_ollama_chat_request_uses_token_and_message_content(monkeypatch) -> None:
-    import moddular_graph.qa as qa
+def test_openai_graph_rag_requires_request_api_key_even_when_server_key_exists(monkeypatch, tmp_path) -> None:
+    import modular_ontology.qa as qa
 
-    calls = []
+    def fail_if_called(api_key=None):
+        raise AssertionError("server OpenAI key fallback should not be used")
 
-    def fake_post(url, payload, timeout):
-        calls.append({"url": url, "payload": payload, "timeout": timeout})
-        return {"message": {"role": "assistant", "content": "Gemma answer"}}
+    db_path = tmp_path / "openai-no-server-fallback.sqlite3"
+    index_all_packs(db_path=db_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-server-secret-for-test")
+    monkeypatch.setattr(qa, "_make_openai_client", fail_if_called)
 
-    monkeypatch.setenv("MODDULAR_GRAPH_OLLAMA_URL", "https://ai.example.test")
-    monkeypatch.setenv("MODDULAR_GRAPH_OLLAMA_MODEL", "gemma4:12b-it-q4_K_M")
-    monkeypatch.setenv("MODDULAR_GRAPH_OLLAMA_TOKEN", "secret-token")
-    monkeypatch.setattr(qa, "_post_ollama_json", fake_post)
+    answer = answer_pack_question(
+        "advance-steel-samcheok-bldg-b-bm25-evidence-pack",
+        "Beam",
+        limit=2,
+        db_path=db_path,
+        use_openai=True,
+        openai_model="gpt-4.1-mini",
+    )
 
-    answer = qa._compose_ollama_answer("질문", [], [], [], "local fallback", [])
-
-    assert answer == "Gemma answer"
-    assert calls[0]["url"] == "https://ai.example.test/api/chat"
-    assert calls[0]["payload"]["model"] == "gemma4:12b-it-q4_K_M"
-    assert calls[0]["payload"]["think"] is False
-    assert calls[0]["payload"]["options"]["num_predict"] == 2048
-    assert calls[0]["payload"]["messages"][0]["role"] == "system"
-    assert calls[0]["payload"]["messages"][1]["role"] == "user"
-    assert qa._ollama_headers()["X-Modular-AI-Token"] == "secret-token"
+    assert answer["mode"] == "local-graph-rag"
+    assert answer["llmError"] == "OpenAI API key is required for web AI Query. Provide a user API key."
 
 
-def test_local_ai_proxy_requires_token(monkeypatch) -> None:
-    from fastapi.responses import Response
-    from fastapi.testclient import TestClient
-    import moddular_graph.local_ai_proxy as proxy
+def test_openai_graph_rag_redacts_request_api_key_from_errors(monkeypatch, tmp_path) -> None:
+    import modular_ontology.qa as qa
 
-    monkeypatch.setenv("MODDULAR_GRAPH_LOCAL_AI_TOKEN", "proxy-secret")
-    monkeypatch.setattr(proxy, "_forward_to_ollama", lambda *args, **kwargs: Response(b'{"ok":true}', media_type="application/json"))
-    proxy_client = TestClient(proxy.app)
+    def fake_make_openai_client(api_key=None):
+        raise RuntimeError(f"bad api key {api_key}")
 
-    missing = proxy_client.get("/api/tags")
-    wrong = proxy_client.get("/api/tags", headers={"X-Modular-AI-Token": "wrong"})
-    ok = proxy_client.get("/api/tags", headers={"X-Modular-AI-Token": "proxy-secret"})
+    db_path = tmp_path / "openai-redacted-key-index.sqlite3"
+    index_all_packs(db_path=db_path)
+    monkeypatch.setattr(qa, "_make_openai_client", fake_make_openai_client)
 
-    assert missing.status_code == 401
-    assert wrong.status_code == 401
-    assert ok.status_code == 200
+    answer = answer_pack_question(
+        "advance-steel-samcheok-bldg-b-bm25-evidence-pack",
+        "Beam",
+        limit=2,
+        db_path=db_path,
+        use_openai=True,
+        openai_api_key="sk-user-secret-for-test",
+        openai_model="gpt-4.1-mini",
+    )
+
+    assert answer["mode"] == "local-graph-rag"
+    assert answer["llmError"]
+    assert "sk-user-secret-for-test" not in answer["llmError"]
+    assert "[redacted" in answer["llmError"]
+
+
+def test_safe_llm_error_redacts_openai_masked_key() -> None:
+    import modular_ontology.qa as qa
+
+    error = "Incorrect API key provided: sk-user-********************************test. Check your API key."
+
+    safe = qa._safe_llm_error(error)
+
+    assert "sk-user" not in safe
+    assert "test." not in safe
+    assert "[redacted-api-key]" in safe
+
+
+def test_validate_openai_api_key_uses_request_key(monkeypatch) -> None:
+    import modular_ontology.qa as qa
+
+    class FakeResponses:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return object()
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = FakeResponses()
+
+    fake_client = FakeClient()
+    captured_keys = []
+
+    def fake_make_openai_client(api_key=None):
+        captured_keys.append(api_key)
+        return fake_client
+
+    monkeypatch.setattr(qa, "_make_openai_client", fake_make_openai_client)
+
+    result = qa.validate_openai_api_key("sk-user-secret-for-test", "gpt-4.1-mini")
+
+    assert result == {"valid": True, "model": "gpt-4.1-mini"}
+    assert captured_keys == ["sk-user-secret-for-test"]
+    assert fake_client.responses.calls[0]["model"] == "gpt-4.1-mini"
+    assert fake_client.responses.calls[0]["max_output_tokens"] == 16
+
+
+def test_validate_openai_api_key_redacts_errors(monkeypatch) -> None:
+    import modular_ontology.qa as qa
+
+    def fake_make_openai_client(api_key=None):
+        raise RuntimeError(f"Incorrect API key provided: {api_key}.")
+
+    monkeypatch.setattr(qa, "_make_openai_client", fake_make_openai_client)
+
+    result = qa.validate_openai_api_key("sk-user-secret-for-test", "gpt-4.1-mini")
+
+    assert result["valid"] is False
+    assert result["model"] == "gpt-4.1-mini"
+    assert "sk-user-secret-for-test" not in result["error"]
+    assert "[redacted-api-key]" in result["error"]
+
+
+def test_openai_validate_api_requires_login() -> None:
+    response = client.post(
+        "/api/llm/openai/validate",
+        json={"openai_api_key": "sk-user-secret-for-test", "openai_model": "gpt-4.1-mini"},
+    )
+
+    assert response.status_code == 401
+
+
+def test_query_openai_mode_requires_login_and_request_key(monkeypatch) -> None:
+    from modular_ontology import app as app_module
+
+    active_user = User(
+        id="member-test",
+        name="Member",
+        email="member@example.com",
+        company="Kumkang Kind",
+        role="member",
+        password_hash="unused",
+        status="active",
+    )
+    no_auth = client.post(
+        "/api/query",
+        json={"pack_id": "advance-steel-samcheok-bldg-b-bm25-evidence-pack", "question": "Beam", "use_openai": True},
+    )
+    monkeypatch.setattr(app_module, "current_user", lambda authorization: active_user)
+    missing_key = client.post(
+        "/api/query",
+        headers={"Authorization": "Bearer member-test-token"},
+        json={"pack_id": "advance-steel-samcheok-bldg-b-bm25-evidence-pack", "question": "Beam", "use_openai": True},
+    )
+
+    assert no_auth.status_code == 401
+    assert missing_key.status_code == 400
 
 
 def test_admin_reindex_api_requires_admin_session(monkeypatch, tmp_path) -> None:
-    import moddular_graph.store as store
-    from moddular_graph.auth import _hash_password
+    import modular_ontology.store as store
+    from modular_ontology.auth import _hash_password
 
     monkeypatch.setattr(store, "DB_PATH", tmp_path / "api-index.sqlite3")
     users_file = tmp_path / "users.json"
@@ -1004,7 +1315,7 @@ def test_admin_reindex_api_requires_admin_session(monkeypatch, tmp_path) -> None
         ),
         encoding="utf-8",
     )
-    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
     admin_login = client.post(
         "/api/auth/login",
         json={"email": "ythong@kumkangkind.com", "password": TEST_ADMIN_PASSWORD},
@@ -1041,7 +1352,7 @@ def test_google_drive_sync_downloads_runtime_storage(tmp_path) -> None:
                 DriveItem("mcp", "mcp_remote.json", "application/json"),
                 DriveItem("mcp_tokens", "mcp_tokens.json", "application/json"),
             ],
-            "database": [DriveItem("db", "moddular_graph.sqlite3", "application/octet-stream")],
+            "database": [DriveItem("db", "modular_ontology.sqlite3", "application/octet-stream")],
             "packs": [DriveItem("indexed", "indexed", "application/vnd.google-apps.folder")],
             "indexed": [
                 DriveItem("pack", "sample-pack.zip", "application/x-zip-compressed"),
@@ -1075,18 +1386,61 @@ def test_google_drive_sync_downloads_runtime_storage(tmp_path) -> None:
     assert (tmp_path / "00_Admin" / "users.json").read_text(encoding="utf-8") == '{"users":[]}'
     assert (tmp_path / "00_Admin" / "mcp_remote.json").exists()
     assert (tmp_path / "00_Admin" / "mcp_tokens.json").exists()
-    assert (tmp_path / "01_Database" / "moddular_graph.sqlite3").read_bytes() == b"sqlite-bytes"
+    assert (tmp_path / "01_Database" / "modular_ontology.sqlite3").read_bytes() == b"sqlite-bytes"
     assert (tmp_path / "02_Ontology_Packs" / "indexed" / "sample-pack.zip").read_bytes() == b"zip-bytes"
     assert not (tmp_path / "02_Ontology_Packs" / "indexed" / "README.md").exists()
 
 
+def test_google_drive_sync_downloads_legacy_database_filename(tmp_path) -> None:
+    legacy_db_name = "mod" + "dular_" + "graph.sqlite3"
+
+    class FakeDriveClient:
+        children = {
+            "root": [
+                DriveItem("admin", "00_Admin", "application/vnd.google-apps.folder"),
+                DriveItem("database", "01_Database", "application/vnd.google-apps.folder"),
+                DriveItem("packs", "02_Ontology_Packs", "application/vnd.google-apps.folder"),
+            ],
+            "admin": [],
+            "database": [DriveItem("db", legacy_db_name, "application/octet-stream")],
+            "packs": [],
+        }
+
+        def list_children(self, folder_id):
+            return self.children[folder_id]
+
+        def download_file(self, file_id, target):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"legacy-sqlite-bytes")
+
+    result = sync_google_drive_storage(
+        client=FakeDriveClient(),
+        root_folder_id="root",
+        data_dir=tmp_path,
+        force=True,
+    )
+
+    assert result["status"] == "synced"
+    assert (tmp_path / "01_Database" / "modular_ontology.sqlite3").read_bytes() == b"legacy-sqlite-bytes"
+
+
+def test_new_env_helper_reads_legacy_prefix(monkeypatch) -> None:
+    from modular_ontology.config import env
+
+    legacy_name = "MOD" + "DULAR_GRAPH_GOOGLE_DRIVE_FOLDER_ID"
+    monkeypatch.delenv("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", raising=False)
+    monkeypatch.setenv(legacy_name, "legacy-root")
+
+    assert env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID") == "legacy-root"
+
+
 def test_login_syncs_google_drive_users_before_auth(monkeypatch, tmp_path) -> None:
-    from moddular_graph.auth import _hash_password, invalidate_users_cache, load_users
-    from moddular_graph import app as app_module
+    from modular_ontology.auth import _hash_password, invalidate_users_cache, load_users
+    from modular_ontology import app as app_module
 
     users_file = tmp_path / "00_Admin" / "users.json"
-    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
-    monkeypatch.setenv("MODDULAR_GRAPH_GOOGLE_DRIVE_FOLDER_ID", "root")
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "root")
     invalidate_users_cache()
     assert "drive.admin@example.com" not in load_users()
 
@@ -1124,12 +1478,12 @@ def test_login_syncs_google_drive_users_before_auth(monkeypatch, tmp_path) -> No
 
 
 def test_admin_users_syncs_google_drive_users_before_listing(monkeypatch, tmp_path) -> None:
-    from moddular_graph.auth import invalidate_users_cache
-    from moddular_graph import app as app_module
+    from modular_ontology.auth import invalidate_users_cache
+    from modular_ontology import app as app_module
 
     users_file = tmp_path / "00_Admin" / "users.json"
-    monkeypatch.setenv("MODDULAR_GRAPH_USERS_FILE", str(users_file))
-    monkeypatch.setenv("MODDULAR_GRAPH_GOOGLE_DRIVE_FOLDER_ID", "root")
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
+    monkeypatch.setenv("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "root")
     invalidate_users_cache()
     sync_calls = 0
 
@@ -1201,7 +1555,7 @@ def test_google_drive_sync_rejects_duplicate_folder_names(tmp_path) -> None:
 
 
 def test_google_drive_status_requires_admin(monkeypatch) -> None:
-    monkeypatch.setenv("MODDULAR_GRAPH_GOOGLE_DRIVE_FOLDER_ID", "root")
+    monkeypatch.setenv("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "root")
 
     response = client.get("/api/storage/google-drive/status")
 

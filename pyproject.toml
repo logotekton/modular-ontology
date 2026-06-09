@@ -20,4 +20,4 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["manus_harness*", "moddular_graph*"]
+include = ["manus_harness*", "modular_ontology*"]

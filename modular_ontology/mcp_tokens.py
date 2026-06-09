@@ -88,6 +88,35 @@ def ensure_mcp_token_for_user(user: User, *, path: Path = MCP_TOKENS_FILE) -> di
     return _public_token_record(record)
 
 
+def regenerate_mcp_token_for_user(user: User, *, path: Path = MCP_TOKENS_FILE) -> dict[str, Any]:
+    payload = _load_token_payload(path)
+    tokens = [item for item in payload.get("tokens", []) if isinstance(item, dict)]
+    normalized_email = user.email.strip().lower()
+    now = time.time()
+    for record in tokens:
+        if str(record.get("userEmail", "")).strip().lower() != normalized_email:
+            continue
+        if record.get("status") == "active":
+            record["status"] = "revoked"
+            record["revokedAt"] = now
+            record["updatedAt"] = now
+
+    record = {
+        "token": _new_token(),
+        "userEmail": normalized_email,
+        "userName": user.name,
+        "company": user.company,
+        "role": user.role,
+        "status": "active",
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    tokens.append(record)
+    payload["tokens"] = tokens
+    _save_token_payload(payload, path)
+    return _public_token_record(record)
+
+
 def get_mcp_token_record(token: str, *, path: Path = MCP_TOKENS_FILE) -> dict[str, Any] | None:
     token = token.strip()
     if not token:

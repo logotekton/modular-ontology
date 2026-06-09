@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
-from .config import USERS_FILE
+from .config import USERS_FILE, env
 
 Role = Literal["admin", "member"]
 UserStatus = Literal["pending", "active", "rejected"]
@@ -43,12 +43,12 @@ def _hash_password(password: str) -> str:
 
 
 def _default_admin_password_hash(env_name: str) -> str:
-    password = os.environ.get(env_name)
+    password = env(env_name)
     if password:
-        return _hash_password(password)
-    password_hash = os.environ.get(f"{env_name}_HASH")
+        return _hash_password(str(password))
+    password_hash = env(f"{env_name}_HASH")
     if password_hash:
-        return password_hash
+        return str(password_hash)
     return _hash_password(secrets.token_urlsafe(32))
 
 
@@ -59,7 +59,7 @@ DEFAULT_USERS: dict[str, User] = {
         email="ythong@kumkangkind.com",
         company="Kumkang Kind",
         role="admin",
-        password_hash=_default_admin_password_hash("MODDULAR_GRAPH_ADMIN_YTHONG_PASSWORD"),
+        password_hash=_default_admin_password_hash("MODULAR_ONTOLOGY_ADMIN_YTHONG_PASSWORD"),
         status="active",
     ),
     "mwhong@kumkangkind.com": User(
@@ -68,7 +68,7 @@ DEFAULT_USERS: dict[str, User] = {
         email="mwhong@kumkangkind.com",
         company="Kumkang Kind",
         role="admin",
-        password_hash=_default_admin_password_hash("MODDULAR_GRAPH_ADMIN_MWHONG_PASSWORD"),
+        password_hash=_default_admin_password_hash("MODULAR_ONTOLOGY_ADMIN_MWHONG_PASSWORD"),
         status="active",
     ),
 }
@@ -79,7 +79,7 @@ TOKEN_TTL_SECONDS = 12 * 60 * 60
 
 
 def _users_file_path(users_file: str | Path | None = None) -> Path:
-    return Path(users_file or os.environ.get("MODDULAR_GRAPH_USERS_FILE") or DEFAULT_USERS_FILE)
+    return Path(users_file or env("MODULAR_ONTOLOGY_USERS_FILE") or DEFAULT_USERS_FILE)
 
 
 def _normalize_email(email: str) -> str:
@@ -99,13 +99,13 @@ def _base64url_decode(data: str) -> bytes:
 
 
 def _session_secret() -> bytes:
-    configured = os.environ.get("MODDULAR_GRAPH_SESSION_SECRET") or os.environ.get("MODDULAR_GRAPH_AUTH_SECRET")
+    configured = env("MODULAR_ONTOLOGY_SESSION_SECRET") or env("MODULAR_ONTOLOGY_AUTH_SECRET")
     if configured:
-        return configured.encode("utf-8")
+        return str(configured).encode("utf-8")
     users_fingerprint = "|".join(
         f"{user.id}:{user.email}:{user.password_hash}:{user.status}" for user in sorted(load_users().values(), key=lambda item: item.email)
     )
-    return hashlib.sha256(f"moddular-graph-session:{users_fingerprint}".encode("utf-8")).digest()
+    return hashlib.sha256(f"modular-ontology-session:{users_fingerprint}".encode("utf-8")).digest()
 
 
 def _sign_token_payload(payload: str) -> str:

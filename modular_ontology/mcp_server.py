@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from collections.abc import Sequence
 
 from .auth import get_company_project_access
+from .config import env
 from .mcp_tokens import get_mcp_token_record
 from .pack_index import (
     build_graph as read_graph,
@@ -39,17 +39,17 @@ except Exception as exc:  # pragma: no cover - import-time operator hint
     ) from exc
 
 
-DEFAULT_HOST = os.environ.get("MODULAR_GRAPH_MCP_HOST", "127.0.0.1")
-DEFAULT_PORT = int(os.environ.get("MODULAR_GRAPH_MCP_PORT", "8011"))
-DEFAULT_PATH = os.environ.get("MODULAR_GRAPH_MCP_PATH", "/mcp/{mcp_token}")
-DEFAULT_ALLOWED_HOSTS = os.environ.get(
-    "MODULAR_GRAPH_MCP_ALLOWED_HOSTS",
+DEFAULT_HOST = str(env("MODULAR_ONTOLOGY_MCP_HOST", "127.0.0.1"))
+DEFAULT_PORT = int(str(env("MODULAR_ONTOLOGY_MCP_PORT", "8011")))
+DEFAULT_PATH = str(env("MODULAR_ONTOLOGY_MCP_PATH", "/mcp/{mcp_token}"))
+DEFAULT_ALLOWED_HOSTS = str(env(
+    "MODULAR_ONTOLOGY_MCP_ALLOWED_HOSTS",
     "127.0.0.1:*,localhost:*,[::1]:*",
-)
-DEFAULT_ALLOWED_ORIGINS = os.environ.get(
-    "MODULAR_GRAPH_MCP_ALLOWED_ORIGINS",
+))
+DEFAULT_ALLOWED_ORIGINS = str(env(
+    "MODULAR_ONTOLOGY_MCP_ALLOWED_ORIGINS",
     "http://127.0.0.1:*,http://localhost:*,http://[::1]:*",
-)
+))
 
 TOOL_NAMES = [
     "copycrab_status",
@@ -86,9 +86,9 @@ def _split_many(values: Sequence[str]) -> list[str]:
 
 
 mcp = FastMCP(
-    "Modular Graph",
+    "Modular Ontology",
     instructions=(
-        "Use Modular Graph tools to inspect BIM ontology packs, search evidence, "
+        "Use Modular Ontology tools to inspect BIM ontology packs, search evidence, "
         "sample graph nodes/edges, and answer natural language questions about Revit IFC "
         "and Advance Steel model data."
     ),
@@ -108,7 +108,7 @@ def _json(payload: object, *, pretty: bool = True) -> str:
 
 
 def _mcp_company_env() -> str:
-    return os.environ.get("MODULAR_GRAPH_MCP_COMPANY", "").strip()
+    return str(env("MODULAR_ONTOLOGY_MCP_COMPANY", "")).strip()
 
 
 def _request_mcp_token() -> str:
@@ -138,10 +138,24 @@ def _mcp_scope() -> dict:
     token = _request_mcp_token()
     if token:
         record = get_mcp_token_record(token)
+        if not record and _refresh_mcp_tokens_from_remote():
+            record = get_mcp_token_record(token)
         if not record:
             return {"authorized": False, "token": token, "company": "", "userEmail": ""}
         return {"authorized": True, **record}
     return {"authorized": True, "company": _mcp_company_env(), "userEmail": "", "token": ""}
+
+
+def _refresh_mcp_tokens_from_remote() -> bool:
+    try:
+        from .google_drive_sync import google_drive_sync_enabled, sync_google_drive_mcp_tokens_file
+
+        if not google_drive_sync_enabled():
+            return False
+        result = sync_google_drive_mcp_tokens_file()
+        return result.get("status") in {"synced", "cached"}
+    except Exception:
+        return False
 
 
 def _mcp_authorized() -> bool:
@@ -152,11 +166,15 @@ def _mcp_company() -> str:
     scope = _mcp_scope()
     if not scope.get("authorized"):
         return ""
+    if str(scope.get("userEmail") or "").strip().lower().endswith("@kumkangkind.com"):
+        return "Kumkang Kind"
     return str(scope.get("company") or "").strip()
 
 
 def _is_internal_company(company: str) -> bool:
     lowered = company.casefold()
+    if "금강" in company:
+        return True
     return not company or "kumkang" in lowered or "금강" in company
 
 
@@ -225,13 +243,13 @@ def _filter_sources(payload: dict) -> dict:
 
 @mcp.tool()
 def copycrab_status() -> str:
-    """Return MCP server, pack, project, and tool status for CopyCrab/Modular Graph."""
+    """Return MCP server, pack, project, and tool status for CopyCrab/Modular Ontology."""
 
     if not _mcp_authorized():
         return _json(
             {
                 "status": "unauthorized",
-                "server": "Modular Graph MCP",
+                "server": "Modular Ontology MCP",
                 "detail": "Invalid MCP user URL token.",
                 "tools": [],
             }
@@ -242,7 +260,7 @@ def copycrab_status() -> str:
     return _json(
         {
             "status": "ok",
-            "server": "Modular Graph MCP",
+            "server": "Modular Ontology MCP",
             "company": _mcp_company() or "all",
             "userEmail": scope.get("userEmail") or "",
             "pack_count": len(packs),
@@ -375,13 +393,12 @@ def ask_pack_question(
     question: str,
     limit: int = 6,
     use_openai: bool = False,
-    use_ollama: bool = False,
 ) -> str:
     """Answer a natural language question using pack evidence and graph context."""
 
     if not _pack_is_visible(pack_id):
         return _forbidden_pack(pack_id)
-    return _json(answer_pack_question(pack_id, question, limit=limit, use_openai=use_openai, use_ollama=use_ollama))
+    return _json(answer_pack_question(pack_id, question, limit=limit, use_openai=use_openai))
 
 
 @mcp.tool()
@@ -390,13 +407,12 @@ def query(
     question: str,
     limit: int = 6,
     use_openai: bool = False,
-    use_ollama: bool = False,
 ) -> str:
     """OpenCrab-compatible alias for natural language pack question answering."""
 
     if not _pack_is_visible(pack_id):
         return _forbidden_pack(pack_id)
-    return _json(answer_pack_question(pack_id, question, limit=limit, use_openai=use_openai, use_ollama=use_ollama))
+    return _json(answer_pack_question(pack_id, question, limit=limit, use_openai=use_openai))
 
 
 @mcp.tool()
@@ -472,11 +488,11 @@ def configure_server(
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the Modular Graph MCP server.")
+    parser = argparse.ArgumentParser(description="Run the Modular Ontology MCP server.")
     parser.add_argument(
         "--transport",
         choices=("stdio", "streamable-http", "sse"),
-        default=os.environ.get("MODULAR_GRAPH_MCP_TRANSPORT", "stdio"),
+        default=str(env("MODULAR_ONTOLOGY_MCP_TRANSPORT", "stdio")),
         help="Use stdio for local MCP clients or streamable-http for Remote MCP.",
     )
     parser.add_argument("--host", default=DEFAULT_HOST, help="HTTP bind host for remote MCP.")

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 from urllib.parse import urlsplit, urlunsplit
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -34,20 +35,23 @@ from .auth import (
     set_user_company,
     set_user_role,
 )
-from .config import MCP_REMOTE_FILE, ROOT
+from .config import DATA_DIR, MCP_REMOTE_FILE, ROOT, env
 from .google_drive_sync import (
     google_drive_sync_enabled,
     google_drive_sync_status,
     sync_google_drive_storage,
+    sync_google_drive_mcp_tokens_file,
     sync_google_drive_users_file,
     write_back_database_file,
+    write_back_ifc_file,
+    write_back_ifc_metadata_file,
     write_back_mcp_tokens_file,
     write_back_pack_file,
     write_back_users_file,
 )
-from .mcp_server import TOOL_NAMES
-from .mcp_tokens import build_user_mcp_urls, ensure_mcp_token_for_user
-from .pack_index import PackFile, build_graph, discover_pack_files, list_packs, list_projects, save_uploaded_pack
+from .mcp_server import TOOL_NAMES, configure_server as configure_mcp_server, mcp as remote_mcp
+from .mcp_tokens import build_user_mcp_urls, ensure_mcp_token_for_user, regenerate_mcp_token_for_user
+from .pack_index import PackFile, build_graph, build_multi_pack_graph, discover_pack_files, list_packs, list_projects, save_uploaded_pack
 from .project_store import (
     attach_pack_to_project,
     create_project,
@@ -56,11 +60,44 @@ from .project_store import (
     suggest_project_name,
     update_project,
 )
-from .qa import answer_pack_question, ollama_status
+from .qa import answer_pack_question, validate_openai_api_key
 from .store import connect, index_all_packs, index_pack, index_stats, init_db
 
 
 DIST_DIR = ROOT / "dist"
+IFC_UPLOAD_DIR = DATA_DIR / "03_IFC_Models"
+PUBLIC_MCP_DOMAIN = str(env("MODULAR_ONTOLOGY_PUBLIC_MCP_DOMAIN", "modular-ontology.xyz"))
+PUBLIC_MCP_BASE_URL = f"https://{PUBLIC_MCP_DOMAIN}"
+PUBLIC_MCP_URL = f"{PUBLIC_MCP_BASE_URL}/mcp"
+VERCEL_MCP_HOSTS = (
+    f"{PUBLIC_MCP_DOMAIN},"
+    "modular-ontology.vercel.app,"
+    "modular-ontology-ythongs-projects.vercel.app,"
+    "modular-ontology-ghddudxor12-8502-ythongs-projects.vercel.app"
+)
+
+configure_mcp_server(
+    host="127.0.0.1",
+    port=8011,
+    path="/{mcp_token}",
+    allowed_hosts=[
+        host
+        for host in (
+            env("MODULAR_ONTOLOGY_MCP_ALLOWED_HOSTS")
+            or f"{VERCEL_MCP_HOSTS},127.0.0.1:*,localhost:*,[::1]:*,testserver"
+        ).split(",")
+        if host.strip()
+    ],
+    allowed_origins=[
+        origin
+        for origin in (
+            env("MODULAR_ONTOLOGY_MCP_ALLOWED_ORIGINS")
+            or "https://chatgpt.com,https://chat.openai.com,http://127.0.0.1:*,http://localhost:*"
+        ).split(",")
+        if origin.strip()
+    ],
+)
+remote_mcp_app = remote_mcp.streamable_http_app()
 
 
 def run_google_drive_sync(force: bool = False) -> dict[str, Any]:
@@ -80,6 +117,16 @@ def run_google_drive_users_sync() -> dict[str, Any]:
         result = sync_google_drive_users_file()
         if result.get("status") == "synced":
             invalidate_users_cache()
+        return {"enabled": True, **result}
+    except Exception as exc:
+        return {"enabled": True, "status": "error", "error": str(exc)}
+
+
+def run_google_drive_mcp_tokens_sync() -> dict[str, Any]:
+    if not google_drive_sync_enabled():
+        return {"enabled": False, "status": "disabled"}
+    try:
+        result = sync_google_drive_mcp_tokens_file()
         return {"enabled": True, **result}
     except Exception as exc:
         return {"enabled": True, "status": "error", "error": str(exc)}
@@ -153,11 +200,12 @@ def require_google_drive_write_back(result: dict[str, Any]) -> dict[str, Any]:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if google_drive_sync_enabled():
         run_google_drive_sync()
-    yield
+    async with remote_mcp.session_manager.run():
+        yield
 
 
 app = FastAPI(
-    title="Modular Graph API",
+    title="Modular Ontology API",
     description="Project ontology pack ingestion, graph exploration, and MCP-ready data access API.",
     version="0.1.0",
     lifespan=lifespan,
@@ -174,12 +222,20 @@ app.add_middleware(
 if (DIST_DIR / "assets").exists():
     app.mount("/assets", StaticFiles(directory=str(DIST_DIR / "assets")), name="assets")
 
+app.mount("/mcp", remote_mcp_app, name="remote-mcp")
+
 
 class QueryRequest(BaseModel):
     pack_id: str
     question: str
     use_openai: bool = False
-    use_ollama: bool = False
+    openai_api_key: str | None = None
+    openai_model: str | None = None
+
+
+class OpenAIKeyValidationRequest(BaseModel):
+    openai_api_key: str
+    openai_model: str | None = None
 
 
 class LoginRequest(BaseModel):
@@ -228,6 +284,39 @@ class ProjectPackRequest(BaseModel):
     pack_ids: list[str] = []
 
 
+def _safe_upload_filename(filename: str, allowed_suffixes: set[str]) -> str:
+    safe_name = Path(filename.replace("\\", "/")).name.strip()
+    if not safe_name:
+        raise ValueError("File name is required.")
+    if Path(safe_name).suffix.lower() not in allowed_suffixes:
+        raise ValueError(f"Supported file types: {', '.join(sorted(allowed_suffixes))}")
+    return safe_name
+
+
+def _ifc_metadata_filename(filename: str) -> str:
+    return f"{Path(filename).stem}.metadata.json"
+
+
+async def _write_upload_file_with_limit(file: UploadFile, target: Path, *, max_bytes: int) -> int:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(f".{target.name}.tmp")
+    total = 0
+    try:
+        with temp.open("wb") as stream:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise HTTPException(status_code=413, detail=f"File exceeds {max_bytes} byte limit.")
+                stream.write(chunk)
+        os.replace(temp, target)
+        return total
+    finally:
+        temp.unlink(missing_ok=True)
+
+
 def require_admin(authorization: str | None):
     ensure_runtime_storage()
     user = get_user_by_token(extract_bearer_token(authorization))
@@ -274,9 +363,21 @@ def ensure_pack_access(pack_id: str, user) -> None:
         raise HTTPException(status_code=403, detail="This pack is not available for your company.")
 
 
+def ensure_project_access(project_id: str, user) -> dict[str, Any]:
+    ensure_runtime_storage()
+    project = next((item for item in list_projects() if item["id"] == project_id), None)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
+    if not user or is_internal_user(user):
+        return project
+    if not any(item["id"] == project_id for item in visible_projects_for_user(user)):
+        raise HTTPException(status_code=403, detail="This project is not available for your company.")
+    return project
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "service": "modular-graph"}
+    return {"status": "ok", "service": "modular-ontology"}
 
 
 @app.get("/", include_in_schema=False)
@@ -287,9 +388,9 @@ def web_index():
     return HTMLResponse(
         """
         <html>
-          <head><title>Modular Graph</title></head>
+          <head><title>Modular Ontology</title></head>
           <body>
-            <h1>Modular Graph API is running</h1>
+            <h1>Modular Ontology API is running</h1>
             <p>Run <code>npm run build</code> to serve the React UI from this FastAPI server.</p>
           </body>
         </html>
@@ -627,7 +728,7 @@ def google_drive_storage_status(authorization: str | None = Header(default=None)
 def admin_sync_google_drive_storage(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_admin(authorization)
     if not google_drive_sync_enabled():
-        raise HTTPException(status_code=400, detail="MODDULAR_GRAPH_GOOGLE_DRIVE_FOLDER_ID is not set.")
+        raise HTTPException(status_code=400, detail="MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set.")
     return {"enabled": True, **run_google_drive_sync(force=True)}
 
 
@@ -638,7 +739,7 @@ def admin_write_back_google_drive_storage(
 ) -> dict[str, Any]:
     require_admin(authorization)
     if not google_drive_sync_enabled():
-        raise HTTPException(status_code=400, detail="MODDULAR_GRAPH_GOOGLE_DRIVE_FOLDER_ID is not set.")
+        raise HTTPException(status_code=400, detail="MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set.")
     results: dict[str, Any] = {
         "users": require_google_drive_write_back(run_google_drive_write_back("users")),
         "database": require_google_drive_write_back(run_google_drive_write_back("database")),
@@ -673,6 +774,41 @@ def graph(
         return build_graph(pack_id=pack_id, max_nodes=max_nodes, max_edges=max_edges)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Pack not found: {pack_id}") from None
+
+
+@app.get("/api/projects/{project_id}/graph")
+def project_graph(
+    project_id: str,
+    pack_ids: str | None = None,
+    max_nodes: int = 900,
+    max_edges: int = 1600,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    ensure_runtime_storage()
+    user = current_user(authorization)
+    project = ensure_project_access(project_id, user)
+    project_pack_ids = [pack_id for pack_id in project.get("packIds", []) if isinstance(pack_id, str)]
+    requested_pack_ids = [
+        pack_id.strip()
+        for pack_id in (pack_ids or "").split(",")
+        if pack_id.strip()
+    ]
+    active_pack_ids = requested_pack_ids or project_pack_ids
+    invalid_pack_ids = [pack_id for pack_id in active_pack_ids if pack_id not in project_pack_ids]
+    if invalid_pack_ids:
+        raise HTTPException(status_code=400, detail=f"Packs are not linked to this project: {', '.join(invalid_pack_ids)}")
+    for pack_id in active_pack_ids:
+        ensure_pack_access(pack_id, user)
+    try:
+        return build_multi_pack_graph(
+            active_pack_ids,
+            title=project["name"],
+            project=project,
+            max_nodes=max_nodes,
+            max_edges=max_edges,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Pack not found: {exc}") from None
 
 
 @app.post("/api/packs/upload")
@@ -730,53 +866,127 @@ async def upload_pack(
     return summary
 
 
+@app.post("/api/ifc/upload")
+async def upload_ifc_model(
+    file: UploadFile = File(...),
+    project_id: str | None = Form(default=None),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_admin(authorization)
+    ensure_runtime_storage()
+    target_project_id = (project_id or "").strip()
+    project = ensure_project_access(target_project_id, current_user(authorization)) if target_project_id else None
+    try:
+        safe_name = _safe_upload_filename(file.filename or "model.ifc", {".ifc", ".ifczip", ".zip"})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    max_bytes = int(str(env("MODULAR_ONTOLOGY_IFC_MAX_BYTES", str(100 * 1024 * 1024))))
+    target_dir = IFC_UPLOAD_DIR / (target_project_id or "_unassigned")
+    target_path = target_dir / safe_name
+    size_bytes = await _write_upload_file_with_limit(file, target_path, max_bytes=max_bytes)
+    metadata = {
+        "filename": safe_name,
+        "sizeBytes": size_bytes,
+        "projectId": target_project_id or None,
+        "projectName": project.get("name") if project else None,
+        "uploadedAt": time.time(),
+        "storage": "local",
+        "localPath": str(target_path),
+    }
+    metadata_path = target_dir / _ifc_metadata_filename(safe_name)
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_back: dict[str, Any] = {}
+    if google_drive_sync_enabled():
+        try:
+            write_back["file"] = write_back_ifc_file(target_path, target_project_id or "_unassigned")
+            metadata["storage"] = "google-drive"
+            metadata["drive"] = write_back
+            metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+            write_back["metadata"] = write_back_ifc_metadata_file(metadata_path, target_project_id or "_unassigned")
+            metadata["drive"] = write_back
+            metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            target_path.unlink(missing_ok=True)
+            metadata_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=502, detail=f"Google Drive IFC upload failed: {exc}") from exc
+    return {
+        "status": "stored",
+        "projectId": target_project_id or None,
+        "projectName": project.get("name") if project else None,
+        "filename": safe_name,
+        "sizeBytes": size_bytes,
+        "path": str(target_path),
+        "metadata": metadata,
+        "writeBack": write_back,
+    }
+
+
 @app.post("/api/query")
 def query_ontology(request: QueryRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     ensure_runtime_storage()
-    ensure_pack_access(request.pack_id, current_user(authorization))
+    user = current_user(authorization)
+    if request.use_openai and not user:
+        raise HTTPException(status_code=401, detail="Login is required to use OpenAI AI Query.")
+    if request.use_openai and not (request.openai_api_key or "").strip():
+        raise HTTPException(status_code=400, detail="OpenAI API key is required.")
+    ensure_pack_access(request.pack_id, user)
     try:
         result = answer_pack_question(
             request.pack_id,
             request.question,
             limit=6,
             use_openai=request.use_openai,
-            use_ollama=request.use_ollama,
+            openai_api_key=request.openai_api_key,
+            openai_model=request.openai_model,
         )
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Pack not found: {request.pack_id}") from None
     return result
 
 
-@app.get("/api/llm/ollama/status")
-def ollama_llm_status() -> dict[str, Any]:
-    return ollama_status()
+@app.post("/api/llm/openai/validate")
+def validate_openai_key(request: OpenAIKeyValidationRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    if not current_user(authorization):
+        raise HTTPException(status_code=401, detail="Login is required to validate an OpenAI API key.")
+    return validate_openai_api_key(request.openai_api_key, request.openai_model)
 
 
-def _public_mcp_remote() -> tuple[str | None, str | None]:
-    public_url = os.environ.get("MODULAR_GRAPH_PUBLIC_MCP_URL") or os.environ.get("MODDULAR_GRAPH_PUBLIC_MCP_URL")
+def _public_mcp_remote(request: Request | None = None) -> tuple[str | None, str | None]:
+    configured_public_url = (
+        env("MODULAR_ONTOLOGY_PUBLIC_MCP_URL")
+        or PUBLIC_MCP_URL
+    )
+    public_url = configured_public_url
     public_base_url: str | None = None
     if MCP_REMOTE_FILE.exists():
         try:
             payload = json.loads(MCP_REMOTE_FILE.read_text(encoding="utf-8-sig"))
             if not public_url:
                 public_url = payload.get("publicUrl")
-            public_base_url = payload.get("publicBaseUrl")
+                public_base_url = payload.get("publicBaseUrl")
         except (OSError, json.JSONDecodeError):
             public_base_url = None
 
     if public_url and not public_base_url:
         parts = urlsplit(public_url)
         public_base_url = urlunsplit((parts.scheme, parts.netloc, "", "", "")) if parts.scheme and parts.netloc else None
+    if request and not public_base_url:
+        public_base_url = urlunsplit((request.url.scheme, request.url.netloc, "", "", ""))
+        public_url = f"{public_base_url}/mcp"
     return public_url, public_base_url
 
 
-@app.get("/api/mcp/status")
-def mcp_status(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    public_url, public_base_url = _public_mcp_remote()
+def _mcp_status_payload(request: Request, authorization: str | None, *, regenerate_user_token: bool = False) -> dict[str, Any]:
+    public_url, public_base_url = _public_mcp_remote(request)
     user_url: dict[str, Any] | None = None
+    token_sync: dict[str, Any] | None = None
+    token_write_back: dict[str, Any] | None = None
     user = current_user(authorization)
+    if regenerate_user_token and not user:
+        raise HTTPException(status_code=401, detail="Login is required to regenerate an MCP URL.")
     if user and user.status == "active":
-        token_record = ensure_mcp_token_for_user(user)
+        token_sync = run_google_drive_mcp_tokens_sync()
+        token_record = regenerate_mcp_token_for_user(user) if regenerate_user_token else ensure_mcp_token_for_user(user)
         user_urls = build_user_mcp_urls(public_base_url, token_record["token"])
         user_url = {
             **user_urls,
@@ -786,10 +996,10 @@ def mcp_status(authorization: str | None = Header(default=None)) -> dict[str, An
             "company": token_record["company"],
             "role": token_record["role"],
         }
-        run_google_drive_write_back("mcp_tokens")
+        token_write_back = run_google_drive_write_back("mcp_tokens")
     return {
         "status": "ready",
-        "server": "python -m moddular_graph.mcp_server",
+        "server": "python -m modular_ontology.mcp_server",
         "remote": {
             "transport": "streamable-http",
             "localUrl": "http://127.0.0.1:8011/mcp",
@@ -798,10 +1008,22 @@ def mcp_status(authorization: str | None = Header(default=None)) -> dict[str, An
             "publicBaseUrl": public_base_url,
             "publicUserUrlTemplate": f"{public_base_url.rstrip('/')}/mcp/{{token}}" if public_base_url else None,
             "userUrl": user_url,
+            "tokenSync": token_sync,
+            "tokenWriteBack": token_write_back,
             "command": ".\\scripts\\run_remote_mcp.ps1",
         },
         "tools": TOOL_NAMES,
     }
+
+
+@app.get("/api/mcp/status")
+def mcp_status(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    return _mcp_status_payload(request, authorization)
+
+
+@app.post("/api/mcp/user-url/regenerate")
+def regenerate_mcp_user_url(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    return _mcp_status_payload(request, authorization, regenerate_user_token=True)
 
 
 @app.get("/{full_path:path}", include_in_schema=False)

@@ -1,4 +1,4 @@
-"""Modular Graph backend package."""
+"""Modular Ontology backend package."""
 
 __all__ = ["__version__"]
 
