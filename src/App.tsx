@@ -348,6 +348,7 @@ function App() {
   const graphPackOptions = selectedProject
     ? packs.filter((pack) => selectedProject.packIds.includes(pack.id))
     : [];
+  const visibleNav = nav.filter((item) => item.label !== "Admin" || currentUser?.role === "admin");
 
   function navigateToTab(tab: string, options: { replace?: boolean } = {}) {
     const nextTab = nav.some((item) => item.label === tab) ? (tab as AppTab) : DEFAULT_TAB;
@@ -431,6 +432,12 @@ function App() {
     setCompanies([]);
     setCompanyProjectAccess({});
   }, [currentUser?.role, authToken]);
+
+  useEffect(() => {
+    if (currentUser && currentUser.role !== "admin" && activeTab === "Admin") {
+      navigateToTab("Dashboard", { replace: true });
+    }
+  }, [activeTab, currentUser?.role]);
 
   useEffect(() => {
     if (activeTab !== "Admin" || currentUser?.role !== "admin" || !authToken) return;
@@ -1101,7 +1108,7 @@ function App() {
           </div>
         </div>
         <nav>
-          {nav.map((item) => {
+          {visibleNav.map((item) => {
             const Icon = item.icon;
             return (
               <button
@@ -1117,6 +1124,7 @@ function App() {
           })}
         </nav>
         {activeTab === "Graph Explorer" && <div id="graph-sidebar-controls" className="sidebar-graph-controls" />}
+        {currentUser.role === "admin" && (
         <div className="sidebar-status">
           <ShieldCheck size={18} />
           <div>
@@ -1124,11 +1132,12 @@ function App() {
             <span>업로드와 수집 권한 잠김</span>
           </div>
         </div>
+        )}
       </aside>
 
       <main className={activeTab === "Graph Explorer" ? "workspace graph-workspace" : "workspace"}>
         <header className="topbar">
-          <div>
+          <div className="topbar-title">
             <p className="eyebrow">프로젝트 지식 그래프</p>
             <h1>{tabLabel(activeTab)}</h1>
           </div>
@@ -1150,33 +1159,28 @@ function App() {
               accept=".zip"
               onChange={(event) => uploadPack(event.currentTarget.files?.[0])}
             />
-            <button
-              className="primary-button"
-              disabled={currentUser?.role !== "admin"}
-              title={currentUser?.role === "admin" ? "온톨로지 팩 업로드" : "관리자 세션이 필요합니다"}
-              onClick={() => fileInputRef.current?.click()}
-            >
-              <Upload size={17} />
-              팩 업로드
-            </button>
-            <div className="role-pill">
-              <CircleUserRound size={17} />
-              {roleLabel(currentUser?.role)}
-            </div>
-            <div className="auth-actions">
-              <span className="signed-user">{currentUser.email}</span>
-              <button onClick={logout}>로그아웃</button>
+            <div className="topbar-user-cluster">
+              <div className="role-pill">
+                <CircleUserRound size={17} />
+                {roleLabel(currentUser?.role)}
+              </div>
+              <div className="auth-actions">
+                <span className="signed-user">{currentUser.email}</span>
+                <button onClick={logout}>로그아웃</button>
+              </div>
             </div>
           </div>
         </header>
-        <MetricsStrip
-          activeTab={activeTab}
-          companies={companies}
-          currentUser={currentUser}
-          packs={packs}
-          projects={projects}
-          users={managedUsers}
-        />
+        {activeTab !== "Graph Explorer" && activeTab !== "MCP Connections" && (
+          <MetricsStrip
+            activeTab={activeTab}
+            companies={companies}
+            currentUser={currentUser}
+            packs={packs}
+            projects={projects}
+            users={managedUsers}
+          />
+        )}
 
         {activeTab === "Dashboard" && (
           <DashboardView
