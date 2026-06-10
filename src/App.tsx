@@ -1220,6 +1220,7 @@ function App() {
 
         {activeTab === "Dashboard" && (
           <DashboardView
+            ifcModels={ifcModels}
             packs={packs}
             projects={projects}
             onGoToTab={navigateToTab}
@@ -1646,16 +1647,21 @@ function MetricsStrip({
 }
 
 function DashboardView({
+  ifcModels,
   packs,
   projects,
   onGoToTab,
   onOpenPack,
 }: {
+  ifcModels: IfcModel[];
   packs: Pack[];
   projects: Project[];
   onGoToTab: (tab: string) => void;
   onOpenPack: (packId: string) => void;
 }) {
+  const recentIfcModels = ifcModels.slice(0, 5);
+  const recentPacks = packs.slice(0, 5);
+
   return (
     <section className="dashboard-grid">
       <div className="overview-panel">
@@ -1676,23 +1682,47 @@ function DashboardView({
         </div>
       </div>
 
-      <div className="overview-panel">
-        <div className="panel-header slim">
-          <div>
-            <h2>최근 팩</h2>
-            <span>그래프 워크스페이스 열기</span>
+      <div className="overview-panel dashboard-recents-panel">
+        <div className="dashboard-recents-section">
+          <div className="panel-header slim">
+            <div>
+              <h2>최근 IFC 모델</h2>
+              <span>프로젝트에 업로드된 IFC 원본</span>
+            </div>
+            <Database size={19} />
           </div>
-          <FileArchive size={19} />
-        </div>
-        <div className="compact-list">
-          {packs.slice(0, 4).map((pack) => (
-            <button className="compact-row" key={pack.id} onClick={() => onOpenPack(pack.id)}>
-              <strong>{pack.title}</strong>
-              <span>{numberLabel(pack.counts.nodes)}개 노드 / {numberLabel(pack.counts.edges)}개 엣지</span>
-            </button>
-          ))}
+          <div className="compact-list dashboard-scroll-list">
+            {recentIfcModels.length ? recentIfcModels.map((model) => (
+              <div className="compact-row static" key={model.id}>
+                <strong>{model.filename}</strong>
+                <span>{model.projectName || "미연결"} / {model.storage || "local"}</span>
+              </div>
+            )) : (
+              <div className="compact-row static empty-row">
+                <strong>업로드된 IFC 모델 없음</strong>
+                <span>업로드 메뉴에서 IFC 모델을 추가하세요</span>
+              </div>
+            )}
+          </div>
         </div>
 
+        <div className="dashboard-recents-section">
+          <div className="panel-header slim">
+            <div>
+              <h2>최근 온톨로지 팩</h2>
+              <span>그래프 워크스페이스 열기</span>
+            </div>
+            <FileArchive size={19} />
+          </div>
+          <div className="compact-list dashboard-scroll-list">
+            {recentPacks.map((pack) => (
+              <button className="compact-row" key={pack.id} onClick={() => onOpenPack(pack.id)}>
+                <strong>{pack.title}</strong>
+                <span>{numberLabel(pack.counts.nodes)}개 노드 / {numberLabel(pack.counts.edges)}개 엣지</span>
+              </button>
+            ))}
+          </div>
+        </div>
       </div>
     </section>
   );
