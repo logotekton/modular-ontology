@@ -1682,8 +1682,8 @@ function DashboardView({
         </div>
       </div>
 
-      <div className="overview-panel dashboard-recents-panel">
-        <div className="dashboard-recents-section">
+      <div className="dashboard-recents-panel">
+        <div className="overview-panel dashboard-recents-section">
           <div className="panel-header slim">
             <div>
               <h2>최근 IFC 모델</h2>
@@ -1706,7 +1706,7 @@ function DashboardView({
           </div>
         </div>
 
-        <div className="dashboard-recents-section">
+        <div className="overview-panel dashboard-recents-section">
           <div className="panel-header slim">
             <div>
               <h2>최근 온톨로지 팩</h2>

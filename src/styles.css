@@ -1792,7 +1792,8 @@ dd {
   align-items: stretch;
 }
 
-.dashboard-grid > .overview-panel {
+.dashboard-grid > .overview-panel,
+.dashboard-recents-section {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   min-height: 0;
@@ -1809,13 +1810,13 @@ dd {
 }
 
 .dashboard-recents-panel {
+  display: grid;
   grid-template-rows: minmax(0, 1fr) minmax(0, 1fr) !important;
   gap: 14px;
+  min-height: 0;
 }
 
 .dashboard-recents-section {
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
   min-height: 0;
 }
 
