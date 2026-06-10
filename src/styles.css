@@ -1915,6 +1915,7 @@ dd {
 
 .project-status-panel {
   grid-column: span 3;
+  min-height: 236px;
 }
 
 .project-connection-panel {
@@ -1960,6 +1961,12 @@ dd {
 .action-feedback-button:not(:disabled):focus-visible {
   outline: 0;
   box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.18);
+}
+
+.action-feedback-button:not(:disabled):active {
+  transform: translateY(1px) scale(0.985);
+  border-color: #14b8a6;
+  box-shadow: 0 0 0 3px rgba(20, 184, 166, 0.14);
 }
 
 .action-feedback-button.is-confirming:not(:disabled) {
@@ -2052,7 +2059,9 @@ dd {
 .project-status-grid {
   display: grid;
   grid-template-columns: minmax(280px, 0.9fr) minmax(0, 1.1fr);
+  align-items: stretch;
   gap: 16px;
+  min-height: 204px;
 }
 
 .project-status-copy,
@@ -2060,15 +2069,25 @@ dd {
   min-width: 0;
 }
 
+.project-status-copy {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
 .project-linked-summary {
   display: grid;
-  align-content: start;
+  grid-template-rows: minmax(0, 1fr);
+  align-content: stretch;
+  height: 100%;
+  min-height: 0;
+  padding-top: 54px;
 }
 
 .project-detail-list {
   display: grid;
   gap: 8px;
   margin: 12px 0 0;
+  min-height: 0;
 }
 
 .project-detail-list div {
@@ -2102,13 +2121,17 @@ dd {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+  height: 100%;
+  min-height: 0;
   margin-top: 0;
 }
 
 .linked-summary-columns > div {
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 8px;
   min-width: 0;
+  min-height: 0;
 }
 
 .linked-summary-columns > div > strong,
@@ -2122,8 +2145,9 @@ dd {
   display: grid;
   align-content: start;
   gap: 7px;
-  min-height: 156px;
-  max-height: 186px;
+  min-height: 0;
+  height: 100%;
+  max-height: none;
   overflow-x: hidden;
   overflow-y: auto;
   border: 1px solid #e1eaf2;

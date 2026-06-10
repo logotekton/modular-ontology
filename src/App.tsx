@@ -1211,6 +1211,7 @@ function App() {
             activeTab={activeTab}
             companies={companies}
             currentUser={currentUser}
+            ifcModels={ifcModels}
             packs={packs}
             projects={projects}
             users={managedUsers}
@@ -1610,6 +1611,7 @@ function MetricsStrip({
   activeTab,
   companies,
   currentUser,
+  ifcModels,
   packs,
   projects,
   users,
@@ -1617,6 +1619,7 @@ function MetricsStrip({
   activeTab: string;
   companies: string[];
   currentUser: CurrentUser | null;
+  ifcModels: IfcModel[];
   packs: Pack[];
   projects: Project[];
   users: ManagedUser[];
@@ -1636,8 +1639,8 @@ function MetricsStrip({
     <section className="metrics">
       <Metric icon={Building2} label="회사명" value={currentUser?.company || "미지정"} />
       <Metric icon={FolderKanban} label="프로젝트" value={numberLabel(projects.length)} />
-      <Metric icon={FileArchive} label="팩" value={numberLabel(packs.length)} />
-      <Metric icon={Waypoints} label="그래프 노드" value={numberLabel(packs.reduce((sum, pack) => sum + (pack.counts.nodes ?? 0), 0))} tone="green" />
+      <Metric icon={Database} label="IFC 모델" value={numberLabel(ifcModels.length)} />
+      <Metric icon={FileArchive} label="온톨로지 팩" value={numberLabel(packs.length)} tone="green" />
     </section>
   );
 }
@@ -1899,6 +1902,7 @@ function ProjectsView({
 
   async function saveConnections() {
     if (!selectedProject) return;
+    if (!connectionDirty) return;
     await Promise.resolve(onSetProjectPacks(selectedProject.id, draft.packIds));
     const changedModels = ifcModels.filter((model) => (ifcDraftLinks[model.id] ?? null) !== (model.projectId ?? null));
     await Promise.all(
@@ -1973,7 +1977,6 @@ function ProjectsView({
                 <h2>{selectedProject?.name ?? "프로젝트를 선택하세요"}</h2>
                 <span>{selectedProject ? `${selectedProject.company || "회사 미지정"} / ${selectedProject.manager || "관리자 미지정"}` : "카드를 선택하면 상세 정보가 표시됩니다"}</span>
               </div>
-              <FolderKanban size={19} />
             </div>
             <dl className="project-detail-list">
               <div>
@@ -1985,8 +1988,12 @@ function ProjectsView({
                 <dd>{selectedProject?.description || "설명 없음"}</dd>
               </div>
               <div>
-                <dt>연결 상태</dt>
-                <dd>{numberLabel(linkedModels.length)}개 IFC 모델 / {numberLabel(linkedPacks.length)}개 온톨로지 팩</dd>
+                <dt>IFC 모델</dt>
+                <dd>{numberLabel(linkedModels.length)}개</dd>
+              </div>
+              <div>
+                <dt>온톨로지 팩</dt>
+                <dd>{numberLabel(linkedPacks.length)}개</dd>
               </div>
             </dl>
           </div>
@@ -2023,7 +2030,7 @@ function ProjectsView({
           {isAdmin && (
             <button
               className={actionButtonClass("connections-save")}
-              disabled={!selectedProject || !connectionDirty}
+              disabled={!selectedProject}
               type="button"
               onClick={() => runProjectAction("connections-save", saveConnections)}
             >
