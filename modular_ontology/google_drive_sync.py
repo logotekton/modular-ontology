@@ -6,6 +6,7 @@ import mimetypes
 import os
 import subprocess
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -19,6 +20,10 @@ DRIVE_API = "https://www.googleapis.com/drive/v3"
 DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
 FOLDER_MIME = "application/vnd.google-apps.folder"
 DEFAULT_TTL_SECONDS = 300
+# Simple/multipart uploads hold the whole payload in memory and cannot resume,
+# so anything larger goes through a resumable upload session.
+RESUMABLE_UPLOAD_THRESHOLD = 5 * 1024 * 1024
+RESUMABLE_UPLOAD_CHUNK_SIZE = 16 * 1024 * 1024  # must be a multiple of 256 KiB
 DATABASE_FILENAME = "modular_ontology.sqlite3"
 LEGACY_DATABASE_FILENAME = "mod" + "dular_" + "graph.sqlite3"
 
@@ -107,13 +112,17 @@ class GoogleDriveClient:
         os.replace(temp, target)
 
     def update_file(self, file_id: str, source: Path, mime_type: str | None = None) -> dict[str, Any]:
+        content_type = mime_type or _guess_mime_type(source)
+        size = source.stat().st_size
+        if size > RESUMABLE_UPLOAD_THRESHOLD:
+            return self._resumable_upload(f"files/{file_id}", "PATCH", None, source, content_type, size)
         params = {"uploadType": "media", "supportsAllDrives": "true"}
         url = self._upload_url(f"files/{file_id}", params)
         data = source.read_bytes()
         request = urllib.request.Request(
             url,
             data=data,
-            headers={**self._headers(), "Content-Type": mime_type or _guess_mime_type(source)},
+            headers={**self._headers(), "Content-Type": content_type},
             method="PATCH",
         )
         with urllib.request.urlopen(request, timeout=60) as response:
@@ -124,6 +133,9 @@ class GoogleDriveClient:
         file_name = name or source.name
         content_type = mime_type or _guess_mime_type(source)
         metadata = {"name": file_name, "parents": [parent_id]}
+        size = source.stat().st_size
+        if size > RESUMABLE_UPLOAD_THRESHOLD:
+            return self._resumable_upload("files", "POST", metadata, source, content_type, size)
         metadata_bytes = json.dumps(metadata, ensure_ascii=False).encode("utf-8")
         file_bytes = source.read_bytes()
         body = b"".join(
@@ -148,6 +160,72 @@ class GoogleDriveClient:
         )
         with urllib.request.urlopen(request, timeout=120) as response:
             return json.loads(response.read().decode("utf-8"))
+
+    def _resumable_upload(
+        self,
+        path: str,
+        method: str,
+        metadata: dict[str, Any] | None,
+        source: Path,
+        content_type: str,
+        size: int,
+    ) -> dict[str, Any]:
+        params = {"uploadType": "resumable", "supportsAllDrives": "true"}
+        url = self._upload_url(path, params)
+        headers = {
+            **self._headers(),
+            "X-Upload-Content-Type": content_type,
+            "X-Upload-Content-Length": str(size),
+        }
+        body = None
+        if metadata is not None:
+            body = json.dumps(metadata, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json; charset=UTF-8"
+        request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        with urllib.request.urlopen(request, timeout=60) as response:
+            session_url = response.headers.get("Location")
+        if not session_url:
+            raise RuntimeError("Google Drive did not return a resumable upload session URL.")
+
+        offset = 0
+        stalled_responses = 0
+        with source.open("rb") as stream:
+            while offset < size:
+                stream.seek(offset)
+                chunk = stream.read(RESUMABLE_UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    raise RuntimeError(f"Source file shrank during resumable upload: {source}")
+                chunk_end = offset + len(chunk) - 1
+                chunk_request = urllib.request.Request(
+                    session_url,
+                    data=chunk,
+                    headers={
+                        "Content-Length": str(len(chunk)),
+                        "Content-Range": f"bytes {offset}-{chunk_end}/{size}",
+                    },
+                    method="PUT",
+                )
+                try:
+                    with urllib.request.urlopen(chunk_request, timeout=300) as response:
+                        return json.loads(response.read().decode("utf-8"))
+                except urllib.error.HTTPError as exc:
+                    if exc.code != 308:
+                        raise
+                    # 308 Resume Incomplete: Drive reports the confirmed range.
+                    confirmed = str(exc.headers.get("Range") or "")
+                    if confirmed.startswith("bytes=0-"):
+                        next_offset = int(confirmed.removeprefix("bytes=0-")) + 1
+                    else:
+                        # No Range means Drive has not confirmed this chunk; retry it.
+                        next_offset = offset
+                    if next_offset == offset:
+                        stalled_responses += 1
+                        if stalled_responses >= 3:
+                            raise RuntimeError(f"Google Drive resumable upload made no progress for {source.name}.")
+                    else:
+                        stalled_responses = 0
+                    offset = next_offset
+        raise RuntimeError(f"Google Drive resumable upload ended without a completion response: {source.name}")
 
     def create_folder(self, parent_id: str, name: str) -> DriveItem:
         metadata = {"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
@@ -271,6 +349,10 @@ def sync_google_drive_storage(
             missing.append("02_Ontology_Packs/indexed")
     else:
         missing.append("02_Ontology_Packs")
+
+    ifc_models = root.get("03_IFC_Models")
+    if ifc_models and ifc_models.is_folder:
+        downloaded.extend(_download_ifc_metadata_files(client, ifc_models.id, data_dir / "03_IFC_Models"))
 
     result = {"status": "synced", "synced_at": time.time(), "downloaded": downloaded, "missing": missing}
     marker.parent.mkdir(parents=True, exist_ok=True)
@@ -492,6 +574,52 @@ def _download_database_file(client: GoogleDriveClient, folder_id: str, target_di
     target = target_dir / DATABASE_FILENAME
     client.download_file(source.id, target)
     return [str(target)]
+
+
+def _download_ifc_metadata_files(client: GoogleDriveClient, ifc_folder_id: str, target_dir: Path) -> list[str]:
+    downloaded: list[str] = []
+    for project in client.list_children(ifc_folder_id):
+        if not project.is_folder:
+            continue
+        metadata_folder = _children_by_name(client, project.id).get("metadata")
+        if not metadata_folder or not metadata_folder.is_folder:
+            continue
+        for item in client.list_children(metadata_folder.id):
+            if item.is_folder or not item.name.endswith(".metadata.json"):
+                continue
+            target = target_dir / _safe_drive_filename(project.name) / "metadata" / _safe_drive_filename(item.name)
+            client.download_file(item.id, target)
+            downloaded.append(str(target))
+    return downloaded
+
+
+def restore_ifc_files_from_drive(
+    project_folder: str,
+    file_names: list[str],
+    target_dir: Path,
+    *,
+    client: GoogleDriveClient | None = None,
+    root_folder_id: str | None = None,
+) -> list[str]:
+    """Download IFC model files (e.g. .ifc/.xkt) back from Drive into the local data dir."""
+    root_folder_id = root_folder_id or str(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "")).strip()
+    if not root_folder_id or not file_names:
+        return []
+    client = client or GoogleDriveClient.from_env()
+    try:
+        folder_id = _resolve_folder_path(client, root_folder_id, ["03_IFC_Models", project_folder, "files"])
+    except RuntimeError:
+        return []
+    children = _children_by_name(client, folder_id)
+    downloaded: list[str] = []
+    for name in file_names:
+        item = children.get(name)
+        if not item or item.is_folder:
+            continue
+        target = target_dir / _safe_drive_filename(name)
+        client.download_file(item.id, target)
+        downloaded.append(str(target))
+    return downloaded
 
 
 def _download_zip_files(client: GoogleDriveClient, folder_id: str, target_dir: Path) -> list[str]:

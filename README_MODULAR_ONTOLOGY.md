@@ -48,6 +48,17 @@ All backend routes stay under `/api` except the streamable HTTP MCP endpoint und
 | `/api/packs*` | visible ontology packs and ontology ZIP upload |
 | `/api/graph/{pack_id}` | legacy single-pack graph inspection |
 | `/api/ifc/upload` | IFC, IFCZIP, or ZIP model file staging by project |
+
+### IFC to XKT conversion
+
+Model Explorer loads `.xkt` assets. When `@xeokit/xeokit-convert` is installed, the backend uses the local converter by default:
+
+```powershell
+node node_modules\@xeokit\xeokit-convert\convert2xkt.js -s {ifc} -f ifc -o {xkt}
+```
+
+Override it with `MODULAR_ONTOLOGY_XKT_CONVERTER_CMD` when you need a custom converter command. The command may use `{ifc}` and `{xkt}` placeholders. Set `MODULAR_ONTOLOGY_DISABLE_DEFAULT_XKT_CONVERTER=1` to disable the built-in default.
+Long conversions use `MODULAR_ONTOLOGY_XKT_CONVERTER_TIMEOUT_SECONDS` and default to 900 seconds.
 | `/api/query` | Graph RAG and user-key OpenAI AI Query |
 | `/api/llm/openai/validate` | user-provided OpenAI API key validation |
 | `/api/mcp/*` | per-user MCP URL status and token regeneration |

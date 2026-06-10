@@ -28,6 +28,7 @@ import {
 } from "lucide-react";
 import Graph from "graphology";
 import Sigma from "sigma";
+import { ModelExplorerView } from "./ModelExplorer";
 
 const API_BASE = "";
 const OPENAI_CHAT_MODEL = "gpt-4.1-mini";
@@ -74,6 +75,9 @@ type IfcModel = {
   uploadedAt?: number | null;
   storage?: string;
   localPath?: string;
+  viewerStatus?: string | null;
+  xktPath?: string | null;
+  xktError?: string | null;
 };
 
 type GraphNode = {
@@ -186,13 +190,7 @@ type ProjectForm = {
 };
 
 type UploadProjectTarget = {
-  mode: "existing" | "new";
   projectId: string;
-  name: string;
-  company: string;
-  manager: string;
-  discipline: string;
-  description: string;
 };
 
 type SignupForm = {
@@ -216,6 +214,7 @@ const nav = [
   { label: "Projects", icon: FolderKanban },
   { label: "Ontology Packs", icon: FileArchive },
   { label: "Graph Explorer", icon: Waypoints },
+  { label: "Model Explorer", icon: Building2 },
   { label: "MCP Connections", icon: ServerCog },
   { label: "Admin", icon: LockKeyhole },
 ] as const;
@@ -227,8 +226,9 @@ const DEFAULT_TAB: AppTab = "Dashboard";
 const ROUTE_BY_TAB: Record<AppTab, string> = {
   Dashboard: "/dashboard",
   Projects: "/projects",
-  "Ontology Packs": "/upload",
   "Graph Explorer": "/graph",
+  "Model Explorer": "/model-explorer",
+  "Ontology Packs": "/upload",
   "MCP Connections": "/mcp-connection",
   Admin: "/admin",
 };
@@ -257,6 +257,7 @@ const TAB_LABELS: Record<string, string> = {
   Projects: "프로젝트",
   "Ontology Packs": "업로드",
   "Graph Explorer": "그래프 탐색기",
+  "Model Explorer": "모델 탐색기",
   "MCP Connections": "MCP 연결",
   Admin: "관리자",
 };
@@ -346,13 +347,7 @@ function App() {
   const [companyProjectAccess, setCompanyProjectAccess] = useState<CompanyProjectAccess>({});
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogOptions | null>(null);
   const [uploadProjectTarget, setUploadProjectTarget] = useState<UploadProjectTarget>({
-    mode: "existing",
     projectId: "",
-    name: "",
-    company: "Kumkang Kind",
-    manager: "",
-    discipline: "",
-    description: "",
   });
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? projects[0];
@@ -477,10 +472,10 @@ function App() {
   useEffect(() => {
     if (!projects.length) return;
     setUploadProjectTarget((target) => {
-      if (target.mode === "existing" && projects.some((project) => project.id === target.projectId)) {
+      if (projects.some((project) => project.id === target.projectId)) {
         return target;
       }
-      return { ...target, mode: "existing", projectId: projects[0].id };
+      return { ...target, projectId: projects[0].id };
     });
   }, [projects]);
 
@@ -885,16 +880,8 @@ function App() {
     setUploadStatus("업로드 중");
     const formData = new FormData();
     formData.append("file", file);
-    formData.append("project_mode", uploadProjectTarget.mode);
-    if (uploadProjectTarget.mode === "new") {
-      if (uploadProjectTarget.name.trim()) {
-        formData.append("new_project_name", uploadProjectTarget.name.trim());
-      }
-      formData.append("new_project_company", uploadProjectTarget.company.trim());
-      formData.append("new_project_manager", uploadProjectTarget.manager.trim());
-      formData.append("new_project_discipline", uploadProjectTarget.discipline.trim());
-      formData.append("new_project_description", uploadProjectTarget.description.trim());
-    } else if (uploadProjectTarget.projectId) {
+    formData.append("project_mode", "existing");
+    if (uploadProjectTarget.projectId) {
       formData.append("project_id", uploadProjectTarget.projectId);
     }
     const res = await fetch("/api/packs/upload", {
@@ -1134,8 +1121,16 @@ function App() {
 
   return (
     <>
-    <div className="app-shell">
-      <aside className={activeTab === "Graph Explorer" ? "sidebar graph-sidebar-active" : "sidebar"}>
+    <div className={activeTab === "Model Explorer" ? "app-shell model-shell" : "app-shell"}>
+      <aside
+        className={
+          activeTab === "Graph Explorer"
+            ? "sidebar graph-sidebar-active"
+            : activeTab === "Model Explorer"
+              ? "sidebar model-sidebar-active"
+              : "sidebar"
+        }
+      >
         <div className="brand">
           <div>
             <strong>Modular Ontology</strong>
@@ -1147,13 +1142,14 @@ function App() {
             const Icon = item.icon;
             return (
               <button
+                aria-label={tabLabel(item.label)}
                 className={activeTab === item.label ? "nav-item active" : "nav-item"}
                 key={item.label}
                 onClick={() => navigateToTab(item.label)}
                 type="button"
               >
                 <Icon size={18} />
-                {tabLabel(item.label)}
+                <span className="nav-item-label">{tabLabel(item.label)}</span>
               </button>
             );
           })}
@@ -1170,7 +1166,15 @@ function App() {
         )}
       </aside>
 
-      <main className={activeTab === "Graph Explorer" ? "workspace graph-workspace" : "workspace"}>
+      <main
+        className={
+          activeTab === "Graph Explorer"
+            ? "workspace graph-workspace"
+            : activeTab === "Model Explorer"
+              ? "workspace model-workspace"
+              : "workspace"
+        }
+      >
         <header className="topbar">
           <div className="topbar-title">
             <p className="eyebrow">프로젝트 지식 그래프</p>
@@ -1206,7 +1210,7 @@ function App() {
             </div>
           </div>
         </header>
-        {activeTab !== "Graph Explorer" && activeTab !== "MCP Connections" && (
+        {activeTab !== "Graph Explorer" && activeTab !== "Model Explorer" && activeTab !== "MCP Connections" && (
           <MetricsStrip
             activeTab={activeTab}
             companies={companies}
@@ -1250,10 +1254,18 @@ function App() {
             projects={projects}
             selectedPackId={selectedPackId}
             uploadProjectTarget={uploadProjectTarget}
-            onReindex={reindexPacks}
             onUploadIfc={uploadIfc}
             onUploadProjectTargetChange={setUploadProjectTarget}
             onUpload={() => fileInputRef.current?.click()}
+          />
+        )}
+
+        {activeTab === "Model Explorer" && (
+          <ModelExplorerView
+            authToken={authToken}
+            ifcModels={ifcModels}
+            projects={projects}
+            selectedProjectId={selectedProjectId}
           />
         )}
 
@@ -1340,7 +1352,11 @@ function App() {
                 </div>
               </div>
             ) : null}
-            <GraphCanvas graph={graph} selectedNode={selectedNode} onSelectNode={setSelectedNode} />
+            {graphPackOptions.length ? (
+              <GraphCanvas graph={graph} selectedNode={selectedNode} onSelectNode={setSelectedNode} />
+            ) : (
+              <GraphProjectEmptyState projectName={selectedProject?.name} />
+            )}
           </div>
 
           <aside className="inspector">
@@ -2162,7 +2178,6 @@ function OntologyPacksView({
   projects,
   selectedPackId,
   uploadProjectTarget,
-  onReindex,
   onUploadIfc,
   onUploadProjectTargetChange,
   onUpload,
@@ -2172,7 +2187,6 @@ function OntologyPacksView({
   projects: Project[];
   selectedPackId: string;
   uploadProjectTarget: UploadProjectTarget;
-  onReindex: () => void;
   onUploadIfc: (file: File | undefined, projectId: string) => void;
   onUploadProjectTargetChange: (target: UploadProjectTarget) => void;
   onUpload: () => void;
@@ -2266,62 +2280,25 @@ function OntologyPacksView({
         </div>
         <div className="action-stack">
           <div className="upload-project-target">
-            <div className="segmented-control">
-              <button
-                className={uploadProjectTarget.mode === "existing" ? "active" : ""}
-                type="button"
-                onClick={() => onUploadProjectTargetChange({ ...uploadProjectTarget, mode: "existing" })}
-              >
-                기존 프로젝트
-              </button>
-              <button
-                className={uploadProjectTarget.mode === "new" ? "active" : ""}
-                type="button"
-                onClick={() => onUploadProjectTargetChange({ ...uploadProjectTarget, mode: "new" })}
-              >
-                새 프로젝트
-              </button>
-            </div>
-            {uploadProjectTarget.mode === "existing" ? (
-              <select
-                disabled={!isAdmin}
-                value={uploadProjectTarget.projectId}
-                onChange={(event) => onUploadProjectTargetChange({ ...uploadProjectTarget, projectId: event.target.value })}
-              >
-                {projects.map((project) => (
-                  <option key={project.id} value={project.id}>{project.name}</option>
-                ))}
-              </select>
-            ) : (
-              <div className="upload-project-form">
-                <input
-                  disabled={!isAdmin}
-                  placeholder="새 프로젝트명"
-                  value={uploadProjectTarget.name}
-                  onChange={(event) => onUploadProjectTargetChange({ ...uploadProjectTarget, name: event.target.value })}
-                />
-                <input
-                  disabled={!isAdmin}
-                  placeholder="회사"
-                  value={uploadProjectTarget.company}
-                  onChange={(event) => onUploadProjectTargetChange({ ...uploadProjectTarget, company: event.target.value })}
-                />
-                <input
-                  disabled={!isAdmin}
-                  placeholder="분야"
-                  value={uploadProjectTarget.discipline}
-                  onChange={(event) => onUploadProjectTargetChange({ ...uploadProjectTarget, discipline: event.target.value })}
-                />
-              </div>
-            )}
+            <span>대상 프로젝트</span>
+            <select
+              disabled={!isAdmin}
+              value={uploadProjectTarget.projectId}
+              onChange={(event) =>
+                onUploadProjectTargetChange({
+                  ...uploadProjectTarget,
+                  projectId: event.target.value,
+                })
+              }
+            >
+              {projects.map((project) => (
+                <option key={project.id} value={project.id}>{project.name}</option>
+              ))}
+            </select>
           </div>
-          <button className="primary-button block" disabled={!isAdmin} onClick={onUpload}>
+          <button className="primary-button block" disabled={!isAdmin || !uploadProjectTarget.projectId} onClick={onUpload}>
             <Upload size={17} />
             ZIP 팩 업로드
-          </button>
-          <button className="secondary-button" disabled={!isAdmin} onClick={onReindex}>
-            <RefreshCw size={17} />
-            색인 재생성
           </button>
         </div>
       </div>
@@ -3171,6 +3148,17 @@ function GraphStatsPanel({ stats }: { stats: GraphViewStats }) {
         <strong>{numberLabel(stats.totalEdges)}</strong>
       </div>
     </aside>
+  );
+}
+
+function GraphProjectEmptyState({ projectName }: { projectName?: string }) {
+  return (
+    <div className="graph-project-empty-state project-empty-state">
+      <Database size={30} />
+      <strong>온톨로지 팩이 없습니다.</strong>
+      <span>{projectName ? `${projectName} 프로젝트에 연결된 온톨로지 팩이 없습니다.` : "선택한 프로젝트에 연결된 온톨로지 팩이 없습니다."}</span>
+      <em>업로드 탭에서 온톨로지 ZIP 팩을 이 프로젝트에 추가하면 그래프 탐색기를 사용할 수 있습니다.</em>
+    </div>
   );
 }
 

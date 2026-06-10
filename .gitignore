@@ -15,6 +15,7 @@ api-server*.log
 vite-server*.log
 data/.google-drive-sync.json
 data/00_Admin/
+data/03_IFC_Models/
 data/*.sqlite3
 data/*.sqlite3-*
 data/users.json

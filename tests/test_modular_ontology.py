@@ -4,6 +4,7 @@ import io
 import json
 import os
 import sys
+import urllib.error
 import zipfile
 from pathlib import Path
 
@@ -32,7 +33,7 @@ from modular_ontology.pack_index import (
 )
 from modular_ontology.qa import answer_pack_question
 from modular_ontology.store import index_all_packs, search_documents
-from modular_ontology.google_drive_sync import DriveItem, google_drive_sync_status, sync_google_drive_storage, write_back_ifc_file
+from modular_ontology.google_drive_sync import DriveItem, GoogleDriveClient, google_drive_sync_status, sync_google_drive_storage, write_back_ifc_file
 
 
 client = TestClient(app)
@@ -148,6 +149,9 @@ def test_ifc_upload_stores_project_file_for_admin(monkeypatch, tmp_path) -> None
         status="active",
     )
     monkeypatch.setattr(app_module, "IFC_UPLOAD_DIR", tmp_path / "ifc")
+    monkeypatch.setenv("MODULAR_ONTOLOGY_DISABLE_DEFAULT_XKT_CONVERTER", "1")
+    monkeypatch.delenv("MODULAR_ONTOLOGY_XKT_CONVERTER_CMD", raising=False)
+    monkeypatch.delenv("XKT_CONVERTER_CMD", raising=False)
     monkeypatch.setattr(app_module, "require_admin", lambda authorization: admin_user)
     monkeypatch.setattr(app_module, "current_user", lambda authorization: admin_user)
     headers = {"Authorization": "Bearer admin-test-token"}
@@ -181,6 +185,15 @@ def test_ifc_upload_stores_project_file_for_admin(monkeypatch, tmp_path) -> None
     model = listed.json()[0]
     assert model["id"] == "samcheok-building-b/sample.metadata.json"
     assert model["filename"] == "sample.ifc"
+    assert model["viewerStatus"] == "pending-xkt"
+
+    manifest = client.get(
+        "/api/ifc/model-viewer/manifest",
+        headers=headers,
+        params={"model_id": model["id"]},
+    )
+    assert manifest.status_code == 200
+    assert manifest.json()["status"] == "pending-xkt"
 
     linked = client.post(
         "/api/admin/ifc/models/link",
@@ -193,6 +206,166 @@ def test_ifc_upload_stores_project_file_for_admin(monkeypatch, tmp_path) -> None
     assert linked_model["projectName"] == "Yeoju Modular Dormitory"
     assert (tmp_path / "ifc" / "yeoju-modular-dormitory" / "files" / "sample.ifc").read_bytes() == b"ISO-10303-21;"
     assert (tmp_path / "ifc" / "yeoju-modular-dormitory" / "metadata" / "sample.metadata.json").exists()
+
+
+def test_xkt_upload_is_ready_for_model_viewer(monkeypatch, tmp_path) -> None:
+    from modular_ontology import app as app_module
+
+    admin_user = User(
+        id="admin-test",
+        name="Admin",
+        email="admin@example.com",
+        company="Kumkang Kind",
+        role="admin",
+        password_hash="unused",
+        status="active",
+    )
+    monkeypatch.setattr(app_module, "IFC_UPLOAD_DIR", tmp_path / "ifc")
+    monkeypatch.setenv("MODULAR_ONTOLOGY_DISABLE_DEFAULT_XKT_CONVERTER", "1")
+    monkeypatch.delenv("MODULAR_ONTOLOGY_XKT_CONVERTER_CMD", raising=False)
+    monkeypatch.delenv("XKT_CONVERTER_CMD", raising=False)
+    monkeypatch.setattr(app_module, "require_admin", lambda authorization: admin_user)
+    monkeypatch.setattr(app_module, "current_user", lambda authorization: admin_user)
+    headers = {"Authorization": "Bearer admin-test-token"}
+
+    response = client.post(
+        "/api/ifc/upload",
+        headers=headers,
+        data={"project_id": "samcheok-building-b"},
+        files={"file": ("sample.xkt", b"xkt-bytes", "application/octet-stream")},
+    )
+    assert response.status_code == 200
+    model = client.get("/api/ifc/models", headers=headers).json()[0]
+    assert model["viewerStatus"] == "ready"
+
+    manifest = client.get(
+        "/api/ifc/model-viewer/manifest",
+        headers=headers,
+        params={"model_id": model["id"]},
+    )
+    assert manifest.status_code == 200
+    assert manifest.json()["status"] == "ready"
+    assert manifest.json()["xktUrl"]
+
+    asset = client.get(
+        "/api/ifc/model-viewer/asset",
+        headers=headers,
+        params={"model_id": model["id"]},
+    )
+    assert asset.status_code == 200
+    assert asset.content == b"xkt-bytes"
+
+
+def test_ifc_upload_uses_configured_xkt_converter(monkeypatch, tmp_path) -> None:
+    from modular_ontology import app as app_module
+
+    admin_user = User(
+        id="admin-test",
+        name="Admin",
+        email="admin@example.com",
+        company="Kumkang Kind",
+        role="admin",
+        password_hash="unused",
+        status="active",
+    )
+    converter = tmp_path / "fake_converter.py"
+    converter.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "Path(sys.argv[sys.argv.index('--out') + 1]).write_bytes(b'converted-xkt')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app_module, "IFC_UPLOAD_DIR", tmp_path / "ifc")
+    monkeypatch.setenv("MODULAR_ONTOLOGY_XKT_CONVERTER_CMD", f"{sys.executable} {converter} --in {{ifc}} --out {{xkt}}")
+    monkeypatch.setattr(app_module, "require_admin", lambda authorization: admin_user)
+    monkeypatch.setattr(app_module, "current_user", lambda authorization: admin_user)
+    headers = {"Authorization": "Bearer admin-test-token"}
+
+    response = client.post(
+        "/api/ifc/upload",
+        headers=headers,
+        data={"project_id": "samcheok-building-b"},
+        files={"file": ("sample.ifc", b"ISO-10303-21;", "application/octet-stream")},
+    )
+
+    assert response.status_code == 200
+    model = client.get("/api/ifc/models", headers=headers).json()[0]
+    assert model["viewerStatus"] == "ready"
+    asset = client.get(
+        "/api/ifc/model-viewer/asset",
+        headers=headers,
+        params={"model_id": model["id"]},
+    )
+    assert asset.status_code == 200
+    assert asset.content == b"converted-xkt"
+
+
+def test_unassigned_xkt_asset_requires_user(monkeypatch, tmp_path) -> None:
+    from modular_ontology import app as app_module
+
+    monkeypatch.setattr(app_module, "IFC_UPLOAD_DIR", tmp_path / "ifc")
+    monkeypatch.setattr(app_module, "current_user", lambda authorization: None)
+    model_dir = tmp_path / "ifc" / "_unassigned"
+    model_dir.mkdir(parents=True)
+    (model_dir / "sample.xkt").write_bytes(b"xkt-bytes")
+    (model_dir / "sample.metadata.json").write_text(
+        json.dumps(
+            {
+                "id": "_unassigned/sample.metadata.json",
+                "filename": "sample.xkt",
+                "sizeBytes": 9,
+                "uploadedAt": 1,
+                "storage": "local",
+                "localPath": str(model_dir / "sample.xkt"),
+                "viewerStatus": "ready",
+                "xktPath": str(model_dir / "sample.xkt"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    response = client.get("/api/ifc/model-viewer/asset", params={"model_id": "_unassigned/sample.metadata.json"})
+
+    assert response.status_code == 401
+
+
+def test_assigned_xkt_model_viewer_requires_user(monkeypatch, tmp_path) -> None:
+    from modular_ontology import app as app_module
+
+    monkeypatch.setattr(app_module, "IFC_UPLOAD_DIR", tmp_path / "ifc")
+    monkeypatch.setattr(app_module, "current_user", lambda authorization: None)
+    model_dir = tmp_path / "ifc" / "samcheok-building-b"
+    model_dir.mkdir(parents=True)
+    (model_dir / "sample.xkt").write_bytes(b"xkt-bytes")
+    (model_dir / "sample.metadata.json").write_text(
+        json.dumps(
+            {
+                "id": "samcheok-building-b/sample.metadata.json",
+                "filename": "sample.xkt",
+                "sizeBytes": 9,
+                "uploadedAt": 1,
+                "storage": "local",
+                "localPath": str(model_dir / "sample.xkt"),
+                "projectId": "samcheok-building-b",
+                "projectName": "Samcheok Building B",
+                "viewerStatus": "ready",
+                "xktPath": str(model_dir / "sample.xkt"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = client.get(
+        "/api/ifc/model-viewer/manifest",
+        params={"model_id": "samcheok-building-b/sample.metadata.json"},
+    )
+    asset = client.get(
+        "/api/ifc/model-viewer/asset",
+        params={"model_id": "samcheok-building-b/sample.metadata.json"},
+    )
+
+    assert manifest.status_code == 401
+    assert asset.status_code == 401
 
 
 def test_ifc_drive_write_back_creates_project_folders(monkeypatch, tmp_path) -> None:
@@ -232,6 +405,51 @@ def test_ifc_drive_write_back_creates_project_folders(monkeypatch, tmp_path) -> 
         ("root/03_IFC_Models/samcheok-building-b", "files"),
     ]
     assert fake_client.uploads[0]["folder_id"] == "root/03_IFC_Models/samcheok-building-b/files"
+
+
+def test_resumable_upload_retries_same_chunk_when_drive_omits_range(monkeypatch, tmp_path) -> None:
+    from modular_ontology import google_drive_sync as drive_module
+
+    class FakeResponse:
+        def __init__(self, payload: bytes = b"", headers: dict[str, str] | None = None) -> None:
+            self._payload = payload
+            self.headers = headers or {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self) -> bytes:
+            return self._payload
+
+    def header_value(request, name: str) -> str:
+        for key, value in request.header_items():
+            if key.lower() == name.lower():
+                return value
+        return ""
+
+    source = tmp_path / "large.ifc"
+    source.write_bytes(b"a" * (6 * 1024 * 1024))
+    put_requests = []
+
+    def fake_urlopen(request, timeout=0):
+        if request.get_method() == "POST" and "uploadType=resumable" in request.full_url:
+            return FakeResponse(headers={"Location": "https://upload.example/session"})
+        if request.get_method() == "PUT":
+            put_requests.append(request)
+            if len(put_requests) == 1:
+                raise urllib.error.HTTPError(request.full_url, 308, "Resume Incomplete", {}, None)
+            return FakeResponse(json.dumps({"id": "drive-file", "name": "large.ifc"}).encode("utf-8"))
+        raise AssertionError(f"Unexpected request: {request.get_method()} {request.full_url}")
+
+    monkeypatch.setattr(drive_module.urllib.request, "urlopen", fake_urlopen)
+    result = GoogleDriveClient(access_token="token").create_file("folder", source, "large.ifc", "application/octet-stream")
+
+    expected_range = f"bytes 0-{source.stat().st_size - 1}/{source.stat().st_size}"
+    assert result["id"] == "drive-file"
+    assert [header_value(request, "Content-Range") for request in put_requests] == [expected_range, expected_range]
 
 
 def test_admin_project_crud_and_pack_link_management(monkeypatch, tmp_path) -> None:

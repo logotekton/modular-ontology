@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import shlex
+import subprocess
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,6 +42,7 @@ from .config import DATA_DIR, MCP_REMOTE_FILE, ROOT, env
 from .google_drive_sync import (
     google_drive_sync_enabled,
     google_drive_sync_status,
+    restore_ifc_files_from_drive,
     sync_google_drive_storage,
     sync_google_drive_mcp_tokens_file,
     sync_google_drive_users_file,
@@ -320,6 +324,9 @@ def _read_ifc_metadata(metadata_path: Path) -> dict[str, Any] | None:
         "uploadedAt": metadata.get("uploadedAt"),
         "storage": metadata.get("storage", "local"),
         "localPath": metadata.get("localPath"),
+        "viewerStatus": metadata.get("viewerStatus"),
+        "xktPath": metadata.get("xktPath"),
+        "xktError": metadata.get("xktError"),
         "metadataPath": str(metadata_path),
     }
 
@@ -349,10 +356,148 @@ def _find_ifc_metadata_path(model_id: str) -> Path:
     raise FileNotFoundError(model_id)
 
 
+def _model_file_path(metadata_path: Path, metadata: dict[str, Any]) -> Path:
+    filename = _safe_upload_filename(str(metadata.get("filename") or "model.ifc"), {".ifc", ".ifczip", ".zip", ".xkt"})
+    default_file_dir = metadata_path.parent.parent / "files" if metadata_path.parent.name == "metadata" else metadata_path.parent
+    recorded = str(metadata.get("localPath") or "").strip()
+    # Metadata restored from Drive can carry a path from another machine/instance.
+    if recorded and Path(recorded).exists():
+        return Path(recorded)
+    return default_file_dir / filename
+
+
+def _ifc_project_folder(metadata_path: Path) -> str:
+    return metadata_path.parent.parent.name if metadata_path.parent.name == "metadata" else metadata_path.parent.name
+
+
+def _ensure_ifc_local_files(metadata_path: Path, metadata: dict[str, Any]) -> None:
+    """Lazily restore the model file (and its XKT sibling) from Drive if they are not on local disk."""
+    if not google_drive_sync_enabled():
+        return
+    model_path = _model_file_path(metadata_path, metadata)
+    wanted: list[str] = []
+    if not model_path.exists():
+        wanted.append(model_path.name)
+    if model_path.suffix.lower() != ".xkt" and not _candidate_xkt_path(model_path, metadata):
+        wanted.append(model_path.with_suffix(".xkt").name)
+    if not wanted:
+        return
+    try:
+        restore_ifc_files_from_drive(_ifc_project_folder(metadata_path), wanted, model_path.parent)
+    except Exception:
+        return
+
+
+def _candidate_xkt_path(model_path: Path, metadata: dict[str, Any]) -> Path | None:
+    recorded = str(metadata.get("xktPath") or "").strip()
+    if recorded:
+        path = Path(recorded)
+        if path.exists():
+            return path
+    if model_path.suffix.lower() == ".xkt" and model_path.exists():
+        return model_path
+    sibling = model_path.with_suffix(".xkt")
+    if sibling.exists():
+        return sibling
+    nested = model_path.parent / "model.xkt"
+    if nested.exists():
+        return nested
+    return None
+
+
+def _shell_arg(path: Path) -> str:
+    if os.name != "nt":
+        return shlex.quote(str(path))
+    return subprocess.list2cmdline([str(path)])
+
+
+def _node_command() -> str:
+    command = str(env("MODULAR_ONTOLOGY_NODE_COMMAND") or "node").strip()
+    command_path = Path(command)
+    return _shell_arg(command_path) if command_path.exists() else command
+
+
+def _default_xkt_converter_command() -> str:
+    if str(env("MODULAR_ONTOLOGY_DISABLE_DEFAULT_XKT_CONVERTER") or "").strip() == "1":
+        return ""
+    converter_path = ROOT / "node_modules" / "@xeokit" / "xeokit-convert" / "convert2xkt.js"
+    if not converter_path.exists():
+        return ""
+    return f"{_node_command()} {_shell_arg(converter_path)} -s {{ifc}} -f ifc -o {{xkt}}"
+
+
+def _xkt_converter_command() -> str:
+    configured = str(env("MODULAR_ONTOLOGY_XKT_CONVERTER_CMD") or env("XKT_CONVERTER_CMD") or "").strip()
+    return configured or _default_xkt_converter_command()
+
+
+def _maybe_create_xkt(model_path: Path, metadata: dict[str, Any]) -> dict[str, Any]:
+    if model_path.suffix.lower() == ".xkt":
+        metadata.update({"viewerStatus": "ready", "xktPath": str(model_path), "xktError": None})
+        return metadata
+    if model_path.suffix.lower() != ".ifc":
+        metadata.update({"viewerStatus": "pending-xkt", "xktError": "Only IFC or XKT files can be opened in the 3D viewer."})
+        return metadata
+    existing = _candidate_xkt_path(model_path, metadata)
+    if existing:
+        metadata.update({"viewerStatus": "ready", "xktPath": str(existing), "xktError": None})
+        return metadata
+    command_template = _xkt_converter_command()
+    if not command_template:
+        metadata.update({"viewerStatus": "pending-xkt", "xktError": "XKT converter command is not configured."})
+        return metadata
+    target = model_path.with_suffix(".xkt")
+    timeout_seconds = int(str(env("MODULAR_ONTOLOGY_XKT_CONVERTER_TIMEOUT_SECONDS", "900")))
+    try:
+        command = command_template.format(ifc=_shell_arg(model_path), xkt=_shell_arg(target))
+        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout_seconds)
+    except (KeyError, IndexError, ValueError) as exc:
+        metadata.update({"viewerStatus": "error", "xktError": f"Invalid XKT converter command template: {exc}"})
+        return metadata
+    except subprocess.TimeoutExpired:
+        metadata.update({"viewerStatus": "error", "xktError": f"XKT converter timed out after {timeout_seconds} seconds."})
+        return metadata
+    except OSError as exc:
+        metadata.update({"viewerStatus": "error", "xktError": f"XKT converter could not start: {exc}"})
+        return metadata
+    if result.returncode != 0 or not target.exists():
+        metadata.update(
+            {
+                "viewerStatus": "error",
+                "xktError": (result.stderr or result.stdout or "XKT converter did not create an output file.").strip(),
+            }
+        )
+        return metadata
+    metadata.update({"viewerStatus": "ready", "xktPath": str(target), "xktError": None})
+    return metadata
+
+
+def _read_ifc_metadata_by_id(model_id: str) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+    metadata_path = _find_ifc_metadata_path(model_id)
+    raw_metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
+    public_metadata = _read_ifc_metadata(metadata_path)
+    if not public_metadata:
+        raise FileNotFoundError(model_id)
+    return metadata_path, raw_metadata, public_metadata
+
+
+def _ensure_ifc_model_access(model_id: str, authorization: str | None) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+    metadata_path, raw_metadata, public_metadata = _read_ifc_metadata_by_id(model_id)
+    user = current_user(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication is required for model viewer access.")
+    project_id = public_metadata.get("projectId")
+    if project_id:
+        ensure_project_access(str(project_id), user)
+    elif not is_internal_user(user):
+        raise HTTPException(status_code=403, detail="This model is not available for your company.")
+    return metadata_path, raw_metadata, public_metadata
+
+
 def assign_ifc_model_to_project(model_id: str, project_id: str | None) -> dict[str, Any]:
     metadata_path = _find_ifc_metadata_path(model_id)
     metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
-    filename = _safe_upload_filename(str(metadata.get("filename") or "model.ifc"), {".ifc", ".ifczip", ".zip"})
+    filename = _safe_upload_filename(str(metadata.get("filename") or "model.ifc"), {".ifc", ".ifczip", ".zip", ".xkt"})
     target_project_id = (project_id or "").strip() or "_unassigned"
     project = None
     if target_project_id != "_unassigned":
@@ -370,6 +515,12 @@ def assign_ifc_model_to_project(model_id: str, project_id: str | None) -> dict[s
 
     if source_file.exists() and source_file.resolve() != target_file.resolve():
         os.replace(source_file, target_file)
+    source_xkt = _candidate_xkt_path(source_file, metadata)
+    if source_xkt and source_xkt.exists():
+        target_xkt = target_file.with_suffix(".xkt")
+        if source_xkt.resolve() != target_xkt.resolve():
+            os.replace(source_xkt, target_xkt)
+        metadata["xktPath"] = str(target_xkt)
     metadata_path.unlink(missing_ok=True)
 
     metadata.update(
@@ -963,10 +1114,10 @@ async def upload_ifc_model(
     target_project_id = (project_id or "").strip()
     project = ensure_project_access(target_project_id, current_user(authorization)) if target_project_id else None
     try:
-        safe_name = _safe_upload_filename(file.filename or "model.ifc", {".ifc", ".ifczip", ".zip"})
+        safe_name = _safe_upload_filename(file.filename or "model.ifc", {".ifc", ".ifczip", ".zip", ".xkt"})
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    max_bytes = int(str(env("MODULAR_ONTOLOGY_IFC_MAX_BYTES", str(100 * 1024 * 1024))))
+    max_bytes = int(str(env("MODULAR_ONTOLOGY_IFC_MAX_BYTES", str(250 * 1024 * 1024))))
     target_dir = IFC_UPLOAD_DIR / (target_project_id or "_unassigned")
     target_path = target_dir / safe_name
     size_bytes = await _write_upload_file_with_limit(file, target_path, max_bytes=max_bytes)
@@ -979,12 +1130,16 @@ async def upload_ifc_model(
         "storage": "local",
         "localPath": str(target_path),
     }
+    metadata = await asyncio.to_thread(_maybe_create_xkt, target_path, metadata)
     metadata_path = target_dir / _ifc_metadata_filename(safe_name)
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     write_back: dict[str, Any] = {}
     if google_drive_sync_enabled():
         try:
             write_back["file"] = write_back_ifc_file(target_path, target_project_id or "_unassigned")
+            xkt_path = _candidate_xkt_path(target_path, metadata)
+            if xkt_path and xkt_path != target_path:
+                write_back["xkt"] = write_back_ifc_file(xkt_path, target_project_id or "_unassigned")
             metadata["storage"] = "google-drive"
             metadata["drive"] = write_back
             metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1018,6 +1173,60 @@ def ifc_models(authorization: str | None = Header(default=None)) -> list[dict[st
     return [model for model in models if model.get("projectId") in allowed_project_ids]
 
 
+@app.get("/api/ifc/model-viewer/manifest")
+def ifc_model_viewer_manifest(model_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    metadata_path, raw_metadata, public_metadata = _ensure_ifc_model_access(model_id, authorization)
+    _ensure_ifc_local_files(metadata_path, raw_metadata)
+    model_path = _model_file_path(metadata_path, raw_metadata)
+    xkt_path = _candidate_xkt_path(model_path, raw_metadata)
+    status = "ready" if xkt_path else str(raw_metadata.get("viewerStatus") or "pending-xkt")
+    if not model_path.exists() and not xkt_path:
+        status = "missing-file"
+    encoded_model_id = quote(model_id, safe="")
+    return {
+        "modelId": public_metadata["id"],
+        "filename": public_metadata["filename"],
+        "projectId": public_metadata.get("projectId"),
+        "projectName": public_metadata.get("projectName"),
+        "status": status,
+        "xktUrl": f"/api/ifc/model-viewer/asset?model_id={encoded_model_id}" if xkt_path else None,
+        "error": raw_metadata.get("xktError"),
+        "sizeBytes": public_metadata.get("sizeBytes"),
+        "storage": public_metadata.get("storage"),
+    }
+
+
+@app.get("/api/ifc/model-viewer/asset")
+def ifc_model_viewer_asset(model_id: str, authorization: str | None = Header(default=None)) -> FileResponse:
+    metadata_path, raw_metadata, _public_metadata = _ensure_ifc_model_access(model_id, authorization)
+    _ensure_ifc_local_files(metadata_path, raw_metadata)
+    xkt_path = _candidate_xkt_path(_model_file_path(metadata_path, raw_metadata), raw_metadata)
+    if not xkt_path or not xkt_path.exists():
+        raise HTTPException(status_code=404, detail="XKT asset is not available for this model.")
+    return FileResponse(xkt_path, media_type="application/octet-stream", filename=xkt_path.name)
+
+
+@app.get("/api/ifc/model-viewer/object")
+def ifc_model_viewer_object(
+    model_id: str,
+    object_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _metadata_path, raw_metadata, public_metadata = _ensure_ifc_model_access(model_id, authorization)
+    return {
+        "objectId": object_id,
+        "label": object_id,
+        "type": "Viewer Object",
+        "source": "xeokit",
+        "properties": {
+            "model": public_metadata.get("filename"),
+            "project": public_metadata.get("projectName"),
+            "viewerStatus": raw_metadata.get("viewerStatus"),
+            "storage": public_metadata.get("storage"),
+        },
+    }
+
+
 @app.post("/api/admin/ifc/models/link")
 def admin_link_ifc_model(
     request: IfcModelLinkRequest,
@@ -1037,6 +1246,9 @@ def admin_link_ifc_model(
         file_path = Path(str(model.get("localPath", "")))
         if file_path.exists():
             write_back["file"] = write_back_ifc_file(file_path, model.get("projectId") or "_unassigned")
+        xkt_path = _candidate_xkt_path(file_path, model)
+        if xkt_path and xkt_path != file_path and xkt_path.exists():
+            write_back["xkt"] = write_back_ifc_file(xkt_path, model.get("projectId") or "_unassigned")
         if metadata_path.exists():
             write_back["metadata"] = write_back_ifc_metadata_file(metadata_path, model.get("projectId") or "_unassigned")
     return {"model": model, "models": list_ifc_models(), "writeBack": write_back}
