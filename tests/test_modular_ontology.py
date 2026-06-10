@@ -113,9 +113,11 @@ def test_builds_project_graph_from_multiple_packs() -> None:
 
 def test_projects_replace_marketplace_with_project_pack_grouping() -> None:
     projects = list_projects()
+    project_by_id = {project["id"]: project for project in projects}
 
-    assert {project["id"] for project in projects} >= {"samcheok-building-b", "yeoju-modular-dormitory"}
-    assert all(project["packIds"] for project in projects)
+    assert set(project_by_id) >= {"samcheok-building-b", "yeoju-modular-dormitory"}
+    assert project_by_id["samcheok-building-b"]["packIds"]
+    assert project_by_id["yeoju-modular-dormitory"]["packIds"]
     assert all(project["role"] == "Admin" for project in projects)
 
 

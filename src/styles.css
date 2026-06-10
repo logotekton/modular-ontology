@@ -2007,7 +2007,7 @@ dd {
   display: grid;
   gap: 8px;
   min-height: 0;
-  max-height: 540px;
+  height: 176px;
   overflow-x: hidden;
   overflow-y: auto;
   padding-right: 4px;
@@ -2017,7 +2017,8 @@ dd {
 .project-summary-card {
   display: grid;
   gap: 4px;
-  min-height: 74px;
+  height: 84px;
+  min-height: 84px;
   border: 1px solid #dbe6ef;
   border-radius: 8px;
   background: #fff;
@@ -2080,7 +2081,7 @@ dd {
   align-content: stretch;
   height: 100%;
   min-height: 0;
-  padding-top: 54px;
+  padding-top: 32px;
 }
 
 .project-detail-list {
