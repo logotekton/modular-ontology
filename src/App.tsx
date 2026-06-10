@@ -65,6 +65,17 @@ type Project = {
   role: string;
 };
 
+type IfcModel = {
+  id: string;
+  filename: string;
+  projectId?: string | null;
+  projectName?: string | null;
+  sizeBytes?: number | null;
+  uploadedAt?: number | null;
+  storage?: string;
+  localPath?: string;
+};
+
 type GraphNode = {
   id: string;
   label: string;
@@ -304,6 +315,7 @@ function App() {
   const [activeTab, setActiveTab] = useState<AppTab>(() => tabFromPathname(window.location.pathname));
   const [packs, setPacks] = useState<Pack[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
+  const [ifcModels, setIfcModels] = useState<IfcModel[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [selectedGraphPackIds, setSelectedGraphPackIds] = useState<string[]>([]);
   const [graph, setGraph] = useState<GraphPayload | null>(null);
@@ -554,12 +566,14 @@ function App() {
   }
 
   async function refreshData(nextPackId?: string, token = authToken) {
-    const [packData, projectData] = await Promise.all([
+    const [packData, projectData, ifcModelData] = await Promise.all([
       getJson<Pack[]>("/api/packs", token),
       getJson<Project[]>("/api/projects", token),
+      getJson<IfcModel[]>("/api/ifc/models", token).catch(() => []),
     ]);
     setPacks(packData);
     setProjects(projectData);
+    setIfcModels(ifcModelData);
     refreshPublicStatus(token).catch(() => undefined);
     const nextProject =
       (nextPackId && projectData.find((project) => project.packIds.includes(nextPackId))) ||
@@ -922,7 +936,28 @@ function App() {
       return;
     }
     const payload = (await res.json()) as { filename: string; sizeBytes: number; projectName?: string | null };
+    await refreshData(undefined, authToken);
     setUploadStatus(`${payload.projectName || "프로젝트"} IFC 저장 완료: ${payload.filename}`);
+  }
+
+  async function setIfcModelProject(modelId: string, projectId: string | null) {
+    if (currentUser?.role !== "admin") {
+      setUploadStatus("관리자 세션이 필요합니다");
+      return;
+    }
+    const res = await fetch("/api/admin/ifc/models/link", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
+      body: JSON.stringify({ model_id: modelId, project_id: projectId }),
+    });
+    if (!res.ok) {
+      const payload = await res.json().catch(() => null);
+      setUploadStatus(payload?.detail ?? "IFC 연결 저장 실패");
+      return;
+    }
+    const payload = (await res.json()) as { models: IfcModel[] };
+    setIfcModels(payload.models);
+    setUploadStatus("IFC 연결 저장 완료");
   }
 
   async function reindexPacks() {
@@ -1194,6 +1229,7 @@ function App() {
         {activeTab === "Projects" && (
           <ProjectsView
             currentUser={currentUser}
+            ifcModels={ifcModels}
             packs={packs}
             projects={projects}
             selectedPackId={selectedPackId}
@@ -1201,6 +1237,7 @@ function App() {
             onDeleteProject={deleteProject}
             onOpenPack={selectPackForGraph}
             onSaveProject={saveProject}
+            onSetIfcModelProject={setIfcModelProject}
             onSetProjectPacks={setProjectPacks}
           />
         )}
@@ -1706,24 +1743,27 @@ function DashboardView({
 
 function ProjectsView({
   currentUser,
+  ifcModels,
   packs,
   projects,
-  selectedPackId,
   onConfirm,
   onDeleteProject,
   onOpenPack,
   onSaveProject,
+  onSetIfcModelProject,
   onSetProjectPacks,
 }: {
   currentUser: CurrentUser | null;
+  ifcModels: IfcModel[];
   packs: Pack[];
   projects: Project[];
   selectedPackId: string;
   onConfirm: (options: ConfirmDialogOptions) => void;
   onDeleteProject: (projectId: string) => void;
   onOpenPack: (packId: string) => void;
-  onSaveProject: (form: ProjectForm) => void;
-  onSetProjectPacks: (projectId: string, packIds: string[]) => void;
+  onSaveProject: (form: ProjectForm) => Promise<void> | void;
+  onSetIfcModelProject: (modelId: string, projectId: string | null) => Promise<void> | void;
+  onSetProjectPacks: (projectId: string, packIds: string[]) => Promise<void> | void;
 }) {
   const isAdmin = currentUser?.role === "admin";
   const emptyForm: ProjectForm = {
@@ -1735,8 +1775,11 @@ function ProjectsView({
     packIds: [],
   };
   const [selectedProjectId, setSelectedProjectId] = useState(projects[0]?.id ?? "");
-  const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? projects[0];
+  const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
   const [draft, setDraft] = useState<ProjectForm>(emptyForm);
+  const [dialogDraft, setDialogDraft] = useState<ProjectForm>(emptyForm);
+  const [dialogMode, setDialogMode] = useState<"add" | "edit" | null>(null);
+  const [ifcDraftLinks, setIfcDraftLinks] = useState<Record<string, string | null>>({});
   const [pressedAction, setPressedAction] = useState("");
 
   useEffect(() => {
@@ -1764,7 +1807,29 @@ function ProjectsView({
       description: selectedProject.description || "",
       packIds: selectedProject.packIds,
     });
-  }, [selectedProject?.id]);
+  }, [selectedProject?.id, selectedProject?.packIds.join("|")]);
+
+  useEffect(() => {
+    const nextLinks: Record<string, string | null> = {};
+    ifcModels.forEach((model) => {
+      nextLinks[model.id] = model.projectId ?? null;
+    });
+    setIfcDraftLinks(nextLinks);
+  }, [ifcModels]);
+
+  const linkedPacks = selectedProject
+    ? selectedProject.packIds
+        .map((packId) => packs.find((pack) => pack.id === packId))
+        .filter((pack): pack is Pack => Boolean(pack))
+    : [];
+  const linkedModels = selectedProject
+    ? ifcModels.filter((model) => (ifcDraftLinks[model.id] ?? model.projectId ?? null) === selectedProject.id)
+    : [];
+  const modelLinkChanged = ifcModels.some((model) => (ifcDraftLinks[model.id] ?? null) !== (model.projectId ?? null));
+  const packLinkChanged = selectedProject
+    ? draft.packIds.slice().sort().join("|") !== selectedProject.packIds.slice().sort().join("|")
+    : false;
+  const connectionDirty = modelLinkChanged || packLinkChanged;
 
   function showActionFeedback(action: string) {
     setPressedAction("");
@@ -1778,17 +1843,32 @@ function ProjectsView({
     return `${baseClass ? `${baseClass} ` : ""}action-feedback-button${pressedAction === action ? " is-confirming" : ""}`;
   }
 
-  function runProjectAction(action: string, callback: () => void) {
+  function runProjectAction(action: string, callback: () => Promise<void> | void) {
     showActionFeedback(action);
-    callback();
+    void callback();
   }
 
-  function newProject() {
-    setSelectedProjectId("");
-    setDraft(emptyForm);
+  function openAddDialog() {
+    setDialogDraft(emptyForm);
+    setDialogMode("add");
+  }
+
+  function openEditDialog() {
+    if (!selectedProject) return;
+    setDialogDraft({
+      id: selectedProject.id,
+      name: selectedProject.name,
+      company: selectedProject.company || "",
+      manager: selectedProject.manager || "",
+      discipline: selectedProject.discipline || "",
+      description: selectedProject.description || "",
+      packIds: selectedProject.packIds,
+    });
+    setDialogMode("edit");
   }
 
   function toggleDraftPack(packId: string) {
+    if (!selectedProject) return;
     setDraft((current) => ({
       ...current,
       packIds: current.packIds.includes(packId)
@@ -1797,28 +1877,41 @@ function ProjectsView({
     }));
   }
 
-  function saveDraft() {
-    onSaveProject(draft);
-  }
-
-  function deleteSelectedProject() {
-    if (!draft.id) return;
-    const projectId = draft.id;
-    onConfirm({
-      title: "프로젝트 삭제",
-      message: `${draft.name} 프로젝트를 삭제하시겠습니까? 연결된 팩은 삭제되지 않습니다.`,
-      confirmLabel: "삭제",
-      tone: "danger",
-      onConfirm: () => onDeleteProject(projectId),
+  function toggleDraftIfc(modelId: string) {
+    if (!selectedProject) return;
+    setIfcDraftLinks((current) => {
+      const linkedToSelected = (current[modelId] ?? null) === selectedProject.id;
+      return { ...current, [modelId]: linkedToSelected ? null : selectedProject.id };
     });
   }
 
-  function savePackLinksOnly() {
-    if (!draft.id) return;
-    onSetProjectPacks(draft.id, draft.packIds);
+  async function saveDialogDraft() {
+    await Promise.resolve(onSaveProject(dialogDraft));
+    setDialogMode(null);
+  }
+
+  function deleteSelectedProject() {
+    if (!selectedProject) return;
+    onConfirm({
+      title: "프로젝트 삭제",
+      message: `${selectedProject.name} 프로젝트를 삭제하시겠습니까? 연결된 팩과 IFC 모델 원본은 삭제되지 않습니다.`,
+      confirmLabel: "삭제",
+      tone: "danger",
+      onConfirm: () => onDeleteProject(selectedProject.id),
+    });
+  }
+
+  async function saveConnections() {
+    if (!selectedProject) return;
+    await Promise.resolve(onSetProjectPacks(selectedProject.id, draft.packIds));
+    const changedModels = ifcModels.filter((model) => (ifcDraftLinks[model.id] ?? null) !== (model.projectId ?? null));
+    await Promise.all(
+      changedModels.map((model) => Promise.resolve(onSetIfcModelProject(model.id, ifcDraftLinks[model.id] ?? null))),
+    );
   }
 
   return (
+    <>
     <section className="project-management-grid">
       <div className="project-list-panel">
         <div className="panel-header slim">
@@ -1827,13 +1920,31 @@ function ProjectsView({
             <span>{projects.length}개 관리형 프로젝트</span>
           </div>
           {isAdmin && (
-            <button
-              className={actionButtonClass("project-add")}
-              type="button"
-              onClick={() => runProjectAction("project-add", newProject)}
-            >
-              프로젝트 추가
-            </button>
+            <div className="project-header-actions">
+              <button
+                className={actionButtonClass("project-add")}
+                type="button"
+                onClick={() => runProjectAction("project-add", openAddDialog)}
+              >
+                추가
+              </button>
+              <button
+                className={actionButtonClass("project-edit")}
+                disabled={!selectedProject}
+                type="button"
+                onClick={() => runProjectAction("project-edit", openEditDialog)}
+              >
+                편집
+              </button>
+              <button
+                className={actionButtonClass("project-delete")}
+                disabled={!selectedProject}
+                type="button"
+                onClick={() => runProjectAction("project-delete", deleteSelectedProject)}
+              >
+                삭제
+              </button>
+            </div>
           )}
         </div>
         <div className="project-card-list">
@@ -1841,6 +1952,7 @@ function ProjectsView({
             const projectPacks = project.packIds
               .map((packId) => packs.find((pack) => pack.id === packId))
               .filter((pack): pack is Pack => Boolean(pack));
+            const projectModels = ifcModels.filter((model) => model.projectId === project.id);
             return (
               <button
                 className={project.id === selectedProject?.id ? "project-summary-card active" : "project-summary-card"}
@@ -1850,129 +1962,221 @@ function ProjectsView({
               >
                 <strong>{project.name}</strong>
                 <span>{project.company || "회사 미지정"} / {project.discipline || "분야 미지정"}</span>
-                <em>{projectPacks.length}개 팩</em>
+                <em>{projectModels.length}개 IFC / {projectPacks.length}개 팩</em>
               </button>
             );
           })}
         </div>
       </div>
 
-      <div className="project-panel project-editor-panel">
-        <div className="project-editor-grid">
-          <div>
+      <div className="project-panel project-status-panel">
+        <div className="project-status-grid">
+          <div className="project-status-copy">
             <div className="panel-header slim">
               <div>
-                <h2>{draft.id ? draft.name : "새 프로젝트"}</h2>
-                <span>{draft.company || "회사 미지정"} / {draft.manager || "관리자 미지정"}</span>
+                <h2>{selectedProject?.name ?? "프로젝트를 선택하세요"}</h2>
+                <span>{selectedProject ? `${selectedProject.company || "회사 미지정"} / ${selectedProject.manager || "관리자 미지정"}` : "카드를 선택하면 상세 정보가 표시됩니다"}</span>
               </div>
               <FolderKanban size={19} />
             </div>
-            <div className="project-form-grid">
-              <label>
-                프로젝트명
-                <input
-                  disabled={!isAdmin}
-                  value={draft.name}
-                  onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-                />
-              </label>
-              <label>
-                회사
-                <input
-                  disabled={!isAdmin}
-                  value={draft.company}
-                  onChange={(event) => setDraft({ ...draft, company: event.target.value })}
-                />
-              </label>
-              <label>
-                관리자
-                <input
-                  disabled={!isAdmin}
-                  value={draft.manager}
-                  onChange={(event) => setDraft({ ...draft, manager: event.target.value })}
-                />
-              </label>
-              <label>
-                분야
-                <input
-                  disabled={!isAdmin}
-                  value={draft.discipline}
-                  onChange={(event) => setDraft({ ...draft, discipline: event.target.value })}
-                />
-              </label>
-              <label className="full">
-                설명
-                <textarea
-                  disabled={!isAdmin}
-                  value={draft.description}
-                  onChange={(event) => setDraft({ ...draft, description: event.target.value })}
-                />
-              </label>
-            </div>
-            {isAdmin && (
-              <div className="project-action-row">
-                <button
-                  className={actionButtonClass("project-save", "primary-button")}
-                  type="button"
-                  onClick={() => runProjectAction("project-save", saveDraft)}
-                >
-                  프로젝트 저장
-                </button>
-                <button
-                  className={actionButtonClass("project-delete", "secondary-button")}
-                  disabled={!draft.id}
-                  type="button"
-                  onClick={() => runProjectAction("project-delete", deleteSelectedProject)}
-                >
-                  프로젝트 삭제
-                </button>
+            <dl className="project-detail-list">
+              <div>
+                <dt>분야</dt>
+                <dd>{selectedProject?.discipline || "미지정"}</dd>
               </div>
-            )}
+              <div>
+                <dt>설명</dt>
+                <dd>{selectedProject?.description || "설명 없음"}</dd>
+              </div>
+              <div>
+                <dt>연결 상태</dt>
+                <dd>{numberLabel(linkedModels.length)}개 IFC 모델 / {numberLabel(linkedPacks.length)}개 팩</dd>
+              </div>
+            </dl>
           </div>
 
-          <div>
+          <div className="project-linked-summary">
             <div className="panel-header slim">
               <div>
-                <h2>팩 연결</h2>
-                <span>프로젝트와 온톨로지 팩 연결을 관리합니다</span>
+                <h2>연결 현황</h2>
+                <span>선택한 프로젝트에 연결된 모델과 팩입니다</span>
               </div>
-              {isAdmin && (
-                <button
-                  className={actionButtonClass("pack-links-save")}
-                  type="button"
-                  disabled={!draft.id}
-                  onClick={() => runProjectAction("pack-links-save", savePackLinksOnly)}
-                >
-                  연결 저장
-                </button>
-              )}
+              <GitBranch size={19} />
             </div>
-            <div className="pack-list">
-              {packs.map((pack) => {
+            <div className="linked-summary-columns">
+              <div>
+                <strong>IFC 모델</strong>
+                <div className="mini-list">
+                  {linkedModels.length ? linkedModels.map((model) => (
+                    <span key={model.id}>{model.filename}</span>
+                  )) : <em>연결된 IFC 모델 없음</em>}
+                </div>
+              </div>
+              <div>
+                <strong>팩</strong>
+                <div className="mini-list">
+                  {linkedPacks.length ? linkedPacks.map((pack) => (
+                    <button key={pack.id} type="button" onClick={() => onOpenPack(pack.id)}>{pack.title}</button>
+                  )) : <em>연결된 팩 없음</em>}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="project-panel project-connection-panel">
+        <div className="panel-header slim">
+          <div>
+            <h2>모델 / 팩 연결 편집</h2>
+            <span>업로드된 모든 IFC 모델과 팩을 프로젝트에 연결합니다</span>
+          </div>
+          {isAdmin && (
+            <button
+              className={actionButtonClass("connections-save")}
+              disabled={!selectedProject || !connectionDirty}
+              type="button"
+              onClick={() => runProjectAction("connections-save", saveConnections)}
+            >
+              연결 저장
+            </button>
+          )}
+        </div>
+        <div className="project-connection-grid">
+          <div className="connection-list-panel">
+            <div className="connection-list-title">
+              <strong>IFC 모델</strong>
+              <span>{numberLabel(ifcModels.length)}개 업로드됨</span>
+            </div>
+            <div className="connection-scroll-list">
+              {ifcModels.length ? ifcModels.map((model) => {
+                const linked = Boolean(selectedProject && (ifcDraftLinks[model.id] ?? null) === selectedProject.id);
+                return (
+                  <div className={linked ? "connection-row active" : "connection-row"} key={model.id}>
+                    <Database size={18} />
+                    <span>
+                      <strong>{model.filename}</strong>
+                      <em>{model.projectName ? `현재 연결: ${model.projectName}` : "미연결"}</em>
+                    </span>
+                    <input
+                      checked={linked}
+                      disabled={!isAdmin || !selectedProject}
+                      type="checkbox"
+                      onChange={() => toggleDraftIfc(model.id)}
+                    />
+                  </div>
+                );
+              }) : <p className="empty-list-note">업로드된 IFC 모델이 없습니다.</p>}
+            </div>
+          </div>
+
+          <div className="connection-list-panel">
+            <div className="connection-list-title">
+              <strong>팩</strong>
+              <span>{numberLabel(packs.length)}개 업로드됨</span>
+            </div>
+            <div className="connection-scroll-list">
+              {packs.length ? packs.map((pack) => {
                 const linked = draft.packIds.includes(pack.id);
                 return (
-                <div className={linked ? "pack-row editable active" : "pack-row editable"} key={pack.id}>
-                  <FileArchive size={19} />
-                  <div>
-                    <strong>{pack.title}</strong>
-                    <span>{pack.filename} / {numberLabel(pack.counts.edges)}개 엣지</span>
+                  <div className={linked ? "connection-row active" : "connection-row"} key={pack.id}>
+                    <FileArchive size={18} />
+                    <span>
+                      <strong>{pack.title}</strong>
+                      <em>{pack.filename} / {numberLabel(pack.counts.edges)}개 엣지</em>
+                    </span>
+                    <input
+                      checked={linked}
+                      disabled={!isAdmin || !selectedProject}
+                      type="checkbox"
+                      onChange={() => toggleDraftPack(pack.id)}
+                    />
+                    <button type="button" onClick={(event) => {
+                      event.preventDefault();
+                      onOpenPack(pack.id);
+                    }}>
+                      열기
+                    </button>
                   </div>
-                  <em>{numberLabel(pack.counts.nodes)}</em>
-                  <input
-                    checked={linked}
-                    disabled={!isAdmin}
-                    type="checkbox"
-                    onChange={() => toggleDraftPack(pack.id)}
-                  />
-                  <button type="button" onClick={() => onOpenPack(pack.id)}>열기</button>
-                </div>
                 );
-              })}
+              }) : <p className="empty-list-note">업로드된 팩이 없습니다.</p>}
             </div>
           </div>
         </div>
       </div>
     </section>
+
+    {dialogMode && createPortal(
+      <div className="confirm-overlay" role="presentation" onMouseDown={() => setDialogMode(null)}>
+        <section
+          aria-modal="true"
+          className="project-dialog"
+          role="dialog"
+          onMouseDown={(event) => event.stopPropagation()}
+        >
+          <div className="panel-header slim">
+            <div>
+              <h2>{dialogMode === "add" ? "프로젝트 추가" : "프로젝트 편집"}</h2>
+              <span>프로젝트 기본 정보만 편집합니다</span>
+            </div>
+            <FolderKanban size={19} />
+          </div>
+          <div className="project-form-grid">
+            <label>
+              프로젝트명
+              <input
+                autoFocus
+                value={dialogDraft.name}
+                onChange={(event) => setDialogDraft({ ...dialogDraft, name: event.target.value })}
+              />
+            </label>
+            <label>
+              회사
+              <input
+                value={dialogDraft.company}
+                onChange={(event) => setDialogDraft({ ...dialogDraft, company: event.target.value })}
+              />
+            </label>
+            <label>
+              관리자
+              <input
+                value={dialogDraft.manager}
+                onChange={(event) => setDialogDraft({ ...dialogDraft, manager: event.target.value })}
+              />
+            </label>
+            <label>
+              분야
+              <input
+                value={dialogDraft.discipline}
+                onChange={(event) => setDialogDraft({ ...dialogDraft, discipline: event.target.value })}
+              />
+            </label>
+            <label className="full">
+              설명
+              <textarea
+                value={dialogDraft.description}
+                onChange={(event) => setDialogDraft({ ...dialogDraft, description: event.target.value })}
+              />
+            </label>
+          </div>
+          <div className="project-action-row">
+            <button className="secondary-button" type="button" onClick={() => setDialogMode(null)}>
+              취소
+            </button>
+            <button
+              className={actionButtonClass("project-save", "primary-button")}
+              disabled={!dialogDraft.name.trim()}
+              type="button"
+              onClick={() => runProjectAction("project-save", saveDialogDraft)}
+            >
+              프로젝트 저장
+            </button>
+          </div>
+        </section>
+      </div>,
+      document.body,
+    )}
+    </>
   );
 }
 

@@ -284,6 +284,11 @@ class ProjectPackRequest(BaseModel):
     pack_ids: list[str] = []
 
 
+class IfcModelLinkRequest(BaseModel):
+    model_id: str
+    project_id: str | None = None
+
+
 def _safe_upload_filename(filename: str, allowed_suffixes: set[str]) -> str:
     safe_name = Path(filename.replace("\\", "/")).name.strip()
     if not safe_name:
@@ -295,6 +300,87 @@ def _safe_upload_filename(filename: str, allowed_suffixes: set[str]) -> str:
 
 def _ifc_metadata_filename(filename: str) -> str:
     return f"{Path(filename).stem}.metadata.json"
+
+
+def _read_ifc_metadata(metadata_path: Path) -> dict[str, Any] | None:
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    project_folder = metadata_path.parent.parent.name if metadata_path.parent.name == "metadata" else metadata_path.parent.name
+    filename = str(metadata.get("filename") or metadata_path.name.removesuffix(".metadata.json"))
+    return {
+        "id": f"{project_folder}/{metadata_path.name}",
+        "filename": filename,
+        "projectId": metadata.get("projectId"),
+        "projectName": metadata.get("projectName"),
+        "sizeBytes": metadata.get("sizeBytes"),
+        "uploadedAt": metadata.get("uploadedAt"),
+        "storage": metadata.get("storage", "local"),
+        "localPath": metadata.get("localPath"),
+        "metadataPath": str(metadata_path),
+    }
+
+
+def list_ifc_models() -> list[dict[str, Any]]:
+    if not IFC_UPLOAD_DIR.exists():
+        return []
+    models: list[dict[str, Any]] = []
+    metadata_paths = {*IFC_UPLOAD_DIR.glob("*/*.metadata.json"), *IFC_UPLOAD_DIR.glob("*/metadata/*.metadata.json")}
+    for metadata_path in sorted(metadata_paths):
+        metadata = _read_ifc_metadata(metadata_path)
+        if metadata:
+            models.append(metadata)
+    return models
+
+
+def _find_ifc_metadata_path(model_id: str) -> Path:
+    safe_id = model_id.replace("\\", "/").strip("/")
+    if not safe_id or "/" not in safe_id:
+        raise FileNotFoundError(model_id)
+    project_folder, metadata_name = safe_id.split("/", 1)
+    base_dir = IFC_UPLOAD_DIR / Path(project_folder).name
+    metadata_filename = Path(metadata_name).name
+    for metadata_path in (base_dir / "metadata" / metadata_filename, base_dir / metadata_filename):
+        if metadata_path.exists():
+            return metadata_path
+    raise FileNotFoundError(model_id)
+
+
+def assign_ifc_model_to_project(model_id: str, project_id: str | None) -> dict[str, Any]:
+    metadata_path = _find_ifc_metadata_path(model_id)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
+    filename = _safe_upload_filename(str(metadata.get("filename") or "model.ifc"), {".ifc", ".ifczip", ".zip"})
+    target_project_id = (project_id or "").strip() or "_unassigned"
+    project = None
+    if target_project_id != "_unassigned":
+        project = next((item for item in list_projects() if item["id"] == target_project_id), None)
+        if not project:
+            raise KeyError(target_project_id)
+
+    default_file_dir = metadata_path.parent.parent / "files" if metadata_path.parent.name == "metadata" else metadata_path.parent
+    source_file = Path(str(metadata.get("localPath") or default_file_dir / filename))
+    target_dir = IFC_UPLOAD_DIR / target_project_id
+    target_file = target_dir / "files" / filename
+    target_metadata_path = target_dir / "metadata" / _ifc_metadata_filename(filename)
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_metadata_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if source_file.exists() and source_file.resolve() != target_file.resolve():
+        os.replace(source_file, target_file)
+    metadata_path.unlink(missing_ok=True)
+
+    metadata.update(
+        {
+            "projectId": None if target_project_id == "_unassigned" else target_project_id,
+            "projectName": project.get("name") if project else None,
+            "localPath": str(target_file),
+        }
+    )
+    target_metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    return _read_ifc_metadata(target_metadata_path) or {}
 
 
 async def _write_upload_file_with_limit(file: UploadFile, target: Path, *, max_bytes: int) -> int:
@@ -919,6 +1005,41 @@ async def upload_ifc_model(
         "metadata": metadata,
         "writeBack": write_back,
     }
+
+
+@app.get("/api/ifc/models")
+def ifc_models(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    ensure_runtime_storage()
+    user = current_user(authorization)
+    models = list_ifc_models()
+    if not user or is_internal_user(user):
+        return models
+    allowed_project_ids = set(get_company_project_access(user.company))
+    return [model for model in models if model.get("projectId") in allowed_project_ids]
+
+
+@app.post("/api/admin/ifc/models/link")
+def admin_link_ifc_model(
+    request: IfcModelLinkRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_admin(authorization)
+    ensure_runtime_storage()
+    try:
+        model = assign_ifc_model_to_project(request.model_id, request.project_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"IFC model not found: {request.model_id}") from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Project not found: {request.project_id}") from exc
+    write_back: dict[str, Any] = {}
+    if google_drive_sync_enabled():
+        metadata_path = Path(str(model.get("metadataPath", "")))
+        file_path = Path(str(model.get("localPath", "")))
+        if file_path.exists():
+            write_back["file"] = write_back_ifc_file(file_path, model.get("projectId") or "_unassigned")
+        if metadata_path.exists():
+            write_back["metadata"] = write_back_ifc_metadata_file(metadata_path, model.get("projectId") or "_unassigned")
+    return {"model": model, "models": list_ifc_models(), "writeBack": write_back}
 
 
 @app.post("/api/query")

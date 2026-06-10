@@ -174,6 +174,24 @@ def test_ifc_upload_stores_project_file_for_admin(monkeypatch, tmp_path) -> None
     assert metadata["storage"] == "local"
     assert invalid.status_code == 400
 
+    listed = client.get("/api/ifc/models", headers=headers)
+    assert listed.status_code == 200
+    model = listed.json()[0]
+    assert model["id"] == "samcheok-building-b/sample.metadata.json"
+    assert model["filename"] == "sample.ifc"
+
+    linked = client.post(
+        "/api/admin/ifc/models/link",
+        headers=headers,
+        json={"model_id": model["id"], "project_id": "yeoju-modular-dormitory"},
+    )
+    assert linked.status_code == 200
+    linked_model = linked.json()["model"]
+    assert linked_model["projectId"] == "yeoju-modular-dormitory"
+    assert linked_model["projectName"] == "Yeoju Modular Dormitory"
+    assert (tmp_path / "ifc" / "yeoju-modular-dormitory" / "files" / "sample.ifc").read_bytes() == b"ISO-10303-21;"
+    assert (tmp_path / "ifc" / "yeoju-modular-dormitory" / "metadata" / "sample.metadata.json").exists()
+
 
 def test_ifc_drive_write_back_creates_project_folders(monkeypatch, tmp_path) -> None:
     class FakeDriveClient:
