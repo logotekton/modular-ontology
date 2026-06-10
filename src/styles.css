@@ -40,6 +40,19 @@ button {
   cursor: pointer;
 }
 
+button:not(:disabled) {
+  transition:
+    transform 120ms ease,
+    box-shadow 180ms ease,
+    border-color 180ms ease,
+    background-color 180ms ease,
+    color 180ms ease;
+}
+
+button:not(:disabled):active {
+  transform: translateY(1px) scale(0.985);
+}
+
 .app-shell {
   display: grid;
   grid-template-columns: 256px minmax(0, 1fr);
@@ -1916,6 +1929,52 @@ dd {
   font-size: 12px;
   font-weight: 900;
   padding: 8px 10px;
+}
+
+.action-feedback-button {
+  position: relative;
+  overflow: hidden;
+  transform-origin: center;
+  will-change: transform, box-shadow;
+}
+
+.action-feedback-button:not(:disabled):focus-visible {
+  outline: 0;
+  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.18);
+}
+
+.action-feedback-button.is-confirming:not(:disabled) {
+  animation: action-button-confirm 460ms ease-out;
+  border-color: #14b8a6;
+  box-shadow: 0 0 0 3px rgba(20, 184, 166, 0.16);
+}
+
+.action-feedback-button.is-confirming:not(:disabled)::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
+  transform: translateX(-120%);
+  animation: action-button-sheen 460ms ease-out;
+  pointer-events: none;
+}
+
+@keyframes action-button-confirm {
+  0% {
+    transform: translateY(1px) scale(0.985);
+  }
+  45% {
+    transform: translateY(0) scale(1.025);
+  }
+  100% {
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes action-button-sheen {
+  to {
+    transform: translateX(120%);
+  }
 }
 
 .project-card-list {

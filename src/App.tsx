@@ -1737,6 +1737,7 @@ function ProjectsView({
   const [selectedProjectId, setSelectedProjectId] = useState(projects[0]?.id ?? "");
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? projects[0];
   const [draft, setDraft] = useState<ProjectForm>(emptyForm);
+  const [pressedAction, setPressedAction] = useState("");
 
   useEffect(() => {
     if (!projects.length) {
@@ -1764,6 +1765,23 @@ function ProjectsView({
       packIds: selectedProject.packIds,
     });
   }, [selectedProject?.id]);
+
+  function showActionFeedback(action: string) {
+    setPressedAction("");
+    window.setTimeout(() => setPressedAction(action), 0);
+    window.setTimeout(() => {
+      setPressedAction((current) => (current === action ? "" : current));
+    }, 460);
+  }
+
+  function actionButtonClass(action: string, baseClass = "") {
+    return `${baseClass ? `${baseClass} ` : ""}action-feedback-button${pressedAction === action ? " is-confirming" : ""}`;
+  }
+
+  function runProjectAction(action: string, callback: () => void) {
+    showActionFeedback(action);
+    callback();
+  }
 
   function newProject() {
     setSelectedProjectId("");
@@ -1808,7 +1826,15 @@ function ProjectsView({
             <h2>프로젝트</h2>
             <span>{projects.length}개 관리형 프로젝트</span>
           </div>
-          {isAdmin && <button type="button" onClick={newProject}>프로젝트 추가</button>}
+          {isAdmin && (
+            <button
+              className={actionButtonClass("project-add")}
+              type="button"
+              onClick={() => runProjectAction("project-add", newProject)}
+            >
+              프로젝트 추가
+            </button>
+          )}
         </div>
         <div className="project-card-list">
           {projects.map((project) => {
@@ -1885,8 +1911,19 @@ function ProjectsView({
             </div>
             {isAdmin && (
               <div className="project-action-row">
-                <button className="primary-button" type="button" onClick={saveDraft}>프로젝트 저장</button>
-                <button className="secondary-button" disabled={!draft.id} type="button" onClick={deleteSelectedProject}>
+                <button
+                  className={actionButtonClass("project-save", "primary-button")}
+                  type="button"
+                  onClick={() => runProjectAction("project-save", saveDraft)}
+                >
+                  프로젝트 저장
+                </button>
+                <button
+                  className={actionButtonClass("project-delete", "secondary-button")}
+                  disabled={!draft.id}
+                  type="button"
+                  onClick={() => runProjectAction("project-delete", deleteSelectedProject)}
+                >
                   프로젝트 삭제
                 </button>
               </div>
@@ -1899,7 +1936,16 @@ function ProjectsView({
                 <h2>팩 연결</h2>
                 <span>프로젝트와 온톨로지 팩 연결을 관리합니다</span>
               </div>
-              {isAdmin && <button type="button" disabled={!draft.id} onClick={savePackLinksOnly}>연결 저장</button>}
+              {isAdmin && (
+                <button
+                  className={actionButtonClass("pack-links-save")}
+                  type="button"
+                  disabled={!draft.id}
+                  onClick={() => runProjectAction("pack-links-save", savePackLinksOnly)}
+                >
+                  연결 저장
+                </button>
+              )}
             </div>
             <div className="pack-list">
               {packs.map((pack) => {
