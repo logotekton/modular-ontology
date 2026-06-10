@@ -1640,7 +1640,7 @@ function MetricsStrip({
       <Metric icon={Building2} label="회사명" value={currentUser?.company || "미지정"} />
       <Metric icon={FolderKanban} label="프로젝트" value={numberLabel(projects.length)} />
       <Metric icon={Database} label="IFC 모델" value={numberLabel(ifcModels.length)} />
-      <Metric icon={FileArchive} label="온톨로지 팩" value={numberLabel(packs.length)} tone="green" />
+      <Metric icon={FileArchive} label="온톨로지 팩" value={numberLabel(packs.length)} />
     </section>
   );
 }
@@ -1656,36 +1656,8 @@ function DashboardView({
   onGoToTab: (tab: string) => void;
   onOpenPack: (packId: string) => void;
 }) {
-  const visiblePackIds = new Set(projects.flatMap((project) => project.packIds));
-  const scopedPacks = packs.filter((pack) => visiblePackIds.size === 0 || visiblePackIds.has(pack.id));
-  const scopedStats = scopedPacks.reduce(
-    (stats, pack) => ({
-      documents: stats.documents + (pack.counts.documents ?? 0),
-      nodes: stats.nodes + (pack.counts.nodes ?? 0),
-      edges: stats.edges + (pack.counts.edges ?? 0),
-    }),
-    { documents: 0, nodes: 0, edges: 0 }
-  );
-  const scopedCompanyCount = new Set(projects.map((project) => project.company).filter(Boolean)).size;
-
   return (
     <section className="dashboard-grid">
-      <div className="overview-panel wide">
-        <div className="panel-header slim">
-          <div>
-            <h2>운영 현황</h2>
-            <span>현재 계정에 할당된 프로젝트와 온톨로지 팩 기준</span>
-          </div>
-          <Activity size={19} />
-        </div>
-        <div className="status-grid">
-          <StatusTile icon={FolderKanban} label="할당 프로젝트" value={numberLabel(projects.length)} />
-          <StatusTile icon={FileArchive} label="할당 팩" value={numberLabel(scopedPacks.length)} />
-          <StatusTile icon={FileArchive} label="문서" value={numberLabel(scopedStats.documents)} />
-          <StatusTile icon={Waypoints} label="관계 엣지" value={numberLabel(scopedStats.edges)} />
-        </div>
-      </div>
-
       <div className="overview-panel">
         <div className="panel-header slim">
           <div>
@@ -1721,22 +1693,6 @@ function DashboardView({
           ))}
         </div>
 
-      </div>
-
-      <div className="overview-panel wide">
-        <div className="panel-header slim">
-          <div>
-            <h2>할당 범위</h2>
-            <span>회사, 프로젝트, 팩 단위로 권한이 제한됩니다</span>
-          </div>
-          <ShieldCheck size={19} />
-        </div>
-        <div className="status-grid">
-          <StatusTile icon={Building2} label="회사" value={numberLabel(scopedCompanyCount)} />
-          <StatusTile icon={FolderKanban} label="프로젝트" value={numberLabel(projects.length)} />
-          <StatusTile icon={FileArchive} label="팩" value={numberLabel(scopedPacks.length)} />
-          <StatusTile icon={Waypoints} label="노드" value={numberLabel(scopedStats.nodes)} />
-        </div>
       </div>
     </section>
   );
