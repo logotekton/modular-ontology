@@ -1235,7 +1235,6 @@ function App() {
             selectedPackId={selectedPackId}
             onConfirm={confirmAction}
             onDeleteProject={deleteProject}
-            onOpenPack={selectPackForGraph}
             onSaveProject={saveProject}
             onSetIfcModelProject={setIfcModelProject}
             onSetProjectPacks={setProjectPacks}
@@ -1249,7 +1248,6 @@ function App() {
             projects={projects}
             selectedPackId={selectedPackId}
             uploadProjectTarget={uploadProjectTarget}
-            onOpenPack={selectPackForGraph}
             onReindex={reindexPacks}
             onUploadIfc={uploadIfc}
             onUploadProjectTargetChange={setUploadProjectTarget}
@@ -1748,7 +1746,6 @@ function ProjectsView({
   projects,
   onConfirm,
   onDeleteProject,
-  onOpenPack,
   onSaveProject,
   onSetIfcModelProject,
   onSetProjectPacks,
@@ -1760,7 +1757,6 @@ function ProjectsView({
   selectedPackId: string;
   onConfirm: (options: ConfirmDialogOptions) => void;
   onDeleteProject: (projectId: string) => void;
-  onOpenPack: (packId: string) => void;
   onSaveProject: (form: ProjectForm) => Promise<void> | void;
   onSetIfcModelProject: (modelId: string, projectId: string | null) => Promise<void> | void;
   onSetProjectPacks: (projectId: string, packIds: string[]) => Promise<void> | void;
@@ -1962,7 +1958,7 @@ function ProjectsView({
               >
                 <strong>{project.name}</strong>
                 <span>{project.company || "회사 미지정"} / {project.discipline || "분야 미지정"}</span>
-                <em>{projectModels.length}개 IFC / {projectPacks.length}개 팩</em>
+                <em>{projectModels.length}개 IFC / {projectPacks.length}개 온톨로지 팩</em>
               </button>
             );
           })}
@@ -1990,19 +1986,12 @@ function ProjectsView({
               </div>
               <div>
                 <dt>연결 상태</dt>
-                <dd>{numberLabel(linkedModels.length)}개 IFC 모델 / {numberLabel(linkedPacks.length)}개 팩</dd>
+                <dd>{numberLabel(linkedModels.length)}개 IFC 모델 / {numberLabel(linkedPacks.length)}개 온톨로지 팩</dd>
               </div>
             </dl>
           </div>
 
           <div className="project-linked-summary">
-            <div className="panel-header slim">
-              <div>
-                <h2>연결 현황</h2>
-                <span>선택한 프로젝트에 연결된 모델과 팩입니다</span>
-              </div>
-              <GitBranch size={19} />
-            </div>
             <div className="linked-summary-columns">
               <div>
                 <strong>IFC 모델</strong>
@@ -2013,11 +2002,11 @@ function ProjectsView({
                 </div>
               </div>
               <div>
-                <strong>팩</strong>
+                <strong>온톨로지 팩</strong>
                 <div className="mini-list">
                   {linkedPacks.length ? linkedPacks.map((pack) => (
-                    <button key={pack.id} type="button" onClick={() => onOpenPack(pack.id)}>{pack.title}</button>
-                  )) : <em>연결된 팩 없음</em>}
+                    <span key={pack.id}>{pack.title}</span>
+                  )) : <em>연결된 온톨로지 팩 없음</em>}
                 </div>
               </div>
             </div>
@@ -2028,8 +2017,8 @@ function ProjectsView({
       <div className="project-panel project-connection-panel">
         <div className="panel-header slim">
           <div>
-            <h2>모델 / 팩 연결 편집</h2>
-            <span>업로드된 모든 IFC 모델과 팩을 프로젝트에 연결합니다</span>
+            <h2>모델 / 온톨로지 팩 연결 편집</h2>
+            <span>업로드된 모든 IFC 모델과 온톨로지 팩을 프로젝트에 연결합니다</span>
           </div>
           {isAdmin && (
             <button
@@ -2072,7 +2061,7 @@ function ProjectsView({
 
           <div className="connection-list-panel">
             <div className="connection-list-title">
-              <strong>팩</strong>
+              <strong>온톨로지 팩</strong>
               <span>{numberLabel(packs.length)}개 업로드됨</span>
             </div>
             <div className="connection-scroll-list">
@@ -2091,15 +2080,9 @@ function ProjectsView({
                       type="checkbox"
                       onChange={() => toggleDraftPack(pack.id)}
                     />
-                    <button type="button" onClick={(event) => {
-                      event.preventDefault();
-                      onOpenPack(pack.id);
-                    }}>
-                      열기
-                    </button>
                   </div>
                 );
-              }) : <p className="empty-list-note">업로드된 팩이 없습니다.</p>}
+              }) : <p className="empty-list-note">업로드된 온톨로지 팩이 없습니다.</p>}
             </div>
           </div>
         </div>
@@ -2186,7 +2169,6 @@ function OntologyPacksView({
   projects,
   selectedPackId,
   uploadProjectTarget,
-  onOpenPack,
   onReindex,
   onUploadIfc,
   onUploadProjectTargetChange,
@@ -2197,7 +2179,6 @@ function OntologyPacksView({
   projects: Project[];
   selectedPackId: string;
   uploadProjectTarget: UploadProjectTarget;
-  onOpenPack: (packId: string) => void;
   onReindex: () => void;
   onUploadIfc: (file: File | undefined, projectId: string) => void;
   onUploadProjectTargetChange: (target: UploadProjectTarget) => void;
@@ -2364,10 +2345,9 @@ function OntologyPacksView({
           {packs.map((pack) => {
             const projectName = projectByPackId.get(pack.id) ?? "미지정";
             return (
-              <button
+              <div
                 className={pack.id === selectedPackId ? "pack-table-row active" : "pack-table-row"}
                 key={pack.id}
-                onClick={() => onOpenPack(pack.id)}
               >
                 <strong>{pack.title}</strong>
                 <span>{projectName}</span>
@@ -2375,7 +2355,7 @@ function OntologyPacksView({
                 <span>{numberLabel(pack.counts.nodes)}개 노드</span>
                 <span>{numberLabel(pack.counts.edges)}개 엣지</span>
                 <em>{validationLabel(pack.validationStatus)}</em>
-              </button>
+              </div>
             );
           })}
         </div>
