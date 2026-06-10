@@ -224,7 +224,7 @@ type AppTab = (typeof nav)[number]["label"];
 const DEFAULT_TAB: AppTab = "Dashboard";
 
 const ROUTE_BY_TAB: Record<AppTab, string> = {
-  Dashboard: "/dashboard",
+  Dashboard: "/home",
   Projects: "/projects",
   "Graph Explorer": "/graph",
   "Model Explorer": "/model-explorer",
