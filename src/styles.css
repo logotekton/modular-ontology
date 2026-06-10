@@ -2106,8 +2106,10 @@ dd {
 .project-status-grid {
   display: grid;
   grid-template-columns: minmax(280px, 0.9fr) minmax(0, 1.1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   align-items: stretch;
-  gap: 16px;
+  column-gap: 16px;
+  row-gap: 0;
   min-height: 204px;
 }
 
@@ -2118,20 +2120,22 @@ dd {
 
 .project-status-copy {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: subgrid;
+  grid-row: 1 / 3;
 }
 
 .project-linked-summary {
   display: grid;
-  grid-template-rows: minmax(0, 1fr);
+  grid-template-rows: subgrid;
+  grid-row: 1 / 3;
   align-content: stretch;
   height: 100%;
   min-height: 0;
-  padding-top: 17px;
 }
 
 .project-detail-list {
   display: grid;
+  grid-auto-rows: minmax(38px, 1fr);
   gap: 8px;
   margin: 0;
   min-height: 0;
@@ -2166,6 +2170,7 @@ dd {
 
 .linked-summary-columns {
   display: grid;
+  grid-row: 2;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
   height: 100%;
@@ -2175,13 +2180,11 @@ dd {
 
 .linked-summary-columns > div {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  gap: 8px;
   min-width: 0;
   min-height: 0;
 }
 
-.linked-summary-columns > div > strong,
+.mini-list > strong,
 .connection-list-title strong {
   color: #0f172a;
   font-size: 13px;
@@ -2202,6 +2205,11 @@ dd {
   background: #f8fbff;
   padding: 9px;
   scrollbar-gutter: stable;
+}
+
+.mini-list > strong {
+  display: block;
+  padding-bottom: 2px;
 }
 
 .mini-list span,
@@ -3445,6 +3453,20 @@ dd {
   .project-form-grid,
   .linked-summary-columns {
     grid-template-columns: 1fr;
+  }
+
+  .project-status-grid {
+    grid-template-rows: none;
+  }
+
+  .project-status-copy,
+  .project-linked-summary {
+    grid-row: auto;
+    grid-template-rows: none;
+  }
+
+  .linked-summary-columns {
+    grid-row: auto;
   }
 
   .project-status-panel,

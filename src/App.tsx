@@ -1987,16 +1987,16 @@ function ProjectsView({
           <div className="project-linked-summary">
             <div className="linked-summary-columns">
               <div>
-                <strong>IFC 모델</strong>
                 <div className="mini-list">
+                  <strong>IFC 모델</strong>
                   {linkedModels.length ? linkedModels.map((model) => (
                     <span key={model.id}>{model.filename}</span>
                   )) : <em>연결된 IFC 모델 없음</em>}
                 </div>
               </div>
               <div>
-                <strong>온톨로지 팩</strong>
                 <div className="mini-list">
+                  <strong>온톨로지 팩</strong>
                   {linkedPacks.length ? linkedPacks.map((pack) => (
                     <span key={pack.id}>{pack.title}</span>
                   )) : <em>연결된 온톨로지 팩 없음</em>}
