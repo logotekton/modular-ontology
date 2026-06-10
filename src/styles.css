@@ -415,6 +415,7 @@ nav {
   flex-direction: column;
   gap: 18px;
   min-width: 0;
+  min-height: 100vh;
   padding: 22px;
 }
 
@@ -1937,7 +1938,10 @@ dd {
 .project-management-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-rows: auto minmax(0, 1fr);
   gap: 14px;
+  flex: 1;
+  min-height: 0;
 }
 
 .project-list-panel {
@@ -1958,6 +1962,10 @@ dd {
 
 .project-connection-panel {
   grid-column: 1 / -1;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
 }
 
 .project-list-panel,
@@ -2218,12 +2226,13 @@ dd {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
   margin-top: 12px;
+  min-height: 0;
 }
 
 .connection-list-panel {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  min-height: 260px;
+  min-height: 0;
   min-width: 0;
   overflow: hidden;
   border: 1px solid #e1eaf2;
@@ -2254,7 +2263,7 @@ dd {
   align-content: start;
   gap: 8px;
   min-height: 0;
-  max-height: 310px;
+  height: 100%;
   overflow-x: hidden;
   overflow-y: auto;
   padding-right: 4px;
