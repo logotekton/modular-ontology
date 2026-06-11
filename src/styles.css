@@ -2092,8 +2092,7 @@ dd {
 }
 
 .project-list-panel .panel-header button,
-.project-editor-panel .panel-header button,
-.project-connection-panel .panel-header button {
+.project-editor-panel .panel-header button {
   border: 1px solid #a7e4d7;
   border-radius: 8px;
   background: #effcf8;
@@ -2437,12 +2436,6 @@ dd {
   font-size: 11px;
   font-style: normal;
   font-weight: 750;
-}
-
-.connection-row input {
-  width: 16px;
-  height: 16px;
-  accent-color: #0f766e;
 }
 
 .empty-list-note {

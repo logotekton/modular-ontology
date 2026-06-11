@@ -4,6 +4,7 @@ import base64
 import json
 import mimetypes
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -42,6 +43,7 @@ LEGACY_DATABASE_FILENAME = "mod" + "dular_" + "graph.sqlite3"
 PROJECT_IFC_FOLDER = "ifc-models"
 PROJECT_PACKS_FOLDER = "ontology-packs"
 PROJECT_PACK_LINKS_FILENAME = ".drive-project-pack-links.json"
+PROJECT_FOLDERS_FILENAME = ".drive-project-folders.json"
 _DB_SYNC_LOCK = threading.Lock()
 
 
@@ -365,6 +367,7 @@ def sync_google_drive_storage(
         _write_project_pack_links(data_dir, project_pack_links)
     else:
         _write_project_pack_links(data_dir, {})
+        _write_project_folders(data_dir, [])
         missing.append(PROJECTS_FOLDER)
 
     pack_roots = [
@@ -727,12 +730,21 @@ def _download_project_assets(
 ) -> tuple[list[str], dict[str, list[str]]]:
     downloaded: list[str] = []
     project_pack_links: dict[str, list[str]] = {}
+    project_folders: list[dict[str, str]] = []
     for project in client.list_children(projects_folder_id):
         if not project.is_folder:
             continue
         project_id = _safe_drive_filename_or_none(project.name, warnings, f"{PROJECTS_FOLDER} project folder")
         if not project_id:
             continue
+        project_folders.append(
+            {
+                "folderId": project.id,
+                "projectId": project_id,
+                "name": project.name,
+                "modifiedTime": project.modified_time,
+            }
+        )
         project_children = _children_by_name(client, project.id)
         metadata_folder = project_children.get("metadata")
         existing_metadata_names: set[str] = set()
@@ -779,7 +791,28 @@ def _download_project_assets(
             )
             downloaded.extend(pack_downloads)
             project_pack_links[project_id] = [_pack_id_from_zip(Path(path)) for path in pack_downloads]
+    _write_project_folders(data_dir, project_folders)
+    _prune_removed_project_assets(data_dir, {item["projectId"] for item in project_folders})
     return downloaded, project_pack_links
+
+
+def _prune_removed_project_assets(data_dir: Path, active_project_ids: set[str]) -> None:
+    ifc_root = data_dir / IFC_MODELS_FOLDER
+    if ifc_root.exists():
+        for project_dir in ifc_root.iterdir():
+            if not project_dir.is_dir() or project_dir.name in active_project_ids:
+                continue
+            metadata_dir = project_dir / "metadata"
+            metadata_files = list(metadata_dir.glob("*.metadata.json")) if metadata_dir.exists() else list(project_dir.glob("*.metadata.json"))
+            if metadata_files and all(_is_project_metadata_file(path) for path in metadata_files):
+                shutil.rmtree(project_dir, ignore_errors=True)
+
+    indexed_dir = data_dir / ONTOLOGY_PACKS_FOLDER / "indexed"
+    if indexed_dir.exists():
+        for pack_path in indexed_dir.glob("*.zip"):
+            project_id, separator, _pack_name = pack_path.name.partition("__")
+            if separator and project_id not in active_project_ids:
+                pack_path.unlink(missing_ok=True)
 
 
 def _register_ifc_files_from_drive_folder(
@@ -910,6 +943,15 @@ def _write_project_pack_links(data_dir: Path, project_pack_links: dict[str, list
         return
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps(project_pack_links, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _write_project_folders(data_dir: Path, project_folders: list[dict[str, str]]) -> None:
+    marker = data_dir / PROJECTS_FOLDER / PROJECT_FOLDERS_FILENAME
+    if not project_folders:
+        marker.unlink(missing_ok=True)
+        return
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps(project_folders, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _drive_time_to_epoch(value: str) -> float | None:

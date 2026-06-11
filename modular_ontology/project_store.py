@@ -29,6 +29,7 @@ def init_project_db(conn: sqlite3.Connection) -> None:
           discipline TEXT NOT NULL DEFAULT '',
           description TEXT NOT NULL DEFAULT '',
           role TEXT NOT NULL DEFAULT 'Admin',
+          drive_folder_id TEXT,
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -43,6 +44,9 @@ def init_project_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_project_packs_pack ON project_packs(pack_id);
         """
     )
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(projects)").fetchall()}
+    if "drive_folder_id" not in columns:
+        conn.execute("ALTER TABLE projects ADD COLUMN drive_folder_id TEXT")
     conn.commit()
 
 
@@ -136,7 +140,7 @@ def list_projects(packs: list[dict[str, Any]], db_path: Path | None = None) -> l
         init_project_db(conn)
         rows = conn.execute(
             """
-            SELECT id, name, company, manager, discipline, description, role
+            SELECT id, name, company, manager, discipline, description, role, drive_folder_id
             FROM projects
             ORDER BY created_at ASC, name ASC
             """
@@ -158,6 +162,7 @@ def list_projects(packs: list[dict[str, Any]], db_path: Path | None = None) -> l
             "discipline": row["discipline"],
             "description": row["description"],
             "role": row["role"],
+            "driveFolderId": row["drive_folder_id"],
             "packIds": [pack_id for pack_id in pack_ids_by_project.get(row["id"], []) if pack_id in valid_pack_ids],
         }
         for row in rows
@@ -189,10 +194,10 @@ def create_project(
         with conn:
             conn.execute(
                 """
-                INSERT INTO projects (id, name, company, manager, discipline, description)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO projects (id, name, company, manager, discipline, description, drive_folder_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (project_id, clean_name, company.strip(), manager.strip(), discipline.strip(), description.strip()),
+                (project_id, clean_name, company.strip(), manager.strip(), discipline.strip(), description.strip(), None),
             )
             for pack_id in pack_ids or []:
                 if str(pack_id).strip():
@@ -211,7 +216,7 @@ def get_project(project_id: str, db_path: Path | None = None) -> dict[str, Any]:
         init_project_db(conn)
         row = conn.execute(
             """
-            SELECT id, name, company, manager, discipline, description, role
+            SELECT id, name, company, manager, discipline, description, role, drive_folder_id
             FROM projects
             WHERE id = ?
             """,
@@ -231,6 +236,7 @@ def get_project(project_id: str, db_path: Path | None = None) -> dict[str, Any]:
             "discipline": row["discipline"],
             "description": row["description"],
             "role": row["role"],
+            "driveFolderId": row["drive_folder_id"],
             "packIds": [pack_row["pack_id"] for pack_row in pack_rows],
         }
     finally:
@@ -266,6 +272,127 @@ def update_project(
             raise KeyError(project_id)
     finally:
         conn.close()
+
+
+def sync_projects_from_drive_folders(
+    drive_projects: list[dict[str, str]],
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    normalized: list[dict[str, str]] = []
+    seen_folder_ids: set[str] = set()
+    for item in drive_projects:
+        folder_id = str(item.get("folderId") or "").strip()
+        project_id = str(item.get("projectId") or "").strip()
+        name = str(item.get("name") or project_id).strip()
+        if not folder_id or not project_id or folder_id in seen_folder_ids:
+            continue
+        seen_folder_ids.add(folder_id)
+        normalized.append({"folderId": folder_id, "projectId": project_id, "name": name or project_id})
+
+    created: list[str] = []
+    updated: list[str] = []
+    renamed: list[dict[str, str]] = []
+    deleted: list[str] = []
+    conflicts: list[dict[str, str]] = []
+    active_folder_ids = {item["folderId"] for item in normalized}
+    conn = connect(db_path)
+    try:
+        init_project_db(conn)
+        with conn:
+            for row in conn.execute(
+                """
+                SELECT id, drive_folder_id
+                FROM projects
+                WHERE drive_folder_id IS NOT NULL AND drive_folder_id != ''
+                """
+            ).fetchall():
+                if str(row["drive_folder_id"]) in active_folder_ids:
+                    continue
+                project_id = str(row["id"])
+                conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+                deleted.append(project_id)
+
+            for item in normalized:
+                folder_id = item["folderId"]
+                project_id = item["projectId"]
+                name = item["name"]
+                existing = conn.execute(
+                    "SELECT * FROM projects WHERE drive_folder_id = ?",
+                    (folder_id,),
+                ).fetchone()
+                if existing:
+                    old_id = str(existing["id"])
+                    if old_id != project_id:
+                        conflict = conn.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone()
+                        if conflict:
+                            conn.execute(
+                                """
+                                UPDATE projects
+                                SET name = ?, drive_folder_id = ?, updated_at = CURRENT_TIMESTAMP
+                                WHERE id = ?
+                                """,
+                                (name, folder_id, old_id),
+                            )
+                            conflicts.append({"from": old_id, "to": project_id, "folderId": folder_id})
+                            updated.append(old_id)
+                            continue
+                        conn.execute(
+                            """
+                            INSERT INTO projects
+                              (id, name, company, manager, discipline, description, role, drive_folder_id, created_at, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                            """,
+                            (
+                                project_id,
+                                name,
+                                existing["company"],
+                                existing["manager"],
+                                existing["discipline"],
+                                existing["description"],
+                                existing["role"],
+                                folder_id,
+                                existing["created_at"],
+                            ),
+                        )
+                        conn.execute("UPDATE project_packs SET project_id = ? WHERE project_id = ?", (project_id, old_id))
+                        conn.execute("DELETE FROM projects WHERE id = ?", (old_id,))
+                        renamed.append({"from": old_id, "to": project_id, "folderId": folder_id})
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE projects
+                            SET name = ?, drive_folder_id = ?, updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                            """,
+                            (name, folder_id, old_id),
+                        )
+                        updated.append(old_id)
+                    continue
+
+                existing_by_id = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+                if existing_by_id:
+                    conn.execute(
+                        """
+                        UPDATE projects
+                        SET name = ?, drive_folder_id = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (name, folder_id, project_id),
+                    )
+                    updated.append(project_id)
+                    continue
+
+                conn.execute(
+                    """
+                    INSERT INTO projects (id, name, company, manager, discipline, description, drive_folder_id)
+                    VALUES (?, ?, '', '', '', '', ?)
+                    """,
+                    (project_id, name, folder_id),
+                )
+                created.append(project_id)
+    finally:
+        conn.close()
+    return {"created": created, "updated": updated, "renamed": renamed, "deleted": deleted, "conflicts": conflicts}
 
 
 def delete_project(project_id: str, db_path: Path | None = None) -> None:

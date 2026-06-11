@@ -502,6 +502,7 @@ export function ModelExplorerView({
         <div className="model-viewer-window" ref={viewerWindowRef}>
           {visibleModels.length ? (
             <ModelViewerCanvas
+              authToken={authToken}
               command={viewerCommand}
               manifest={manifest}
               onModelTreeLoaded={handleModelTreeLoaded}
@@ -792,12 +793,14 @@ function compareFilterOptions(key: string, left: FilterOption, right: FilterOpti
 }
 
 function ModelViewerCanvas({
+  authToken,
   manifest,
   command,
   onModelTreeLoaded,
   onObjectClear,
   onObjectPick,
 }: {
+  authToken: string;
   manifest: ModelManifest | null;
   command: ViewerCommand | null;
   onModelTreeLoaded: (nodes: ModelTreeNode[]) => void;
@@ -815,10 +818,22 @@ function ModelViewerCanvas({
 
   useEffect(() => {
     let cancelled = false;
+    let objectUrl = "";
     async function boot() {
       if (!manifest?.xktUrl) return;
       const xeokit = await import("@xeokit/xeokit-sdk");
       if (cancelled) return;
+      const assetResponse = await fetch(manifest.xktUrl, {
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
+      });
+      if (!assetResponse.ok) {
+        throw new Error(await assetResponse.text());
+      }
+      objectUrl = URL.createObjectURL(await assetResponse.blob());
+      if (cancelled) {
+        URL.revokeObjectURL(objectUrl);
+        return;
+      }
       xeokitRef.current = xeokit;
       viewerRef.current?.destroy?.();
       const viewer = new xeokit.Viewer({
@@ -844,7 +859,7 @@ function ModelViewerCanvas({
       const loader = new xeokit.XKTLoaderPlugin(viewer);
       const model = loader.load({
         id: manifest.modelId,
-        src: manifest.xktUrl,
+        src: objectUrl,
         edges: true,
       });
       modelRef.current = model;
@@ -898,9 +913,13 @@ function ModelViewerCanvas({
       });
       viewerRef.current = viewer;
     }
-    boot();
+    boot().catch((error) => {
+      console.error("[model-explorer] XKT boot failed", error);
+      onModelTreeLoaded([]);
+    });
     return () => {
       cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
       viewerRef.current?.destroy?.();
       viewerRef.current = null;
       modelRef.current = null;
@@ -910,7 +929,7 @@ function ModelViewerCanvas({
       distanceMeasurementsRef.current = null;
       distanceControlRef.current = null;
     };
-  }, [manifest?.modelId, manifest?.xktUrl, onModelTreeLoaded, onObjectClear, onObjectPick]);
+  }, [authToken, manifest?.modelId, manifest?.xktUrl, onModelTreeLoaded, onObjectClear, onObjectPick]);
 
   useEffect(() => {
     if (!command || !viewerRef.current) return;
@@ -981,11 +1000,11 @@ function ModelViewerCanvas({
     return (
       <div className="model-empty-viewer">
         <MousePointer2 size={30} />
-        <strong>3D 모델 대기 중</strong>
+        <strong>3D 뷰어 변환 대기 중</strong>
         <span>
           {manifest?.status === "pending-xkt"
-            ? "이 IFC 모델은 XKT 변환 결과가 아직 없습니다."
-            : "모델을 선택하거나 XKT가 포함된 IFC 모델을 업로드하세요."}
+            ? "Drive에 IFC만 있고 같은 이름의 XKT가 아직 없습니다. 동기화가 자동 변환을 시도합니다."
+            : "모델을 선택하거나 XKT 변환이 끝난 모델을 동기화하세요."}
         </span>
         {manifest?.error ? <em>{manifest.error}</em> : null}
       </div>

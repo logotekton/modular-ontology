@@ -192,6 +192,16 @@ def _edge(source: str, target: str, relation: str, pack_id: str, raw: dict[str, 
     }
 
 
+def _title_from_drive_filename(filename: str) -> str | None:
+    if "__" not in filename:
+        return None
+    display_name = filename.split("__", 1)[1]
+    stem = Path(display_name).stem.strip()
+    if not stem:
+        return None
+    return re.sub(r"[_-]+", " ", stem).strip() or None
+
+
 def summarize_pack(pack: PackFile) -> dict[str, Any]:
     with zipfile.ZipFile(pack.path) as zf:
         manifest = _read_json(zf, "manifest.json") or {}
@@ -219,13 +229,16 @@ def summarize_pack(pack: PackFile) -> dict[str, Any]:
         edge_count = counts.get("edges") or _count_lines(zf, graph_edges_path) or _count_lines(zf, "backdata/jsonl/edges.jsonl")
         document_count = counts.get("documents") or len([name for name in names if name.startswith("documents/") and name.endswith(".md")])
 
-        source = "Revit IFC" if "revit" in pack.id.lower() else "Advance Steel" if "advance" in pack.id.lower() else "Ontology"
+        pack_id = str(manifest.get("pack_id") or pack.id)
+        source_key = pack_id.lower()
+        source = "Revit IFC" if "revit" in source_key else "Advance Steel" if "advance" in source_key else "Ontology"
         validation = build_summary.get("validation_status") or "READY"
+        drive_title = _title_from_drive_filename(pack.path.name)
 
         return {
-            "id": manifest.get("pack_id") or pack.id,
+            "id": pack_id,
             "filename": pack.path.name,
-            "title": manifest.get("title") or pack.id.replace("-", " ").title(),
+            "title": drive_title or manifest.get("title") or pack.id.replace("-", " ").title(),
             "format": manifest.get("format", "ontology-pack"),
             "description": manifest.get("description") or _extract_readme(zf),
             "source": source,

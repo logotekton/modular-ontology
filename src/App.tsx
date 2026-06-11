@@ -63,6 +63,7 @@ type Project = {
   description: string;
   packIds: string[];
   role: string;
+  driveFolderId?: string | null;
 };
 
 type IfcModel = {
@@ -221,7 +222,7 @@ type AppTab = (typeof nav)[number]["label"];
 const DEFAULT_TAB: AppTab = "Dashboard";
 
 const ROUTE_BY_TAB: Record<AppTab, string> = {
-  Dashboard: "/dashboard",
+  Dashboard: "/home",
   Projects: "/projects",
   "Graph Explorer": "/graph",
   "Model Explorer": "/model-explorer",
@@ -234,6 +235,7 @@ const TAB_BY_ROUTE = new Map<string, AppTab>(
   Object.entries(ROUTE_BY_TAB).map(([tab, route]) => [route, tab as AppTab])
 );
 TAB_BY_ROUTE.set("/upload", "Sync");
+TAB_BY_ROUTE.set("/dashboard", "Dashboard");
 
 const DRIVE_FOLDER_URLS = {
   projects: "https://drive.google.com/drive/folders/1qsFTMJphBJxLlgoSikRa5QZS9grvOA0W",
@@ -892,7 +894,7 @@ function App() {
       setUploadStatus("관리자 세션이 필요합니다");
       return;
     }
-    setUploadStatus("Drive 동기화 중");
+    setUploadStatus("Drive 동기화 및 XKT 변환 중");
     const res = await fetch("/api/admin/reindex", {
       method: "POST",
       headers: { Authorization: `Bearer ${authToken}` },
@@ -902,11 +904,24 @@ function App() {
       setUploadStatus(payload?.detail ?? "Drive 동기화 실패");
       return;
     }
-    const payload = (await res.json()) as { stats: IndexStats };
+    const payload = (await res.json()) as {
+      stats: IndexStats;
+      xktConversion?: { status?: string; converted?: unknown[]; errors?: unknown[]; reason?: string };
+    };
     setIndexStats(payload.stats);
     await refreshData(undefined, authToken);
     await refreshPublicStatus(authToken);
-    setUploadStatus("Drive 동기화 완료");
+    const convertedCount = payload.xktConversion?.converted?.length ?? 0;
+    const errorCount = payload.xktConversion?.errors?.length ?? 0;
+    if (convertedCount > 0) {
+      setUploadStatus(`Drive 동기화 완료 · XKT ${convertedCount}개 자동 변환`);
+    } else if (errorCount > 0) {
+      setUploadStatus(`Drive 동기화 완료 · XKT 변환 오류 ${errorCount}개`);
+    } else if (payload.xktConversion?.status === "skipped") {
+      setUploadStatus(`Drive 동기화 완료 · XKT 변환 건너뜀: ${payload.xktConversion.reason ?? "설정 없음"}`);
+    } else {
+      setUploadStatus("Drive 동기화 완료 · 변환할 IFC 없음");
+    }
   }
 
   function selectPackForGraph(packId: string) {
@@ -1175,11 +1190,7 @@ function App() {
             packs={packs}
             projects={projects}
             selectedPackId={selectedPackId}
-            onConfirm={confirmAction}
-            onDeleteProject={deleteProject}
             onSaveProject={saveProject}
-            onSetIfcModelProject={setIfcModelProject}
-            onSetProjectPacks={setProjectPacks}
           />
         )}
 
@@ -1684,22 +1695,14 @@ function ProjectsView({
   ifcModels,
   packs,
   projects,
-  onConfirm,
-  onDeleteProject,
   onSaveProject,
-  onSetIfcModelProject,
-  onSetProjectPacks,
 }: {
   currentUser: CurrentUser | null;
   ifcModels: IfcModel[];
   packs: Pack[];
   projects: Project[];
   selectedPackId: string;
-  onConfirm: (options: ConfirmDialogOptions) => void;
-  onDeleteProject: (projectId: string) => void;
   onSaveProject: (form: ProjectForm) => Promise<void> | void;
-  onSetIfcModelProject: (modelId: string, projectId: string | null) => Promise<void> | void;
-  onSetProjectPacks: (projectId: string, packIds: string[]) => Promise<void> | void;
 }) {
   const isAdmin = currentUser?.role === "admin";
   const emptyForm: ProjectForm = {
@@ -1712,16 +1715,13 @@ function ProjectsView({
   };
   const [selectedProjectId, setSelectedProjectId] = useState(projects[0]?.id ?? "");
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
-  const [draft, setDraft] = useState<ProjectForm>(emptyForm);
   const [dialogDraft, setDialogDraft] = useState<ProjectForm>(emptyForm);
-  const [dialogMode, setDialogMode] = useState<"add" | "edit" | null>(null);
-  const [ifcDraftLinks, setIfcDraftLinks] = useState<Record<string, string | null>>({});
+  const [dialogMode, setDialogMode] = useState<"edit" | null>(null);
   const [pressedAction, setPressedAction] = useState("");
 
   useEffect(() => {
     if (!projects.length) {
       setSelectedProjectId("");
-      setDraft(emptyForm);
       return;
     }
     if (!selectedProjectId || !projects.some((project) => project.id === selectedProjectId)) {
@@ -1729,43 +1729,14 @@ function ProjectsView({
     }
   }, [projects, selectedProjectId]);
 
-  useEffect(() => {
-    if (!selectedProject) {
-      setDraft(emptyForm);
-      return;
-    }
-    setDraft({
-      id: selectedProject.id,
-      name: selectedProject.name,
-      company: selectedProject.company || "",
-      manager: selectedProject.manager || "",
-      discipline: selectedProject.discipline || "",
-      description: selectedProject.description || "",
-      packIds: selectedProject.packIds,
-    });
-  }, [selectedProject?.id, selectedProject?.packIds.join("|")]);
-
-  useEffect(() => {
-    const nextLinks: Record<string, string | null> = {};
-    ifcModels.forEach((model) => {
-      nextLinks[model.id] = model.projectId ?? null;
-    });
-    setIfcDraftLinks(nextLinks);
-  }, [ifcModels]);
-
   const linkedPacks = selectedProject
     ? selectedProject.packIds
         .map((packId) => packs.find((pack) => pack.id === packId))
         .filter((pack): pack is Pack => Boolean(pack))
     : [];
   const linkedModels = selectedProject
-    ? ifcModels.filter((model) => (ifcDraftLinks[model.id] ?? model.projectId ?? null) === selectedProject.id)
+    ? ifcModels.filter((model) => model.projectId === selectedProject.id)
     : [];
-  const modelLinkChanged = ifcModels.some((model) => (ifcDraftLinks[model.id] ?? null) !== (model.projectId ?? null));
-  const packLinkChanged = selectedProject
-    ? draft.packIds.slice().sort().join("|") !== selectedProject.packIds.slice().sort().join("|")
-    : false;
-  const connectionDirty = modelLinkChanged || packLinkChanged;
 
   function showActionFeedback(action: string) {
     setPressedAction("");
@@ -1784,11 +1755,6 @@ function ProjectsView({
     void callback();
   }
 
-  function openAddDialog() {
-    setDialogDraft(emptyForm);
-    setDialogMode("add");
-  }
-
   function openEditDialog() {
     if (!selectedProject) return;
     setDialogDraft({
@@ -1803,48 +1769,9 @@ function ProjectsView({
     setDialogMode("edit");
   }
 
-  function toggleDraftPack(packId: string) {
-    if (!selectedProject) return;
-    setDraft((current) => ({
-      ...current,
-      packIds: current.packIds.includes(packId)
-        ? current.packIds.filter((id) => id !== packId)
-        : [...current.packIds, packId],
-    }));
-  }
-
-  function toggleDraftIfc(modelId: string) {
-    if (!selectedProject) return;
-    setIfcDraftLinks((current) => {
-      const linkedToSelected = (current[modelId] ?? null) === selectedProject.id;
-      return { ...current, [modelId]: linkedToSelected ? null : selectedProject.id };
-    });
-  }
-
   async function saveDialogDraft() {
     await Promise.resolve(onSaveProject(dialogDraft));
     setDialogMode(null);
-  }
-
-  function deleteSelectedProject() {
-    if (!selectedProject) return;
-    onConfirm({
-      title: "프로젝트 삭제",
-      message: `${selectedProject.name} 프로젝트를 삭제하시겠습니까? 연결된 팩과 IFC 모델 원본은 삭제되지 않습니다.`,
-      confirmLabel: "삭제",
-      tone: "danger",
-      onConfirm: () => onDeleteProject(selectedProject.id),
-    });
-  }
-
-  async function saveConnections() {
-    if (!selectedProject) return;
-    if (!connectionDirty) return;
-    await Promise.resolve(onSetProjectPacks(selectedProject.id, draft.packIds));
-    const changedModels = ifcModels.filter((model) => (ifcDraftLinks[model.id] ?? null) !== (model.projectId ?? null));
-    await Promise.all(
-      changedModels.map((model) => Promise.resolve(onSetIfcModelProject(model.id, ifcDraftLinks[model.id] ?? null))),
-    );
   }
 
   return (
@@ -1859,27 +1786,12 @@ function ProjectsView({
           {isAdmin && (
             <div className="project-header-actions">
               <button
-                className={actionButtonClass("project-add")}
-                type="button"
-                onClick={() => runProjectAction("project-add", openAddDialog)}
-              >
-                추가
-              </button>
-              <button
                 className={actionButtonClass("project-edit")}
                 disabled={!selectedProject}
                 type="button"
                 onClick={() => runProjectAction("project-edit", openEditDialog)}
               >
                 편집
-              </button>
-              <button
-                className={actionButtonClass("project-delete")}
-                disabled={!selectedProject}
-                type="button"
-                onClick={() => runProjectAction("project-delete", deleteSelectedProject)}
-              >
-                삭제
               </button>
             </div>
           )}
@@ -1961,72 +1873,45 @@ function ProjectsView({
       <div className="project-panel project-connection-panel">
         <div className="panel-header slim">
           <div>
-            <h2>모델 / 온톨로지 팩 연결 편집</h2>
-            <span>업로드된 모든 IFC 모델과 온톨로지 팩을 프로젝트에 연결합니다</span>
+            <h2>모델 / 온톨로지 팩 연결 현황</h2>
+            <span>Google Drive 프로젝트 폴더에서 동기화된 항목입니다</span>
           </div>
-          {isAdmin && (
-            <button
-              className={actionButtonClass("connections-save")}
-              disabled={!selectedProject}
-              type="button"
-              onClick={() => runProjectAction("connections-save", saveConnections)}
-            >
-              연결 저장
-            </button>
-          )}
+          <FolderKanban size={19} />
         </div>
         <div className="project-connection-grid">
           <div className="connection-list-panel">
             <div className="connection-list-title">
               <strong>IFC 모델</strong>
-              <span>{numberLabel(ifcModels.length)}개 업로드됨</span>
+              <span>{numberLabel(linkedModels.length)}개 연결됨</span>
             </div>
             <div className="connection-scroll-list">
-              {ifcModels.length ? ifcModels.map((model) => {
-                const linked = Boolean(selectedProject && (ifcDraftLinks[model.id] ?? null) === selectedProject.id);
-                return (
-                  <div className={linked ? "connection-row active" : "connection-row"} key={model.id}>
+              {linkedModels.length ? linkedModels.map((model) => (
+                  <div className="connection-row active" key={model.id}>
                     <Database size={18} />
                     <span>
                       <strong>{model.filename}</strong>
-                      <em>{model.projectName ? `현재 연결: ${model.projectName}` : "미연결"}</em>
+                      <em>{model.viewerStatus === "ready" ? "뷰어 준비" : "동기화됨"}</em>
                     </span>
-                    <input
-                      checked={linked}
-                      disabled={!isAdmin || !selectedProject}
-                      type="checkbox"
-                      onChange={() => toggleDraftIfc(model.id)}
-                    />
                   </div>
-                );
-              }) : <p className="empty-list-note">업로드된 IFC 모델이 없습니다.</p>}
+              )) : <p className="empty-list-note">선택 프로젝트에 연결된 IFC 모델이 없습니다.</p>}
             </div>
           </div>
 
           <div className="connection-list-panel">
             <div className="connection-list-title">
               <strong>온톨로지 팩</strong>
-              <span>{numberLabel(packs.length)}개 업로드됨</span>
+              <span>{numberLabel(linkedPacks.length)}개 연결됨</span>
             </div>
             <div className="connection-scroll-list">
-              {packs.length ? packs.map((pack) => {
-                const linked = draft.packIds.includes(pack.id);
-                return (
-                  <div className={linked ? "connection-row active" : "connection-row"} key={pack.id}>
+              {linkedPacks.length ? linkedPacks.map((pack) => (
+                  <div className="connection-row active" key={pack.id}>
                     <FileArchive size={18} />
                     <span>
                       <strong>{pack.title}</strong>
                       <em>{pack.filename} / {numberLabel(pack.counts.edges)}개 엣지</em>
                     </span>
-                    <input
-                      checked={linked}
-                      disabled={!isAdmin || !selectedProject}
-                      type="checkbox"
-                      onChange={() => toggleDraftPack(pack.id)}
-                    />
                   </div>
-                );
-              }) : <p className="empty-list-note">업로드된 온톨로지 팩이 없습니다.</p>}
+              )) : <p className="empty-list-note">선택 프로젝트에 연결된 온톨로지 팩이 없습니다.</p>}
             </div>
           </div>
         </div>
@@ -2043,23 +1928,16 @@ function ProjectsView({
         >
           <div className="panel-header slim">
             <div>
-              <h2>{dialogMode === "add" ? "프로젝트 추가" : "프로젝트 편집"}</h2>
-              <span>프로젝트 기본 정보만 편집합니다</span>
+              <h2>프로젝트 편집</h2>
+              <span>프로젝트명은 Google Drive 폴더명으로만 변경됩니다</span>
             </div>
             <FolderKanban size={19} />
           </div>
           <div className="project-form-grid">
             <label>
-              프로젝트명
-              <input
-                autoFocus
-                value={dialogDraft.name}
-                onChange={(event) => setDialogDraft({ ...dialogDraft, name: event.target.value })}
-              />
-            </label>
-            <label>
               회사
               <input
+                autoFocus
                 value={dialogDraft.company}
                 onChange={(event) => setDialogDraft({ ...dialogDraft, company: event.target.value })}
               />
@@ -2092,7 +1970,7 @@ function ProjectsView({
             </button>
             <button
               className={actionButtonClass("project-save", "primary-button")}
-              disabled={!dialogDraft.name.trim()}
+              disabled={!selectedProject}
               type="button"
               onClick={() => runProjectAction("project-save", saveDialogDraft)}
             >
@@ -2184,7 +2062,7 @@ function SyncView({
           <div className="sync-folder-list">
             <a href={DRIVE_FOLDER_URLS.projects} target="_blank" rel="noreferrer">
               <strong>프로젝트</strong>
-              프로젝트 탭에서 먼저 프로젝트를 생성하고, 생성된 project-id와 같은 이름으로 02_Projects 안에 폴더를 만듭니다.
+              Drive의 02_Projects 안에 프로젝트 폴더를 만들고 동기화하면 앱의 프로젝트 탭에 자동 등록됩니다.
             </a>
             <a href={DRIVE_FOLDER_URLS.projects} target="_blank" rel="noreferrer">
               <strong>IFC/XKT</strong>

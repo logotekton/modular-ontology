@@ -43,6 +43,7 @@ from modular_ontology.google_drive_sync import (
     write_back_ifc_file,
     write_back_pack_file,
 )
+from modular_ontology.drive_xkt_worker import convert_missing_drive_xkts
 
 
 client = TestClient(app)
@@ -770,6 +771,82 @@ def test_drive_project_pack_links_preserve_manual_legacy_links(monkeypatch, tmp_
 
     assert applied == {"project-a": ["legacy-pack"]}
     assert projects[0]["packIds"] == ["legacy-pack"]
+
+
+def test_drive_project_folder_rename_updates_project_and_company_access(monkeypatch, tmp_path) -> None:
+    from modular_ontology import app as app_module
+    from modular_ontology import project_store
+    from modular_ontology.auth import get_company_project_access, invalidate_users_cache, set_company_project_access
+
+    users_file = tmp_path / "users.json"
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
+    invalidate_users_cache()
+    monkeypatch.setattr(app_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(project_store, "DB_PATH", tmp_path / "projects.sqlite3")
+
+    project_store.create_project(name="Old Project", pack_ids=["sample-pack"])
+    project_store.sync_projects_from_drive_folders(
+        [{"folderId": "drive-folder-1", "projectId": "old-project", "name": "Old Project"}]
+    )
+    set_company_project_access("Client Co", ["old-project"])
+
+    marker = tmp_path / "02_Projects" / ".drive-project-folders.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        json.dumps(
+            [
+                {
+                    "folderId": "drive-folder-1",
+                    "projectId": "renamed-project",
+                    "name": "Renamed Project",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = app_module._apply_drive_project_folders()
+    projects = project_store.list_projects([{"id": "sample-pack"}])
+
+    assert result["renamed"] == [{"from": "old-project", "to": "renamed-project", "folderId": "drive-folder-1"}]
+    assert projects[0]["id"] == "renamed-project"
+    assert projects[0]["name"] == "Renamed Project"
+    assert projects[0]["driveFolderId"] == "drive-folder-1"
+    assert projects[0]["packIds"] == ["sample-pack"]
+    assert get_company_project_access("Client Co") == ["renamed-project"]
+
+
+def test_drive_project_folder_delete_removes_project_and_company_access(monkeypatch, tmp_path) -> None:
+    from modular_ontology import app as app_module
+    from modular_ontology import project_store
+    from modular_ontology.auth import get_company_project_access, invalidate_users_cache, set_company_project_access
+
+    users_file = tmp_path / "users.json"
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
+    invalidate_users_cache()
+    monkeypatch.setattr(app_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(project_store, "DB_PATH", tmp_path / "projects.sqlite3")
+
+    project_store.sync_projects_from_drive_folders(
+        [
+            {"folderId": "drive-folder-1", "projectId": "active-project", "name": "Active Project"},
+            {"folderId": "drive-folder-2", "projectId": "deleted-project", "name": "Deleted Project"},
+        ]
+    )
+    set_company_project_access("Client Co", ["active-project", "deleted-project"])
+    marker = tmp_path / "02_Projects" / ".drive-project-folders.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        json.dumps([{"folderId": "drive-folder-1", "projectId": "active-project", "name": "Active Project"}]),
+        encoding="utf-8",
+    )
+
+    result = app_module._apply_drive_project_folders()
+    projects = project_store.list_projects([])
+
+    assert result["deleted"] == ["deleted-project"]
+    assert [project["id"] for project in projects] == ["active-project"]
+    assert get_company_project_access("Client Co") == ["active-project"]
 
 
 def test_query_api_returns_evidence(monkeypatch) -> None:
@@ -2017,18 +2094,18 @@ def test_google_drive_sync_reads_project_scoped_models_and_packs(tmp_path) -> No
                 DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder"),
             ],
             "projects-root": [
-                DriveItem("project", "samcheok-building-b", "application/vnd.google-apps.folder"),
+                DriveItem("project", "renamed-building", "application/vnd.google-apps.folder", "2026-06-11T02:00:00Z"),
             ],
             "project": [
                 DriveItem("ifc-folder", "ifc-models", "application/vnd.google-apps.folder"),
                 DriveItem("packs-folder", "ontology-packs", "application/vnd.google-apps.folder"),
             ],
             "ifc-folder": [
-                DriveItem("ifc", "sample.ifc", "application/octet-stream", "2026-06-11T00:00:00Z", 1200),
-                DriveItem("xkt", "sample.xkt", "application/octet-stream", "2026-06-11T00:01:00Z", 800),
+                DriveItem("ifc", "renamed-model.ifc", "application/octet-stream", "2026-06-11T00:00:00Z", 1200),
+                DriveItem("xkt", "renamed-model.xkt", "application/octet-stream", "2026-06-11T00:01:00Z", 800),
             ],
             "packs-folder": [
-                DriveItem("pack", "sample-project-pack.zip", "application/x-zip-compressed"),
+                DriveItem("pack", "renamed-project-pack.zip", "application/x-zip-compressed"),
             ],
         }
 
@@ -2047,23 +2124,92 @@ def test_google_drive_sync_reads_project_scoped_models_and_packs(tmp_path) -> No
         force=True,
     )
 
-    metadata_path = tmp_path / "03_IFC_Models" / "samcheok-building-b" / "metadata" / "sample.metadata.json"
-    pack_path = tmp_path / "04_Ontology_Packs" / "indexed" / "samcheok-building-b__sample-project-pack.zip"
+    metadata_path = tmp_path / "03_IFC_Models" / "renamed-building" / "metadata" / "renamed-model.metadata.json"
+    pack_path = tmp_path / "04_Ontology_Packs" / "indexed" / "renamed-building__renamed-project-pack.zip"
     links_path = tmp_path / "02_Projects" / ".drive-project-pack-links.json"
+    folders_path = tmp_path / "02_Projects" / ".drive-project-folders.json"
 
     assert result["status"] == "synced"
     assert "04_Ontology_Packs" not in result["missing"]
     assert str(metadata_path) in result["downloaded"]
     assert pack_path.exists()
     assert json.loads(links_path.read_text(encoding="utf-8")) == {
-        "samcheok-building-b": ["sample-project-pack"],
+        "renamed-building": ["sample-project-pack"],
     }
+    assert json.loads(folders_path.read_text(encoding="utf-8")) == [
+        {
+            "folderId": "project",
+            "projectId": "renamed-building",
+            "name": "renamed-building",
+            "modifiedTime": "2026-06-11T02:00:00Z",
+        }
+    ]
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    assert metadata["filename"] == "sample.ifc"
-    assert metadata["projectId"] == "samcheok-building-b"
+    assert metadata["filename"] == "renamed-model.ifc"
+    assert metadata["projectId"] == "renamed-building"
     assert metadata["viewerStatus"] == "ready"
-    assert metadata["drive"]["file"]["folder"] == "02_Projects/samcheok-building-b/ifc-models"
+    assert metadata["drive"]["file"]["folder"] == "02_Projects/renamed-building/ifc-models"
+
+
+def test_drive_xkt_worker_converts_missing_project_xkt(monkeypatch, tmp_path) -> None:
+    from modular_ontology import drive_xkt_worker
+
+    uploaded: dict[str, bytes] = {}
+
+    class FakeDriveClient:
+        children = {
+            "root": [DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder")],
+            "projects-root": [DriveItem("project", "samcheok-building-b", "application/vnd.google-apps.folder")],
+            "project": [DriveItem("ifc-folder", "ifc-models", "application/vnd.google-apps.folder")],
+            "ifc-folder": [DriveItem("ifc", "sample.ifc", "application/octet-stream", "2026-06-11T00:00:00Z", 1200)],
+        }
+
+        def list_children(self, folder_id):
+            return self.children.get(folder_id, [])
+
+        def download_file(self, file_id, target):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"ISO-10303-21;")
+
+        def upload_file_by_name(self, folder_id, source, name=None, mime_type=None):
+            uploaded[f"{folder_id}/{name or source.name}"] = source.read_bytes()
+            return {"status": "created", "id": "xkt-file", "name": name or source.name}
+
+    def fake_run(command, shell, capture_output, text, timeout):
+        xkt_path = command.rsplit("-o ", 1)[1].strip().strip('"')
+        Path(xkt_path).write_bytes(b"xkt")
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(drive_xkt_worker, "_xkt_converter_command", lambda: "fake-convert -s {ifc} -o {xkt}")
+    monkeypatch.setattr(drive_xkt_worker.subprocess, "run", fake_run)
+
+    result = convert_missing_drive_xkts(client=FakeDriveClient(), root_folder_id="root", max_files=5)
+
+    assert result["status"] == "converted"
+    assert result["converted"] == [
+        {
+            "projectId": "samcheok-building-b",
+            "ifc": "sample.ifc",
+            "xkt": "sample.xkt",
+            "upload": "created",
+            "driveFileId": "xkt-file",
+        }
+    ]
+    assert uploaded["ifc-folder/sample.xkt"] == b"xkt"
+
+
+def test_drive_xkt_worker_uses_npx_fallback_when_local_converter_is_missing(monkeypatch) -> None:
+    from modular_ontology import drive_xkt_worker
+
+    monkeypatch.delenv("MODULAR_ONTOLOGY_DISABLE_DEFAULT_XKT_CONVERTER", raising=False)
+    monkeypatch.setattr(drive_xkt_worker, "_xkt_converter_candidates", lambda: [])
+
+    command = drive_xkt_worker._default_xkt_converter_command()
+
+    assert command.startswith("npx -y @xeokit/xeokit-convert@1.3.2 ")
+    assert "-s {ifc}" in command
+    assert "-o {xkt}" in command
 
 
 def test_google_drive_sync_namespaces_same_pack_filename_per_project(tmp_path) -> None:
@@ -2104,6 +2250,34 @@ def test_google_drive_sync_namespaces_same_pack_filename_per_project(tmp_path) -
         "project-a": ["project-a-pack"],
         "project-b": ["project-b-pack"],
     }
+
+
+def test_project_scoped_pack_title_uses_drive_filename(tmp_path, monkeypatch) -> None:
+    from modular_ontology import pack_index
+
+    pack_dir = tmp_path / "04_Ontology_Packs" / "indexed"
+    pack_dir.mkdir(parents=True)
+    pack_path = pack_dir / "yeoju-project__여주_건축_온톨로지팩.zip"
+    with zipfile.ZipFile(pack_path, "w") as zf:
+        zf.writestr(
+            "manifest.json",
+            json.dumps(
+                {
+                    "pack_id": "revit-yeoju-ar-ifc-workset-module-localcrab-pack",
+                    "title": "Revit IFC Workset Module LocalCrab Pack",
+                    "entrypoints": {"nodes": "graph/nodes.jsonl", "edges": "graph/edges.jsonl"},
+                    "counts": {"nodes": 0, "edges": 0, "documents": 0},
+                }
+            ),
+        )
+        zf.writestr("graph/nodes.jsonl", "")
+        zf.writestr("graph/edges.jsonl", "")
+
+    pack = pack_index.summarize_pack(pack_index.PackFile(pack_path))
+
+    assert pack["id"] == "revit-yeoju-ar-ifc-workset-module-localcrab-pack"
+    assert pack["title"] == "여주 건축 온톨로지팩"
+    assert pack["source"] == "Revit IFC"
 
 
 def test_google_drive_sync_project_metadata_wins_over_legacy_ifc_folder(tmp_path) -> None:
@@ -2231,6 +2405,48 @@ def test_google_drive_sync_prunes_removed_project_ifc_metadata(tmp_path) -> None
     sync_google_drive_storage(client=fake_client, root_folder_id="root", data_dir=tmp_path, force=True)
 
     assert not metadata_path.exists()
+
+
+def test_google_drive_sync_prunes_deleted_project_assets(tmp_path) -> None:
+    class FakeDriveClient:
+        children = {
+            "root": [DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder")],
+            "projects-root": [DriveItem("active-project", "active-project", "application/vnd.google-apps.folder")],
+            "active-project": [DriveItem("ifc-folder", "ifc-models", "application/vnd.google-apps.folder")],
+            "ifc-folder": [],
+        }
+
+        def list_children(self, folder_id):
+            return self.children.get(folder_id, [])
+
+        def download_file(self, file_id, target):
+            raise AssertionError("No files should be downloaded")
+
+    deleted_metadata_dir = tmp_path / "03_IFC_Models" / "deleted-project" / "metadata"
+    deleted_metadata_dir.mkdir(parents=True)
+    (deleted_metadata_dir / "old.metadata.json").write_text(
+        json.dumps(
+            {
+                "filename": "old.ifc",
+                "projectId": "deleted-project",
+                "storage": "google-drive",
+                "drive": {"file": {"folder": "02_Projects/deleted-project/ifc-models"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    indexed = tmp_path / "04_Ontology_Packs" / "indexed"
+    indexed.mkdir(parents=True)
+    deleted_pack = indexed / "deleted-project__old-pack.zip"
+    active_pack = indexed / "active-project__active-pack.zip"
+    deleted_pack.write_bytes(b"deleted")
+    active_pack.write_bytes(b"active")
+
+    sync_google_drive_storage(client=FakeDriveClient(), root_folder_id="root", data_dir=tmp_path, force=True)
+
+    assert not (tmp_path / "03_IFC_Models" / "deleted-project").exists()
+    assert not deleted_pack.exists()
+    assert active_pack.exists()
 
 
 def test_google_drive_sync_downloads_legacy_database_filename(tmp_path) -> None:

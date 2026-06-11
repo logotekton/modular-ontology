@@ -22,6 +22,9 @@ data/users.json
 data/mcp_remote.json
 data/local_ai_*.json
 tools/*.exe
+tools/xkt-converter/bin/
+tools/xkt-converter/obj/
+tools/xkt-converter/publish/
 *.sqlite3
 *.sqlite3-*
 *.db

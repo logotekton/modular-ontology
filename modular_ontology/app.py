@@ -40,6 +40,7 @@ from .auth import (
 )
 from .config import DATA_DIR, IFC_MODELS_FOLDER, MCP_REMOTE_FILE, PROJECTS_FOLDER, ROOT, env
 from .google_drive_sync import (
+    PROJECT_FOLDERS_FILENAME,
     PROJECT_PACK_LINKS_FILENAME,
     ensure_project_drive_folders,
     google_drive_sync_enabled,
@@ -55,6 +56,7 @@ from .google_drive_sync import (
     write_back_pack_file,
     write_back_users_file,
 )
+from .drive_xkt_worker import convert_missing_drive_xkts
 from .mcp_server import TOOL_NAMES, configure_server as configure_mcp_server, mcp as remote_mcp
 from .mcp_tokens import build_user_mcp_urls, ensure_mcp_token_for_user, regenerate_mcp_token_for_user
 from .pack_index import PackFile, build_graph, build_multi_pack_graph, list_packs, list_projects, save_uploaded_pack, unique_pack_files
@@ -64,6 +66,7 @@ from .project_store import (
     delete_project as delete_stored_project,
     set_project_packs,
     suggest_project_name,
+    sync_projects_from_drive_folders,
     update_project,
 )
 from .qa import answer_pack_question, validate_openai_api_key
@@ -163,6 +166,9 @@ def ensure_runtime_storage() -> dict[str, Any]:
             if stats.get("packs", 0) == 0 and list_packs():
                 reindex_result = index_all_packs()
                 result["reindexed"] = reindex_result.get("stats", {})
+            drive_projects = _apply_drive_project_folders()
+            if any(drive_projects.get(key) for key in ("created", "updated", "renamed", "deleted", "conflicts")):
+                result["driveProjects"] = drive_projects
             links = _apply_drive_project_pack_links()
             if links:
                 result["projectPackLinks"] = links
@@ -205,6 +211,16 @@ def run_google_drive_write_back(
         return {"enabled": True, **result}
     except Exception as exc:
         return {"enabled": True, "status": "error", "error": str(exc)}
+
+
+def run_google_drive_xkt_conversion() -> dict[str, Any]:
+    if not google_drive_sync_enabled():
+        return {"enabled": False, "status": "disabled"}
+    try:
+        result = convert_missing_drive_xkts()
+        return {"enabled": True, **result}
+    except Exception as exc:
+        return {"enabled": True, "status": "error", "error": str(exc), "converted": []}
 
 
 def require_google_drive_write_back(result: dict[str, Any]) -> dict[str, Any]:
@@ -434,13 +450,30 @@ def _node_command() -> str:
     return _shell_arg(command_path) if command_path.exists() else command
 
 
+def _npx_command() -> str:
+    command = str(env("MODULAR_ONTOLOGY_NPX_COMMAND") or "npx").strip()
+    command_path = Path(command)
+    return _shell_arg(command_path) if command_path.exists() else command
+
+
+def _xkt_converter_candidates() -> list[Path]:
+    relative = Path("node_modules") / "@xeokit" / "xeokit-convert" / "convert2xkt.js"
+    roots = [ROOT, Path.cwd(), Path(__file__).resolve().parents[1]]
+    candidates: list[Path] = []
+    for root in roots:
+        candidate = (root / relative).resolve()
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
 def _default_xkt_converter_command() -> str:
     if str(env("MODULAR_ONTOLOGY_DISABLE_DEFAULT_XKT_CONVERTER") or "").strip() == "1":
         return ""
-    converter_path = ROOT / "node_modules" / "@xeokit" / "xeokit-convert" / "convert2xkt.js"
-    if not converter_path.exists():
-        return ""
-    return f"{_node_command()} {_shell_arg(converter_path)} -s {{ifc}} -f ifc -o {{xkt}}"
+    for converter_path in _xkt_converter_candidates():
+        if converter_path.exists():
+            return f"{_node_command()} {_shell_arg(converter_path)} -s {{ifc}} -f ifc -o {{xkt}}"
+    return f"{_npx_command()} -y @xeokit/xeokit-convert@1.3.2 -s {{ifc}} -f ifc -o {{xkt}}"
 
 
 def _xkt_converter_command() -> str:
@@ -1002,14 +1035,30 @@ def admin_sync_google_drive_storage(authorization: str | None = Header(default=N
     require_admin(authorization)
     if not google_drive_sync_enabled():
         raise HTTPException(status_code=400, detail="MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set.")
+    conversion = run_google_drive_xkt_conversion()
     result = run_google_drive_sync(force=True)
+    result["xktConversion"] = conversion
     if result.get("status") == "synced":
         index_result = index_all_packs()
         result["reindexed"] = index_result.get("stats", {})
+        result["driveProjects"] = _apply_drive_project_folders()
         result["projectPackLinks"] = _apply_drive_project_pack_links()
         result["projects"] = list_projects()
         result["writeBack"] = require_google_drive_write_back(run_google_drive_write_back("database"))
+        if result["driveProjects"].get("accessRenamed") or result["driveProjects"].get("accessRemoved"):
+            result["usersWriteBack"] = require_google_drive_write_back(run_google_drive_write_back("users"))
     return {"enabled": True, **result}
+
+
+@app.post("/api/admin/storage/google-drive/convert-xkt")
+def admin_convert_google_drive_xkt(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_admin(authorization)
+    if not google_drive_sync_enabled():
+        raise HTTPException(status_code=400, detail="MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set.")
+    result = run_google_drive_xkt_conversion()
+    if result.get("status") == "error":
+        raise HTTPException(status_code=502, detail=f"Google Drive XKT conversion failed: {result.get('error') or result.get('errors')}")
+    return result
 
 
 @app.post("/api/admin/storage/google-drive/write-back")
@@ -1106,14 +1155,76 @@ def _apply_drive_project_pack_links() -> dict[str, list[str]]:
     return applied
 
 
+def _apply_drive_project_folders() -> dict[str, Any]:
+    marker = DATA_DIR / PROJECTS_FOLDER / PROJECT_FOLDERS_FILENAME
+    if not marker.exists():
+        return {"created": [], "updated": [], "renamed": [], "conflicts": []}
+    try:
+        raw_projects = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"created": [], "updated": [], "renamed": [], "conflicts": []}
+    if not isinstance(raw_projects, list):
+        return {"created": [], "updated": [], "renamed": [], "conflicts": []}
+    drive_projects = [item for item in raw_projects if isinstance(item, dict)]
+    result = sync_projects_from_drive_folders(drive_projects)
+    rename_map = {
+        str(item.get("from")): str(item.get("to"))
+        for item in result.get("renamed", [])
+        if item.get("from") and item.get("to")
+    }
+    if rename_map:
+        result["accessRenamed"] = _rename_company_project_access(rename_map)
+    deleted_ids = [str(project_id) for project_id in result.get("deleted", []) if str(project_id)]
+    if deleted_ids:
+        result["accessRemoved"] = _remove_company_project_access(deleted_ids)
+    return result
+
+
+def _rename_company_project_access(rename_map: dict[str, str]) -> dict[str, list[str]]:
+    access = get_company_project_access()
+    if not isinstance(access, dict):
+        return {}
+    changed: dict[str, list[str]] = {}
+    for company, project_ids in access.items():
+        if not isinstance(project_ids, list):
+            continue
+        next_ids = [rename_map.get(str(project_id), str(project_id)) for project_id in project_ids]
+        deduped = list(dict.fromkeys(project_id for project_id in next_ids if project_id))
+        if deduped != project_ids:
+            set_company_project_access(company, deduped)
+            changed[company] = deduped
+    return changed
+
+
+def _remove_company_project_access(project_ids: list[str]) -> dict[str, list[str]]:
+    removed = set(project_ids)
+    access = get_company_project_access()
+    if not isinstance(access, dict):
+        return {}
+    changed: dict[str, list[str]] = {}
+    for company, current_ids in access.items():
+        if not isinstance(current_ids, list):
+            continue
+        next_ids = [str(project_id) for project_id in current_ids if str(project_id) not in removed]
+        if next_ids != current_ids:
+            set_company_project_access(company, next_ids)
+            changed[company] = next_ids
+    return changed
+
+
 @app.post("/api/admin/reindex")
 def reindex(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_admin(authorization)
+    conversion = run_google_drive_xkt_conversion()
     require_google_drive_sync(run_google_drive_sync(force=True))
     result = index_all_packs()
+    result["xktConversion"] = conversion
+    result["driveProjects"] = _apply_drive_project_folders()
     result["projectPackLinks"] = _apply_drive_project_pack_links()
     result["projects"] = list_projects()
     result["writeBack"] = require_google_drive_write_back(run_google_drive_write_back("database"))
+    if result["driveProjects"].get("accessRenamed") or result["driveProjects"].get("accessRemoved"):
+        result["usersWriteBack"] = require_google_drive_write_back(run_google_drive_write_back("users"))
     return result
 
 
