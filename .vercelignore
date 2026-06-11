@@ -2,11 +2,16 @@ node_modules
 dist
 .pytest_cache
 __pycache__
+test
+test/
 *.log
 *.sqlite3
 *.sqlite3-*
 *.db
 *.zip
+*.ifc
+*.ifczip
+*.xkt
 google_drive_staging
 data
 tools/*.exe
