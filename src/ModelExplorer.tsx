@@ -155,6 +155,7 @@ export function ModelExplorerView({
   const [selectedTreeNodeIds, setSelectedTreeNodeIds] = useState<Set<string>>(new Set());
   const [propertyFilter, setPropertyFilter] = useState<PropertyFilter>({ key: "category", value: "" });
   const [viewerCommand, setViewerCommand] = useState<ViewerCommand | null>(null);
+  const [viewerError, setViewerError] = useState("");
 
   useEffect(() => {
     setSelectedModelId((current) => {
@@ -169,6 +170,7 @@ export function ModelExplorerView({
     setSelectedObject(null);
     setSelectedTreeNodeIds(new Set());
     setPropertyFilter((current) => ({ ...current, value: "" }));
+    setViewerError("");
   }, [selectedModelId]);
 
   useEffect(() => {
@@ -507,6 +509,7 @@ export function ModelExplorerView({
               manifest={manifest}
               onModelTreeLoaded={handleModelTreeLoaded}
               onObjectClear={handleObjectClear}
+              onViewerError={setViewerError}
               onObjectPick={handleObjectPick}
             />
           ) : (
@@ -523,7 +526,7 @@ export function ModelExplorerView({
           ) : null}
         </div>
 
-        {manifestError ? <p className="model-viewer-error">{manifestError}</p> : null}
+        {manifestError || viewerError ? <p className="model-viewer-error">{manifestError || viewerError}</p> : null}
       </div>
     </section>
   );
@@ -798,6 +801,7 @@ function ModelViewerCanvas({
   command,
   onModelTreeLoaded,
   onObjectClear,
+  onViewerError,
   onObjectPick,
 }: {
   authToken: string;
@@ -805,6 +809,7 @@ function ModelViewerCanvas({
   command: ViewerCommand | null;
   onModelTreeLoaded: (nodes: ModelTreeNode[]) => void;
   onObjectClear: () => void;
+  onViewerError: (message: string) => void;
   onObjectPick: (objectId: string, picked?: Record<string, unknown>) => void;
 }) {
   const canvasIdRef = useRef(`xeokit-canvas-${Math.random().toString(36).slice(2)}`);
@@ -818,9 +823,9 @@ function ModelViewerCanvas({
 
   useEffect(() => {
     let cancelled = false;
-    let objectUrl = "";
     async function boot() {
       if (!manifest?.xktUrl) return;
+      onViewerError("");
       const xeokit = await import("@xeokit/xeokit-sdk");
       if (cancelled) return;
       const assetResponse = await fetch(manifest.xktUrl, {
@@ -829,11 +834,8 @@ function ModelViewerCanvas({
       if (!assetResponse.ok) {
         throw new Error(await assetResponse.text());
       }
-      objectUrl = URL.createObjectURL(await assetResponse.blob());
-      if (cancelled) {
-        URL.revokeObjectURL(objectUrl);
-        return;
-      }
+      const xktData = await assetResponse.arrayBuffer();
+      if (cancelled) return;
       xeokitRef.current = xeokit;
       viewerRef.current?.destroy?.();
       const viewer = new xeokit.Viewer({
@@ -859,7 +861,7 @@ function ModelViewerCanvas({
       const loader = new xeokit.XKTLoaderPlugin(viewer);
       const model = loader.load({
         id: manifest.modelId,
-        src: objectUrl,
+        xkt: xktData,
         edges: true,
       });
       modelRef.current = model;
@@ -889,6 +891,7 @@ function ModelViewerCanvas({
       });
       model.on("error", (error: unknown) => {
         console.error("[model-explorer] XKT load failed", error);
+        onViewerError(`XKT 모델을 불러오지 못했습니다. ${String(error)}`);
       });
       viewer.cameraControl.on("picked", (pickResult: any) => {
         const entity = pickResult?.entity;
@@ -915,11 +918,11 @@ function ModelViewerCanvas({
     }
     boot().catch((error) => {
       console.error("[model-explorer] XKT boot failed", error);
+      onViewerError(`XKT 파일을 불러오지 못했습니다. ${error instanceof Error ? error.message : String(error)}`);
       onModelTreeLoaded([]);
     });
     return () => {
       cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
       viewerRef.current?.destroy?.();
       viewerRef.current = null;
       modelRef.current = null;
@@ -929,7 +932,7 @@ function ModelViewerCanvas({
       distanceMeasurementsRef.current = null;
       distanceControlRef.current = null;
     };
-  }, [authToken, manifest?.modelId, manifest?.xktUrl, onModelTreeLoaded, onObjectClear, onObjectPick]);
+  }, [authToken, manifest?.modelId, manifest?.xktUrl, onModelTreeLoaded, onObjectClear, onObjectPick, onViewerError]);
 
   useEffect(() => {
     if (!command || !viewerRef.current) return;
