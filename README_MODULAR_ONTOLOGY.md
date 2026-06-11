@@ -106,9 +106,9 @@ Share the `Modular Ontology` Google Drive folder with the service account email 
 - `00_Admin/users.json`
 - `00_Admin/mcp_remote.json`
 - `01_Database/modular_ontology.sqlite3`
-- `02_Projects/`
-- `03_IFC_Models/`
-- `04_Ontology_Packs/indexed/*.zip`
+- `02_Projects/<project-id>/ifc-models/*.{ifc,ifczip,zip,xkt}`
+- `02_Projects/<project-id>/ontology-packs/*.zip`
+- legacy compatibility: `03_IFC_Models/` and `04_Ontology_Packs/indexed/*.zip`
 - `05_MCP/`
 - `07_Backups/`
 
@@ -128,7 +128,15 @@ Runtime write-back is enabled for admin/user changes:
 
 - user, company, approval, role, and company-project access changes update `00_Admin/users.json`
 - project and pack-link changes update `01_Database/modular_ontology.sqlite3`
-- ontology pack uploads create or update ZIPs in `04_Ontology_Packs/indexed/`
+- ontology pack ZIPs are synchronized from each project's `ontology-packs/` folder
+
+Model and pack files are uploaded by an administrator directly in Google Drive. The app does not receive model or pack file uploads from the browser. Use the Sync tab after placing files in Drive:
+
+- Create the project in the app first. The app creates `02_Projects/<project-id>/` and its default upload folders in Drive.
+- IFC/XKT files: `02_Projects/<project-id>/ifc-models/`
+- ontology pack ZIP files: `02_Projects/<project-id>/ontology-packs/`
+
+During sync, IFC/XKT files without metadata are registered automatically as model metadata, pack ZIPs are reindexed into the project knowledge graph, and project-scoped packs are linked to the matching project. A project's `ontology-packs/` folder is authoritative for that project's pack links, so removing a ZIP from Drive and syncing removes that pack link from the project. Project-scoped ZIPs are cached locally with the project ID prefixed to avoid filename collisions. Legacy `03_IFC_Models/<project-id>/files/` and `04_Ontology_Packs/indexed/` folders are still read for backward compatibility.
 
 Force a full write-back as an admin:
 

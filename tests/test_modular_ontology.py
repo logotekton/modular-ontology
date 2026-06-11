@@ -36,7 +36,9 @@ from modular_ontology.store import index_all_packs, search_documents
 from modular_ontology.google_drive_sync import (
     DriveItem,
     GoogleDriveClient,
+    ensure_project_drive_folders,
     google_drive_sync_status,
+    restore_ifc_files_from_drive,
     sync_google_drive_storage,
     write_back_ifc_file,
     write_back_pack_file,
@@ -140,12 +142,28 @@ def test_index_status_includes_landing_kpi_counts() -> None:
     assert payload["packs"] >= 0
 
 
-def test_project_graph_api_returns_project_scoped_graph() -> None:
-    response = client.get("/api/projects/samcheok-building-b/graph?max_nodes=20&max_edges=40")
+def test_project_graph_api_returns_project_scoped_graph(monkeypatch) -> None:
+    from modular_ontology import app as app_module
+
+    admin_user = User(
+        id="admin-test",
+        name="Admin",
+        email="admin@example.com",
+        company="Kumkang Kind",
+        role="admin",
+        password_hash="unused",
+        status="active",
+    )
+    monkeypatch.setattr(app_module, "current_user", lambda authorization: admin_user if authorization else None)
+    headers = {"Authorization": "Bearer admin-test-token"}
+    anonymous = client.get("/api/projects/samcheok-building-b/graph?max_nodes=20&max_edges=40")
+    response = client.get("/api/projects/samcheok-building-b/graph?max_nodes=20&max_edges=40", headers=headers)
     invalid_pack = client.get(
-        "/api/projects/samcheok-building-b/graph?pack_ids=revit-yeoju-ar-ifc-workset-module-localcrab-pack"
+        "/api/projects/samcheok-building-b/graph?pack_ids=revit-yeoju-ar-ifc-workset-module-localcrab-pack",
+        headers=headers,
     )
 
+    assert anonymous.status_code == 401
     assert response.status_code == 200
     payload = response.json()
     assert payload["project"]["id"] == "samcheok-building-b"
@@ -192,8 +210,8 @@ def test_ifc_upload_stores_project_file_for_admin(monkeypatch, tmp_path) -> None
     assert payload["status"] == "stored"
     assert payload["projectId"] == "samcheok-building-b"
     assert payload["filename"] == "sample.ifc"
-    assert (tmp_path / "ifc" / "samcheok-building-b" / "sample.ifc").read_bytes() == b"ISO-10303-21;"
-    metadata = json.loads((tmp_path / "ifc" / "samcheok-building-b" / "sample.metadata.json").read_text(encoding="utf-8"))
+    assert (tmp_path / "ifc" / "samcheok-building-b" / "files" / "sample.ifc").read_bytes() == b"ISO-10303-21;"
+    metadata = json.loads((tmp_path / "ifc" / "samcheok-building-b" / "metadata" / "sample.metadata.json").read_text(encoding="utf-8"))
     assert metadata["projectId"] == "samcheok-building-b"
     assert metadata["storage"] == "local"
     assert invalid.status_code == 400
@@ -318,6 +336,50 @@ def test_ifc_upload_uses_configured_xkt_converter(monkeypatch, tmp_path) -> None
     assert asset.content == b"converted-xkt"
 
 
+def test_drive_managed_ifc_model_cannot_be_reassigned_in_app(monkeypatch, tmp_path) -> None:
+    from modular_ontology import app as app_module
+
+    admin_user = User(
+        id="admin-test",
+        name="Admin",
+        email="admin@example.com",
+        company="Kumkang Kind",
+        role="admin",
+        password_hash="unused",
+        status="active",
+    )
+    model_dir = tmp_path / "ifc" / "samcheok-building-b"
+    metadata_dir = model_dir / "metadata"
+    metadata_dir.mkdir(parents=True)
+    (metadata_dir / "sample.metadata.json").write_text(
+        json.dumps(
+            {
+                "filename": "sample.ifc",
+                "projectId": "samcheok-building-b",
+                "projectName": "Samcheok Building B",
+                "storage": "google-drive",
+                "localPath": str(model_dir / "files" / "sample.ifc"),
+                "drive": {"file": {"folder": "02_Projects/samcheok-building-b/ifc-models"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app_module, "IFC_UPLOAD_DIR", tmp_path / "ifc")
+    monkeypatch.setenv("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "root")
+    monkeypatch.setattr(app_module, "run_google_drive_sync", lambda *args, **kwargs: {"status": "synced"})
+    monkeypatch.setattr(app_module, "require_admin", lambda authorization: admin_user)
+    monkeypatch.setattr(app_module, "current_user", lambda authorization: admin_user)
+
+    response = client.post(
+        "/api/admin/ifc/models/link",
+        headers={"Authorization": "Bearer admin-test-token"},
+        json={"model_id": "samcheok-building-b/sample.metadata.json", "project_id": "yeoju-modular-dormitory"},
+    )
+
+    assert response.status_code == 400
+    assert "Google Drive" in response.json()["detail"]
+
+
 def test_unassigned_xkt_asset_requires_user(monkeypatch, tmp_path) -> None:
     from modular_ontology import app as app_module
 
@@ -416,16 +478,63 @@ def test_ifc_drive_write_back_creates_project_folders(monkeypatch, tmp_path) -> 
     result = write_back_ifc_file(ifc_path, "samcheok-building-b", client=fake_client)
 
     assert result["status"] == "written"
-    assert result["drivePath"] == "03_IFC_Models/samcheok-building-b/files/sample.ifc"
+    assert result["drivePath"] == "02_Projects/samcheok-building-b/ifc-models/sample.ifc"
     assert fake_client.created == [
-        ("root", "03_IFC_Models"),
-        ("root/03_IFC_Models", "samcheok-building-b"),
-        ("root/03_IFC_Models/samcheok-building-b", "files"),
+        ("root", "02_Projects"),
+        ("root/02_Projects", "samcheok-building-b"),
+        ("root/02_Projects/samcheok-building-b", "ifc-models"),
     ]
-    assert fake_client.uploads[0]["folder_id"] == "root/03_IFC_Models/samcheok-building-b/files"
+    assert fake_client.uploads[0]["folder_id"] == "root/02_Projects/samcheok-building-b/ifc-models"
 
 
-def test_pack_drive_write_back_uses_ontology_pack_folder(monkeypatch, tmp_path) -> None:
+def test_ensure_project_drive_folders_creates_default_upload_folders(monkeypatch) -> None:
+    class FakeDriveClient:
+        def __init__(self) -> None:
+            self.children = {"root": []}
+            self.created = []
+
+        def list_children(self, folder_id):
+            return self.children.get(folder_id, [])
+
+        def create_folder(self, parent_id, name):
+            folder_id = f"{parent_id}/{name}"
+            item = DriveItem(folder_id, name, "application/vnd.google-apps.folder")
+            self.children.setdefault(parent_id, []).append(item)
+            self.children.setdefault(folder_id, [])
+            self.created.append((parent_id, name))
+            return item
+
+    fake_client = FakeDriveClient()
+    monkeypatch.setenv("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "root")
+
+    result = ensure_project_drive_folders("client-plant-a", client=fake_client)
+
+    assert result["status"] == "ensured"
+    assert result["paths"] == [
+        "02_Projects/client-plant-a",
+        "02_Projects/client-plant-a/ifc-models",
+        "02_Projects/client-plant-a/ontology-packs",
+    ]
+    assert fake_client.created == [
+        ("root", "02_Projects"),
+        ("root/02_Projects", "client-plant-a"),
+        ("root/02_Projects/client-plant-a", "ifc-models"),
+        ("root/02_Projects/client-plant-a", "ontology-packs"),
+    ]
+
+
+def test_pack_drive_write_back_needs_project_scope(monkeypatch, tmp_path) -> None:
+    pack_path = tmp_path / "sample-pack.zip"
+    pack_path.write_bytes(b"zip")
+    monkeypatch.setenv("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "root")
+
+    result = write_back_pack_file(pack_path)
+
+    assert result["status"] == "skipped"
+    assert "project_id" in result["reason"]
+
+
+def test_pack_drive_write_back_uses_project_ontology_pack_folder(monkeypatch, tmp_path) -> None:
     class FakeDriveClient:
         def __init__(self) -> None:
             self.children = {"root": []}
@@ -452,15 +561,16 @@ def test_pack_drive_write_back_uses_ontology_pack_folder(monkeypatch, tmp_path) 
     fake_client = FakeDriveClient()
     monkeypatch.setenv("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "root")
 
-    result = write_back_pack_file(pack_path, client=fake_client)
+    result = write_back_pack_file(pack_path, project_id="samcheok-building-b", client=fake_client)
 
     assert result["status"] == "written"
-    assert result["drivePath"] == "04_Ontology_Packs/indexed/sample-pack.zip"
+    assert result["drivePath"] == "02_Projects/samcheok-building-b/ontology-packs/sample-pack.zip"
     assert fake_client.created == [
-        ("root", "04_Ontology_Packs"),
-        ("root/04_Ontology_Packs", "indexed"),
+        ("root", "02_Projects"),
+        ("root/02_Projects", "samcheok-building-b"),
+        ("root/02_Projects/samcheok-building-b", "ontology-packs"),
     ]
-    assert fake_client.uploads[0]["folder_id"] == "root/04_Ontology_Packs/indexed"
+    assert fake_client.uploads[0]["folder_id"] == "root/02_Projects/samcheok-building-b/ontology-packs"
 
 
 def test_resumable_upload_retries_same_chunk_when_drive_omits_range(monkeypatch, tmp_path) -> None:
@@ -563,12 +673,129 @@ def test_admin_project_crud_and_pack_link_management(monkeypatch, tmp_path) -> N
     assert deleted.status_code == 200
 
 
-def test_query_api_returns_evidence() -> None:
-    response = client.post(
+def test_admin_create_project_survives_drive_folder_failure(monkeypatch, tmp_path) -> None:
+    from modular_ontology import app as app_module
+    from modular_ontology import project_store
+
+    users_file = tmp_path / "users.json"
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
+    monkeypatch.setattr(project_store, "DB_PATH", tmp_path / "projects.sqlite3")
+
+    admin = client.post(
+        "/api/auth/login",
+        json={"email": "ythong@kumkangkind.com", "password": TEST_ADMIN_PASSWORD},
+    )
+    monkeypatch.setenv("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "root")
+    monkeypatch.setattr(app_module, "run_google_drive_sync", lambda *args, **kwargs: {"status": "synced"})
+    monkeypatch.setattr(app_module, "run_google_drive_write_back", lambda *args, **kwargs: {"enabled": True, "status": "written"})
+
+    def fail_drive_folders(_project_id):
+        raise RuntimeError("Drive temporarily unavailable")
+
+    monkeypatch.setattr(app_module, "ensure_project_drive_folders", fail_drive_folders)
+
+    created = client.post(
+        "/api/admin/projects",
+        headers={"Authorization": f"Bearer {admin.json()['token']}"},
+        json={
+            "name": "Folder Failure Project",
+            "company": "Client Co",
+            "manager": "Site Manager",
+            "discipline": "Advance Steel",
+            "description": "Project must survive Drive folder failure",
+            "pack_ids": [],
+        },
+    )
+
+    assert created.status_code == 200
+    assert created.json()["project"]["id"] == "folder-failure-project"
+    assert created.json()["driveFolders"]["status"] == "error"
+    assert any(project["id"] == "folder-failure-project" for project in created.json()["projects"])
+
+
+def test_drive_project_pack_links_are_authoritative(monkeypatch, tmp_path) -> None:
+    from modular_ontology import app as app_module
+    from modular_ontology import project_store
+
+    monkeypatch.setattr(app_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(project_store, "DB_PATH", tmp_path / "projects.sqlite3")
+    monkeypatch.setattr(
+        app_module,
+        "list_packs",
+        lambda: [
+            {"id": "pack-a", "filename": "project-a__pack-a.zip"},
+            {"id": "pack-b", "filename": "project-a__pack-b.zip"},
+        ],
+    )
+    monkeypatch.setattr(
+        app_module,
+        "list_projects",
+        lambda: project_store.list_projects([{"id": "pack-a"}, {"id": "pack-b"}]),
+    )
+    project_store.create_project(name="Project A", pack_ids=["pack-a", "pack-b"])
+    marker = tmp_path / "02_Projects" / ".drive-project-pack-links.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"project-a": ["pack-b"]}), encoding="utf-8")
+
+    applied = app_module._apply_drive_project_pack_links()
+    projects = project_store.list_projects([{"id": "pack-a"}, {"id": "pack-b"}])
+
+    assert applied == {"project-a": ["pack-b"]}
+    assert projects[0]["packIds"] == ["pack-b"]
+
+
+def test_drive_project_pack_links_preserve_manual_legacy_links(monkeypatch, tmp_path) -> None:
+    from modular_ontology import app as app_module
+    from modular_ontology import project_store
+
+    monkeypatch.setattr(app_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(project_store, "DB_PATH", tmp_path / "projects.sqlite3")
+    monkeypatch.setattr(
+        app_module,
+        "list_packs",
+        lambda: [{"id": "legacy-pack", "filename": "legacy-pack.zip"}],
+    )
+    monkeypatch.setattr(
+        app_module,
+        "list_projects",
+        lambda: project_store.list_projects([{"id": "legacy-pack"}]),
+    )
+    project_store.create_project(name="Project A", pack_ids=["legacy-pack"])
+    marker = tmp_path / "02_Projects" / ".drive-project-pack-links.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"project-a": []}), encoding="utf-8")
+
+    applied = app_module._apply_drive_project_pack_links()
+    projects = project_store.list_projects([{"id": "legacy-pack"}])
+
+    assert applied == {"project-a": ["legacy-pack"]}
+    assert projects[0]["packIds"] == ["legacy-pack"]
+
+
+def test_query_api_returns_evidence(monkeypatch) -> None:
+    from modular_ontology import app as app_module
+
+    admin_user = User(
+        id="admin-test",
+        name="Admin",
+        email="admin@example.com",
+        company="Kumkang Kind",
+        role="admin",
+        password_hash="unused",
+        status="active",
+    )
+    monkeypatch.setattr(app_module, "current_user", lambda authorization: admin_user if authorization else None)
+    anonymous = client.post(
         "/api/query",
         json={"pack_id": "advance-steel-samcheok-bldg-b-bm25-evidence-pack", "question": "Beam"},
     )
+    response = client.post(
+        "/api/query",
+        json={"pack_id": "advance-steel-samcheok-bldg-b-bm25-evidence-pack", "question": "Beam"},
+        headers={"Authorization": "Bearer admin-test-token"},
+    )
 
+    assert anonymous.status_code == 401
     assert response.status_code == 200
     payload = response.json()
     assert payload["evidence"]
@@ -1745,6 +1972,267 @@ def test_google_drive_sync_merges_new_and_legacy_pack_folders(tmp_path) -> None:
     assert (tmp_path / "04_Ontology_Packs" / "indexed" / "legacy-pack.zip").read_bytes() == b"legacy-pack"
 
 
+def test_google_drive_sync_registers_manual_ifc_files_as_metadata(tmp_path) -> None:
+    class FakeDriveClient:
+        children = {
+            "root": [
+                DriveItem("ifc-root", "03_IFC_Models", "application/vnd.google-apps.folder"),
+            ],
+            "ifc-root": [DriveItem("project", "samcheok-building-b", "application/vnd.google-apps.folder")],
+            "project": [DriveItem("files", "files", "application/vnd.google-apps.folder")],
+            "files": [
+                DriveItem("ifc", "sample.ifc", "application/octet-stream", "2026-06-11T00:00:00Z", 1200),
+                DriveItem("xkt", "sample.xkt", "application/octet-stream", "2026-06-11T00:01:00Z", 800),
+            ],
+        }
+
+        def list_children(self, folder_id):
+            return self.children.get(folder_id, [])
+
+        def download_file(self, file_id, target):
+            raise AssertionError("manual IFC registration should not download raw model files")
+
+    result = sync_google_drive_storage(
+        client=FakeDriveClient(),
+        root_folder_id="root",
+        data_dir=tmp_path,
+        force=True,
+    )
+
+    metadata_path = tmp_path / "03_IFC_Models" / "samcheok-building-b" / "metadata" / "sample.metadata.json"
+    assert result["status"] == "synced"
+    assert str(metadata_path) in result["downloaded"]
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["filename"] == "sample.ifc"
+    assert metadata["projectId"] == "samcheok-building-b"
+    assert metadata["storage"] == "google-drive"
+    assert metadata["viewerStatus"] == "ready"
+    assert metadata["sizeBytes"] == 1200
+
+
+def test_google_drive_sync_reads_project_scoped_models_and_packs(tmp_path) -> None:
+    class FakeDriveClient:
+        children = {
+            "root": [
+                DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder"),
+            ],
+            "projects-root": [
+                DriveItem("project", "samcheok-building-b", "application/vnd.google-apps.folder"),
+            ],
+            "project": [
+                DriveItem("ifc-folder", "ifc-models", "application/vnd.google-apps.folder"),
+                DriveItem("packs-folder", "ontology-packs", "application/vnd.google-apps.folder"),
+            ],
+            "ifc-folder": [
+                DriveItem("ifc", "sample.ifc", "application/octet-stream", "2026-06-11T00:00:00Z", 1200),
+                DriveItem("xkt", "sample.xkt", "application/octet-stream", "2026-06-11T00:01:00Z", 800),
+            ],
+            "packs-folder": [
+                DriveItem("pack", "sample-project-pack.zip", "application/x-zip-compressed"),
+            ],
+        }
+
+        def list_children(self, folder_id):
+            return self.children.get(folder_id, [])
+
+        def download_file(self, file_id, target):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(target, "w") as zf:
+                zf.writestr("manifest.json", json.dumps({"pack_id": "sample-project-pack"}))
+
+    result = sync_google_drive_storage(
+        client=FakeDriveClient(),
+        root_folder_id="root",
+        data_dir=tmp_path,
+        force=True,
+    )
+
+    metadata_path = tmp_path / "03_IFC_Models" / "samcheok-building-b" / "metadata" / "sample.metadata.json"
+    pack_path = tmp_path / "04_Ontology_Packs" / "indexed" / "samcheok-building-b__sample-project-pack.zip"
+    links_path = tmp_path / "02_Projects" / ".drive-project-pack-links.json"
+
+    assert result["status"] == "synced"
+    assert "04_Ontology_Packs" not in result["missing"]
+    assert str(metadata_path) in result["downloaded"]
+    assert pack_path.exists()
+    assert json.loads(links_path.read_text(encoding="utf-8")) == {
+        "samcheok-building-b": ["sample-project-pack"],
+    }
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["filename"] == "sample.ifc"
+    assert metadata["projectId"] == "samcheok-building-b"
+    assert metadata["viewerStatus"] == "ready"
+    assert metadata["drive"]["file"]["folder"] == "02_Projects/samcheok-building-b/ifc-models"
+
+
+def test_google_drive_sync_namespaces_same_pack_filename_per_project(tmp_path) -> None:
+    class FakeDriveClient:
+        children = {
+            "root": [DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder")],
+            "projects-root": [
+                DriveItem("project-a", "project-a", "application/vnd.google-apps.folder"),
+                DriveItem("project-b", "project-b", "application/vnd.google-apps.folder"),
+            ],
+            "project-a": [DriveItem("packs-a", "ontology-packs", "application/vnd.google-apps.folder")],
+            "project-b": [DriveItem("packs-b", "ontology-packs", "application/vnd.google-apps.folder")],
+            "packs-a": [DriveItem("pack-a", "pack.zip", "application/x-zip-compressed")],
+            "packs-b": [DriveItem("pack-b", "pack.zip", "application/x-zip-compressed")],
+        }
+
+        def list_children(self, folder_id):
+            return self.children.get(folder_id, [])
+
+        def download_file(self, file_id, target):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            pack_id = "project-a-pack" if file_id == "pack-a" else "project-b-pack"
+            with zipfile.ZipFile(target, "w") as zf:
+                zf.writestr("manifest.json", json.dumps({"pack_id": pack_id}))
+
+    result = sync_google_drive_storage(
+        client=FakeDriveClient(),
+        root_folder_id="root",
+        data_dir=tmp_path,
+        force=True,
+    )
+
+    links_path = tmp_path / "02_Projects" / ".drive-project-pack-links.json"
+    assert result["status"] == "synced"
+    assert (tmp_path / "04_Ontology_Packs" / "indexed" / "project-a__pack.zip").exists()
+    assert (tmp_path / "04_Ontology_Packs" / "indexed" / "project-b__pack.zip").exists()
+    assert json.loads(links_path.read_text(encoding="utf-8")) == {
+        "project-a": ["project-a-pack"],
+        "project-b": ["project-b-pack"],
+    }
+
+
+def test_google_drive_sync_project_metadata_wins_over_legacy_ifc_folder(tmp_path) -> None:
+    class FakeDriveClient:
+        children = {
+            "root": [
+                DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder"),
+                DriveItem("legacy-ifc-root", "03_IFC_Models", "application/vnd.google-apps.folder"),
+            ],
+            "projects-root": [DriveItem("project", "samcheok-building-b", "application/vnd.google-apps.folder")],
+            "project": [DriveItem("ifc-folder", "ifc-models", "application/vnd.google-apps.folder")],
+            "ifc-folder": [DriveItem("project-ifc", "sample.ifc", "application/octet-stream", "2026-06-11T00:00:00Z", 1200)],
+            "legacy-ifc-root": [DriveItem("legacy-project", "samcheok-building-b", "application/vnd.google-apps.folder")],
+            "legacy-project": [DriveItem("legacy-files", "files", "application/vnd.google-apps.folder")],
+            "legacy-files": [DriveItem("legacy-ifc", "sample.ifc", "application/octet-stream", "2026-06-10T00:00:00Z", 20)],
+        }
+
+        def list_children(self, folder_id):
+            return self.children.get(folder_id, [])
+
+        def download_file(self, file_id, target):
+            raise AssertionError("manual IFC registration should not download raw model files")
+
+    result = sync_google_drive_storage(
+        client=FakeDriveClient(),
+        root_folder_id="root",
+        data_dir=tmp_path,
+        force=True,
+    )
+
+    metadata_path = tmp_path / "03_IFC_Models" / "samcheok-building-b" / "metadata" / "sample.metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    assert result["status"] == "synced"
+    assert metadata["sizeBytes"] == 1200
+    assert metadata["drive"]["file"]["id"] == "project-ifc"
+    assert metadata["drive"]["file"]["folder"] == "02_Projects/samcheok-building-b/ifc-models"
+
+
+def test_restore_ifc_files_falls_back_to_legacy_per_missing_file(tmp_path, monkeypatch) -> None:
+    class FakeDriveClient:
+        children = {
+            "root": [DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder"), DriveItem("legacy-root", "03_IFC_Models", "application/vnd.google-apps.folder")],
+            "projects-root": [DriveItem("project", "samcheok-building-b", "application/vnd.google-apps.folder")],
+            "project": [DriveItem("ifc-folder", "ifc-models", "application/vnd.google-apps.folder")],
+            "ifc-folder": [],
+            "legacy-root": [DriveItem("legacy-project", "samcheok-building-b", "application/vnd.google-apps.folder")],
+            "legacy-project": [DriveItem("legacy-files", "files", "application/vnd.google-apps.folder")],
+            "legacy-files": [DriveItem("ifc", "sample.ifc", "application/octet-stream")],
+        }
+
+        def list_children(self, folder_id):
+            return self.children.get(folder_id, [])
+
+        def download_file(self, file_id, target):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"ifc-bytes")
+
+    monkeypatch.setenv("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "root")
+
+    downloaded = restore_ifc_files_from_drive(
+        "samcheok-building-b",
+        ["sample.ifc"],
+        tmp_path,
+        client=FakeDriveClient(),
+    )
+
+    assert downloaded == [str(tmp_path / "sample.ifc")]
+    assert (tmp_path / "sample.ifc").read_bytes() == b"ifc-bytes"
+
+
+def test_google_drive_sync_updates_project_metadata_when_xkt_is_added(tmp_path) -> None:
+    class FakeDriveClient:
+        children = {
+            "root": [DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder")],
+            "projects-root": [DriveItem("project", "samcheok-building-b", "application/vnd.google-apps.folder")],
+            "project": [DriveItem("ifc-folder", "ifc-models", "application/vnd.google-apps.folder")],
+            "ifc-folder": [DriveItem("ifc", "sample.ifc", "application/octet-stream", "2026-06-11T00:00:00Z", 1200)],
+        }
+
+        def list_children(self, folder_id):
+            return self.children.get(folder_id, [])
+
+        def download_file(self, file_id, target):
+            raise AssertionError("manual IFC registration should not download raw model files")
+
+    fake_client = FakeDriveClient()
+    sync_google_drive_storage(client=fake_client, root_folder_id="root", data_dir=tmp_path, force=True)
+    metadata_path = tmp_path / "03_IFC_Models" / "samcheok-building-b" / "metadata" / "sample.metadata.json"
+    assert json.loads(metadata_path.read_text(encoding="utf-8"))["viewerStatus"] == "pending-xkt"
+
+    fake_client.children["ifc-folder"] = [
+        DriveItem("ifc", "sample.ifc", "application/octet-stream", "2026-06-11T00:00:00Z", 1200),
+        DriveItem("xkt", "sample.xkt", "application/octet-stream", "2026-06-11T00:01:00Z", 800),
+    ]
+    sync_google_drive_storage(client=fake_client, root_folder_id="root", data_dir=tmp_path, force=True)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    assert metadata["filename"] == "sample.ifc"
+    assert metadata["viewerStatus"] == "ready"
+    assert metadata["xktPath"].endswith("sample.xkt")
+
+
+def test_google_drive_sync_prunes_removed_project_ifc_metadata(tmp_path) -> None:
+    class FakeDriveClient:
+        children = {
+            "root": [DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder")],
+            "projects-root": [DriveItem("project", "samcheok-building-b", "application/vnd.google-apps.folder")],
+            "project": [DriveItem("ifc-folder", "ifc-models", "application/vnd.google-apps.folder")],
+            "ifc-folder": [DriveItem("ifc", "sample.ifc", "application/octet-stream", "2026-06-11T00:00:00Z", 1200)],
+        }
+
+        def list_children(self, folder_id):
+            return self.children.get(folder_id, [])
+
+        def download_file(self, file_id, target):
+            raise AssertionError("manual IFC registration should not download raw model files")
+
+    fake_client = FakeDriveClient()
+    sync_google_drive_storage(client=fake_client, root_folder_id="root", data_dir=tmp_path, force=True)
+    metadata_path = tmp_path / "03_IFC_Models" / "samcheok-building-b" / "metadata" / "sample.metadata.json"
+    assert metadata_path.exists()
+
+    fake_client.children["ifc-folder"] = []
+    sync_google_drive_storage(client=fake_client, root_folder_id="root", data_dir=tmp_path, force=True)
+
+    assert not metadata_path.exists()
+
+
 def test_google_drive_sync_downloads_legacy_database_filename(tmp_path) -> None:
     legacy_db_name = "mod" + "dular_" + "graph.sqlite3"
 
@@ -1884,28 +2372,25 @@ def test_google_drive_status_reads_marker_without_syncing(tmp_path) -> None:
     assert status["downloaded"] == ["db"]
 
 
-def test_google_drive_sync_rejects_duplicate_folder_names(tmp_path) -> None:
+def test_google_drive_sync_tolerates_duplicate_folder_names(tmp_path) -> None:
     class FakeDriveClient:
         def list_children(self, folder_id):
             return [
-                DriveItem("admin-a", "00_Admin", "application/vnd.google-apps.folder"),
-                DriveItem("admin-b", "00_Admin", "application/vnd.google-apps.folder"),
+                DriveItem("admin-a", "00_Admin", "application/vnd.google-apps.folder", "2026-06-10T00:00:00Z"),
+                DriveItem("admin-b", "00_Admin", "application/vnd.google-apps.folder", "2026-06-11T00:00:00Z"),
             ]
 
         def download_file(self, file_id, target):
-            raise AssertionError("download should not run when folder names are ambiguous")
+            raise AssertionError("empty duplicate admin folders should not download anything")
 
-    try:
-        sync_google_drive_storage(
-            client=FakeDriveClient(),
-            root_folder_id="root",
-            data_dir=tmp_path,
-            force=True,
-        )
-    except RuntimeError as exc:
-        assert "Duplicate Google Drive item names" in str(exc)
-    else:
-        raise AssertionError("Expected duplicate folder names to fail sync")
+    result = sync_google_drive_storage(
+        client=FakeDriveClient(),
+        root_folder_id="root",
+        data_dir=tmp_path,
+        force=True,
+    )
+
+    assert result["status"] == "synced"
 
 
 def test_google_drive_status_requires_admin(monkeypatch) -> None:
@@ -1916,7 +2401,7 @@ def test_google_drive_status_requires_admin(monkeypatch) -> None:
     assert response.status_code == 403
 
 
-def test_google_drive_sync_rejects_unsafe_pack_filename(tmp_path) -> None:
+def test_google_drive_sync_skips_unsafe_pack_filename(tmp_path) -> None:
     class FakeDriveClient:
         children = {
             "root": [
@@ -1936,14 +2421,13 @@ def test_google_drive_sync_rejects_unsafe_pack_filename(tmp_path) -> None:
         def download_file(self, file_id, target):
             raise AssertionError("unsafe filenames must be rejected before download")
 
-    try:
-        sync_google_drive_storage(
-            client=FakeDriveClient(),
-            root_folder_id="root",
-            data_dir=tmp_path,
-            force=True,
-        )
-    except RuntimeError as exc:
-        assert "Unsafe Google Drive filename" in str(exc)
-    else:
-        raise AssertionError("Expected unsafe Drive filename to fail sync")
+    result = sync_google_drive_storage(
+        client=FakeDriveClient(),
+        root_folder_id="root",
+        data_dir=tmp_path,
+        force=True,
+    )
+
+    assert result["status"] == "synced"
+    assert result["warnings"]
+    assert "Unsafe Google Drive filename" in result["warnings"][0]

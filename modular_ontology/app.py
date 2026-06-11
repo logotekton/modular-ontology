@@ -38,8 +38,10 @@ from .auth import (
     set_user_company,
     set_user_role,
 )
-from .config import DATA_DIR, IFC_MODELS_FOLDER, MCP_REMOTE_FILE, ROOT, env
+from .config import DATA_DIR, IFC_MODELS_FOLDER, MCP_REMOTE_FILE, PROJECTS_FOLDER, ROOT, env
 from .google_drive_sync import (
+    PROJECT_PACK_LINKS_FILENAME,
+    ensure_project_drive_folders,
     google_drive_sync_enabled,
     google_drive_sync_status,
     restore_ifc_files_from_drive,
@@ -55,7 +57,7 @@ from .google_drive_sync import (
 )
 from .mcp_server import TOOL_NAMES, configure_server as configure_mcp_server, mcp as remote_mcp
 from .mcp_tokens import build_user_mcp_urls, ensure_mcp_token_for_user, regenerate_mcp_token_for_user
-from .pack_index import PackFile, build_graph, build_multi_pack_graph, discover_pack_files, list_packs, list_projects, save_uploaded_pack
+from .pack_index import PackFile, build_graph, build_multi_pack_graph, list_packs, list_projects, save_uploaded_pack, unique_pack_files
 from .project_store import (
     attach_pack_to_project,
     create_project,
@@ -147,7 +149,13 @@ def ensure_runtime_storage() -> dict[str, Any]:
         return {"enabled": False, "status": "disabled"}
     status = google_drive_sync_status()
     if status.get("status") in {"synced", "cached"}:
-        return {"enabled": True, **status}
+        ttl = int(str(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_SYNC_TTL_SECONDS", "300")))
+        try:
+            synced_at = float(status.get("synced_at", 0) or 0)
+        except (TypeError, ValueError):
+            synced_at = 0
+        if ttl > 0 and synced_at and time.time() - synced_at < ttl:
+            return {"enabled": True, **status}
     result = run_google_drive_sync()
     if result.get("status") == "synced":
         try:
@@ -155,6 +163,9 @@ def ensure_runtime_storage() -> dict[str, Any]:
             if stats.get("packs", 0) == 0 and list_packs():
                 reindex_result = index_all_packs()
                 result["reindexed"] = reindex_result.get("stats", {})
+            links = _apply_drive_project_pack_links()
+            if links:
+                result["projectPackLinks"] = links
         except Exception as exc:
             result["reindexError"] = str(exc)
     return {"enabled": True, **result}
@@ -174,7 +185,9 @@ def storage_runtime_status(status: dict[str, Any] | None = None) -> dict[str, An
 
 
 def run_google_drive_write_back(
-    kind: Literal["users", "database", "pack", "mcp_tokens"], path: Path | None = None
+    kind: Literal["users", "database", "pack", "mcp_tokens"],
+    path: Path | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     if not google_drive_sync_enabled():
         return {"enabled": False, "status": "disabled"}
@@ -186,7 +199,7 @@ def run_google_drive_write_back(
         elif kind == "mcp_tokens":
             result = write_back_mcp_tokens_file()
         elif kind == "pack" and path:
-            result = write_back_pack_file(path)
+            result = write_back_pack_file(path, project_id=project_id)
         else:
             result = {"status": "skipped", "reason": f"Unsupported write-back kind: {kind}"}
         return {"enabled": True, **result}
@@ -327,6 +340,8 @@ def _read_ifc_metadata(metadata_path: Path) -> dict[str, Any] | None:
         "viewerStatus": metadata.get("viewerStatus"),
         "xktPath": metadata.get("xktPath"),
         "xktError": metadata.get("xktError"),
+        "objectKey": metadata.get("objectKey"),
+        "xktObjectKey": metadata.get("xktObjectKey"),
         "metadataPath": str(metadata_path),
     }
 
@@ -334,13 +349,15 @@ def _read_ifc_metadata(metadata_path: Path) -> dict[str, Any] | None:
 def list_ifc_models() -> list[dict[str, Any]]:
     if not IFC_UPLOAD_DIR.exists():
         return []
-    models: list[dict[str, Any]] = []
+    models_by_id: dict[str, dict[str, Any]] = {}
     metadata_paths = {*IFC_UPLOAD_DIR.glob("*/*.metadata.json"), *IFC_UPLOAD_DIR.glob("*/metadata/*.metadata.json")}
     for metadata_path in sorted(metadata_paths):
         metadata = _read_ifc_metadata(metadata_path)
         if metadata:
-            models.append(metadata)
-    return models
+            existing = models_by_id.get(str(metadata["id"]))
+            if not existing or "/metadata/" in str(metadata.get("metadataPath", "")):
+                models_by_id[str(metadata["id"])] = metadata
+    return list(models_by_id.values())
 
 
 def _find_ifc_metadata_path(model_id: str) -> Path:
@@ -576,7 +593,9 @@ def current_user(authorization: str | None):
 def visible_projects_for_user(user) -> list[dict[str, Any]]:
     ensure_runtime_storage()
     projects = list_projects()
-    if not user or is_internal_user(user):
+    if not user:
+        return []
+    if is_internal_user(user):
         return projects
     allowed_project_ids = set(get_company_project_access(user.company))
     return [project for project in projects if project["id"] in allowed_project_ids]
@@ -594,7 +613,9 @@ def visible_pack_ids_for_user(user) -> set[str]:
 
 def ensure_pack_access(pack_id: str, user) -> None:
     ensure_runtime_storage()
-    if not user or is_internal_user(user):
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication is required.")
+    if is_internal_user(user):
         return
     if pack_id not in visible_pack_ids_for_user(user):
         raise HTTPException(status_code=403, detail="This pack is not available for your company.")
@@ -602,10 +623,12 @@ def ensure_pack_access(pack_id: str, user) -> None:
 
 def ensure_project_access(project_id: str, user) -> dict[str, Any]:
     ensure_runtime_storage()
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication is required.")
     project = next((item for item in list_projects() if item["id"] == project_id), None)
     if not project:
         raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
-    if not user or is_internal_user(user):
+    if is_internal_user(user):
         return project
     if not any(item["id"] == project_id for item in visible_projects_for_user(user)):
         raise HTTPException(status_code=403, detail="This project is not available for your company.")
@@ -637,12 +660,15 @@ def web_index():
 
 @app.post("/api/auth/login")
 def login(request: LoginRequest) -> dict[str, object]:
-    require_google_drive_sync(run_google_drive_users_sync())
+    users_sync = run_google_drive_users_sync()
     try:
         token, user = authenticate(request.email, request.password)
     except PermissionError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
-    return {"token": token, "user": public_user(user)}
+    response: dict[str, object] = {"token": token, "user": public_user(user)}
+    if users_sync.get("status") == "error":
+        response["syncWarning"] = users_sync.get("error")
+    return response
 
 
 @app.post("/api/auth/register")
@@ -869,7 +895,13 @@ def admin_create_project(request: ProjectRequest, authorization: str | None = He
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     write_back = require_google_drive_write_back(run_google_drive_write_back("database"))
-    return {"project": project, "projects": list_projects(), "writeBack": write_back}
+    drive_folders: dict[str, Any] | None = None
+    if google_drive_sync_enabled():
+        try:
+            drive_folders = ensure_project_drive_folders(project["id"])
+        except Exception as exc:
+            drive_folders = {"status": "error", "error": str(exc)}
+    return {"project": project, "projects": list_projects(), "driveFolders": drive_folders, "writeBack": write_back}
 
 
 @app.put("/api/admin/projects/{project_id}")
@@ -938,7 +970,9 @@ def admin_set_project_pack_links(
 def packs(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
     ensure_runtime_storage()
     user = current_user(authorization)
-    if not user or is_internal_user(user):
+    if not user:
+        return []
+    if is_internal_user(user):
         return list_packs()
     visible_pack_ids = visible_pack_ids_for_user(user)
     return [pack for pack in list_packs() if pack["id"] in visible_pack_ids]
@@ -968,7 +1002,14 @@ def admin_sync_google_drive_storage(authorization: str | None = Header(default=N
     require_admin(authorization)
     if not google_drive_sync_enabled():
         raise HTTPException(status_code=400, detail="MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set.")
-    return {"enabled": True, **run_google_drive_sync(force=True)}
+    result = run_google_drive_sync(force=True)
+    if result.get("status") == "synced":
+        index_result = index_all_packs()
+        result["reindexed"] = index_result.get("stats", {})
+        result["projectPackLinks"] = _apply_drive_project_pack_links()
+        result["projects"] = list_projects()
+        result["writeBack"] = require_google_drive_write_back(run_google_drive_write_back("database"))
+    return {"enabled": True, **result}
 
 
 @app.post("/api/admin/storage/google-drive/write-back")
@@ -984,11 +1025,85 @@ def admin_write_back_google_drive_storage(
         "database": require_google_drive_write_back(run_google_drive_write_back("database")),
     }
     if include_packs:
-        results["packs"] = [
-            require_google_drive_write_back(run_google_drive_write_back("pack", pack.path))
-            for pack in discover_pack_files()
-        ]
+        project_ids_by_pack_id: dict[str, list[str]] = {}
+        for project in list_projects():
+            for pack_id in project.get("packIds", []):
+                project_ids_by_pack_id.setdefault(str(pack_id), []).append(str(project["id"]))
+        pack_results = []
+        for pack in unique_pack_files():
+            summary = None
+            try:
+                summary = next(item for item in list_packs() if item["id"] == pack.id or item["filename"] == pack.path.name)
+            except StopIteration:
+                summary = None
+            pack_id = str(summary.get("id") if isinstance(summary, dict) else pack.id)
+            project_ids = project_ids_by_pack_id.get(pack_id, [])
+            if not project_ids:
+                pack_results.append({"status": "skipped", "source": str(pack.path), "reason": "Pack is not linked to a project."})
+                continue
+            for project_id in project_ids:
+                pack_results.append(
+                    require_google_drive_write_back(run_google_drive_write_back("pack", pack.path, project_id=project_id))
+                )
+        results["packs"] = pack_results
     return {"enabled": True, "status": "written", "results": results}
+
+
+def _apply_drive_project_pack_links() -> dict[str, list[str]]:
+    marker = DATA_DIR / PROJECTS_FOLDER / PROJECT_PACK_LINKS_FILENAME
+    if not marker.exists():
+        return {}
+    try:
+        raw_links = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw_links, dict):
+        return {}
+
+    packs = list_packs()
+    valid_pack_ids = {str(pack["id"]) for pack in packs}
+    project_prefixes = {
+        f"{str(project_id).strip()}__"
+        for project_id in raw_links
+        if str(project_id).strip()
+    }
+    drive_scoped_pack_ids = {
+        str(pack_id).strip()
+        for pack_ids in raw_links.values()
+        if isinstance(pack_ids, list)
+        for pack_id in pack_ids
+        if str(pack_id).strip()
+    }
+    drive_scoped_pack_ids.update(
+        str(pack["id"])
+        for pack in packs
+        if any(str(pack.get("filename") or "").startswith(prefix) for prefix in project_prefixes)
+    )
+    projects_by_id = {str(project["id"]): project for project in list_projects()}
+    applied: dict[str, list[str]] = {}
+    for project_id, pack_ids in raw_links.items():
+        project_id = str(project_id).strip()
+        if project_id not in projects_by_id or not isinstance(pack_ids, list):
+            continue
+        linked_pack_ids = [
+            str(pack_id).strip()
+            for pack_id in pack_ids
+            if str(pack_id).strip() in valid_pack_ids
+        ]
+        existing_pack_ids = [
+            str(pack_id).strip()
+            for pack_id in projects_by_id[project_id].get("packIds", [])
+            if str(pack_id).strip()
+        ]
+        preserved_pack_ids = [
+            pack_id
+            for pack_id in existing_pack_ids
+            if pack_id in valid_pack_ids and pack_id not in drive_scoped_pack_ids
+        ]
+        authoritative_pack_ids = list(dict.fromkeys([*preserved_pack_ids, *linked_pack_ids]))
+        set_project_packs(project_id, authoritative_pack_ids)
+        applied[project_id] = authoritative_pack_ids
+    return applied
 
 
 @app.post("/api/admin/reindex")
@@ -996,6 +1111,8 @@ def reindex(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_admin(authorization)
     require_google_drive_sync(run_google_drive_sync(force=True))
     result = index_all_packs()
+    result["projectPackLinks"] = _apply_drive_project_pack_links()
+    result["projects"] = list_projects()
     result["writeBack"] = require_google_drive_write_back(run_google_drive_write_back("database"))
     return result
 
@@ -1099,7 +1216,14 @@ async def upload_pack(
         summary["project"] = next(project for project in list_projects() if project["id"] == target_project_id)
     write_back: dict[str, Any] = {}
     if pack_path:
-        write_back["pack"] = require_google_drive_write_back(run_google_drive_write_back("pack", Path(pack_path)))
+        project_for_write = summary.get("project") if isinstance(summary.get("project"), dict) else None
+        write_back["pack"] = require_google_drive_write_back(
+            run_google_drive_write_back(
+                "pack",
+                Path(pack_path),
+                project_id=str(project_for_write.get("id")) if project_for_write else None,
+            )
+        )
     write_back["database"] = require_google_drive_write_back(run_google_drive_write_back("database"))
     summary["writeBack"] = write_back
     return summary
@@ -1120,7 +1244,9 @@ async def upload_ifc_model(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     max_bytes = int(str(env("MODULAR_ONTOLOGY_IFC_MAX_BYTES", str(250 * 1024 * 1024))))
-    target_dir = IFC_UPLOAD_DIR / (target_project_id or "_unassigned")
+    project_folder = target_project_id or "_unassigned"
+    target_dir = IFC_UPLOAD_DIR / project_folder / "files"
+    metadata_dir = IFC_UPLOAD_DIR / project_folder / "metadata"
     target_path = target_dir / safe_name
     size_bytes = await _write_upload_file_with_limit(file, target_path, max_bytes=max_bytes)
     metadata = {
@@ -1133,7 +1259,8 @@ async def upload_ifc_model(
         "localPath": str(target_path),
     }
     metadata = await asyncio.to_thread(_maybe_create_xkt, target_path, metadata)
-    metadata_path = target_dir / _ifc_metadata_filename(safe_name)
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = metadata_dir / _ifc_metadata_filename(safe_name)
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     write_back: dict[str, Any] = {}
     if google_drive_sync_enabled():
@@ -1169,7 +1296,9 @@ def ifc_models(authorization: str | None = Header(default=None)) -> list[dict[st
     ensure_runtime_storage()
     user = current_user(authorization)
     models = list_ifc_models()
-    if not user or is_internal_user(user):
+    if not user:
+        return []
+    if is_internal_user(user):
         return models
     allowed_project_ids = set(get_company_project_access(user.company))
     return [model for model in models if model.get("projectId") in allowed_project_ids]
@@ -1236,6 +1365,18 @@ def admin_link_ifc_model(
 ) -> dict[str, Any]:
     require_admin(authorization)
     ensure_runtime_storage()
+    if google_drive_sync_enabled():
+        try:
+            _metadata_path, _raw_metadata, public_metadata = _read_ifc_metadata_by_id(request.model_id)
+            current_project_id = public_metadata.get("projectId")
+            target_project_id = (request.project_id or "").strip() or None
+            if public_metadata.get("storage") == "google-drive" and target_project_id != current_project_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Drive-managed IFC models must be moved between project folders in Google Drive, then synced.",
+                )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"IFC model not found: {request.model_id}") from exc
     try:
         model = assign_ifc_model_to_project(request.model_id, request.project_id)
     except FileNotFoundError as exc:

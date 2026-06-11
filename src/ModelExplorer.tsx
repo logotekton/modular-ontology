@@ -363,7 +363,7 @@ export function ModelExplorerView({
               <span>
                 {visibleModels.length
                   ? "IFC 모델 구조를 불러오는 중이거나, 이 모델에는 구조 정보가 없습니다."
-                  : "업로드 탭에서 IFC 모델을 이 프로젝트에 추가하면 모델 트리가 표시됩니다."}
+                  : "동기화 탭에서 Drive 모델을 등록하면 모델 트리가 표시됩니다."}
               </span>
             </div>
           )}
@@ -534,7 +534,7 @@ function ModelProjectEmptyState({ projectName }: { projectName?: string }) {
       <Database size={30} />
       <strong>IFC 모델이 없습니다.</strong>
       <span>{projectName ? `${projectName} 프로젝트에 연결된 IFC 모델이 없습니다.` : "선택한 프로젝트에 연결된 IFC 모델이 없습니다."}</span>
-      <em>업로드 탭에서 IFC 파일을 이 프로젝트에 추가하면 모델 탐색기를 사용할 수 있습니다.</em>
+      <em>Drive에 IFC/XKT 파일을 올린 뒤 동기화 탭에서 등록하면 모델 탐색기를 사용할 수 있습니다.</em>
     </div>
   );
 }

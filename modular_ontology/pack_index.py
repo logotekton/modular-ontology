@@ -57,6 +57,30 @@ def discover_pack_files(root: Path = ROOT) -> list[PackFile]:
     return sorted(packs, key=lambda item: item.path.name.lower())
 
 
+def _pack_scope_rank(pack: PackFile) -> tuple[int, float, str]:
+    # Project-scoped Drive cache files are named "<project-id>__<zip-name>".
+    # Prefer those over older flat uploads when the manifest pack_id matches.
+    scoped = 1 if "__" in pack.path.name else 0
+    try:
+        modified = pack.path.stat().st_mtime
+    except OSError:
+        modified = 0
+    return (scoped, modified, pack.path.name)
+
+
+def unique_pack_files(root: Path = ROOT) -> list[PackFile]:
+    packs_by_id: dict[str, PackFile] = {}
+    for pack in discover_pack_files(root):
+        try:
+            pack_id = str(summarize_pack(pack)["id"])
+        except Exception:
+            pack_id = pack.id
+        existing = packs_by_id.get(pack_id)
+        if not existing or _pack_scope_rank(pack) > _pack_scope_rank(existing):
+            packs_by_id[pack_id] = pack
+    return sorted(packs_by_id.values(), key=lambda item: item.path.name.lower())
+
+
 def _read_json(zf: zipfile.ZipFile, name: str) -> dict[str, Any] | None:
     if name not in zf.namelist():
         return None
@@ -226,11 +250,11 @@ def _extract_readme(zf: zipfile.ZipFile) -> str:
 
 
 def list_packs() -> list[dict[str, Any]]:
-    return [summarize_pack(pack) for pack in discover_pack_files()]
+    return [summarize_pack(pack) for pack in unique_pack_files()]
 
 
 def find_pack(pack_id: str) -> PackFile:
-    for pack in discover_pack_files():
+    for pack in unique_pack_files():
         summary_id = pack.id
         try:
             summary_id = summarize_pack(pack)["id"]

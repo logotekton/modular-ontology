@@ -22,7 +22,6 @@ import {
   SendHorizontal,
   ServerCog,
   ShieldCheck,
-  Upload,
   Users,
   Waypoints,
 } from "lucide-react";
@@ -191,10 +190,6 @@ type ProjectForm = {
   packIds: string[];
 };
 
-type UploadProjectTarget = {
-  projectId: string;
-};
-
 type SignupForm = {
   name: string;
   company: string;
@@ -214,10 +209,10 @@ type ConfirmDialogOptions = {
 const nav = [
   { label: "Dashboard", icon: Activity },
   { label: "Projects", icon: FolderKanban },
-  { label: "Ontology Packs", icon: FileArchive },
   { label: "Graph Explorer", icon: Waypoints },
   { label: "Model Explorer", icon: Building2 },
   { label: "MCP Connections", icon: ServerCog },
+  { label: "Sync", icon: RefreshCw },
   { label: "Admin", icon: LockKeyhole },
 ] as const;
 
@@ -230,7 +225,7 @@ const ROUTE_BY_TAB: Record<AppTab, string> = {
   Projects: "/projects",
   "Graph Explorer": "/graph",
   "Model Explorer": "/model-explorer",
-  "Ontology Packs": "/upload",
+  Sync: "/sync",
   "MCP Connections": "/mcp-connection",
   Admin: "/admin",
 };
@@ -238,6 +233,11 @@ const ROUTE_BY_TAB: Record<AppTab, string> = {
 const TAB_BY_ROUTE = new Map<string, AppTab>(
   Object.entries(ROUTE_BY_TAB).map(([tab, route]) => [route, tab as AppTab])
 );
+TAB_BY_ROUTE.set("/upload", "Sync");
+
+const DRIVE_FOLDER_URLS = {
+  projects: "https://drive.google.com/drive/folders/1qsFTMJphBJxLlgoSikRa5QZS9grvOA0W",
+};
 
 function normalizeRoutePath(pathname: string) {
   const normalized = pathname.replace(/\/+$/, "");
@@ -257,7 +257,7 @@ function routeForTab(tab: string) {
 const TAB_LABELS: Record<string, string> = {
   Dashboard: "대시보드",
   Projects: "프로젝트",
-  "Ontology Packs": "업로드",
+  Sync: "동기화",
   "Graph Explorer": "그래프 탐색기",
   "Model Explorer": "모델 탐색기",
   "MCP Connections": "MCP 연결",
@@ -281,6 +281,14 @@ const ROLE_LABELS: Record<string, string> = {
 function numberLabel(value?: number) {
   if (!value) return "0";
   return new Intl.NumberFormat("ko-KR", { notation: value > 9999 ? "compact" : "standard" }).format(value);
+}
+
+function fileSizeLabel(value?: number | null) {
+  if (!value) return "0 B";
+  if (value >= 1024 * 1024 * 1024) return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  if (value >= 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${value} B`;
 }
 
 function tabLabel(tab: string) {
@@ -348,16 +356,12 @@ function App() {
   const [companies, setCompanies] = useState<string[]>([]);
   const [companyProjectAccess, setCompanyProjectAccess] = useState<CompanyProjectAccess>({});
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogOptions | null>(null);
-  const [uploadProjectTarget, setUploadProjectTarget] = useState<UploadProjectTarget>({
-    projectId: "",
-  });
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? projects[0];
   const selectedPackId = selectedGraphPackIds[0] ?? selectedProject?.packIds[0] ?? "";
   const graphPackOptions = selectedProject
     ? packs.filter((pack) => selectedProject.packIds.includes(pack.id))
     : [];
-  const visibleNav = nav.filter((item) => item.label !== "Admin" || currentUser?.role === "admin");
+  const visibleNav = nav.filter((item) => !["Admin", "Sync"].includes(item.label) || currentUser?.role === "admin");
 
   function navigateToTab(tab: string, options: { replace?: boolean } = {}) {
     const nextTab = nav.some((item) => item.label === tab) ? (tab as AppTab) : DEFAULT_TAB;
@@ -443,7 +447,7 @@ function App() {
   }, [currentUser?.role, authToken]);
 
   useEffect(() => {
-    if (currentUser && currentUser.role !== "admin" && activeTab === "Admin") {
+    if (currentUser && currentUser.role !== "admin" && ["Admin", "Sync"].includes(activeTab)) {
       navigateToTab("Dashboard", { replace: true });
     }
   }, [activeTab, currentUser?.role]);
@@ -470,16 +474,6 @@ function App() {
       document.removeEventListener("visibilitychange", refreshOnVisible);
     };
   }, [activeTab, currentUser?.role, authToken]);
-
-  useEffect(() => {
-    if (!projects.length) return;
-    setUploadProjectTarget((target) => {
-      if (projects.some((project) => project.id === target.projectId)) {
-        return target;
-      }
-      return { ...target, projectId: projects[0].id };
-    });
-  }, [projects]);
 
   useEffect(() => {
     if (!projects.length) {
@@ -873,62 +867,6 @@ function App() {
     setUploadStatus("로그아웃됨");
   }
 
-  async function uploadPack(file: File | undefined) {
-    if (!file) return;
-    if (currentUser?.role !== "admin") {
-      setUploadStatus("관리자 세션이 필요합니다");
-      return;
-    }
-    setUploadStatus("업로드 중");
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("project_mode", "existing");
-    if (uploadProjectTarget.projectId) {
-      formData.append("project_id", uploadProjectTarget.projectId);
-    }
-    const res = await fetch("/api/packs/upload", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${authToken}` },
-      body: formData,
-    });
-    if (!res.ok) {
-      setUploadStatus("업로드 실패");
-      return;
-    }
-    const uploaded = (await res.json()) as Pack;
-    await refreshData(uploaded.id);
-    setUploadStatus(
-      uploaded.ingest?.status === "indexed"
-        ? `${numberLabel(uploaded.ingest.documents)}개 문서 / ${numberLabel(uploaded.ingest.nodes)}개 노드 색인됨`
-        : "수집 완료"
-    );
-  }
-
-  async function uploadIfc(file: File | undefined, projectId: string) {
-    if (!file) return;
-    if (currentUser?.role !== "admin") {
-      setUploadStatus("관리자 세션이 필요합니다");
-      return;
-    }
-    setUploadStatus("IFC 업로드 중");
-    const formData = new FormData();
-    formData.append("file", file);
-    if (projectId) formData.append("project_id", projectId);
-    const res = await fetch("/api/ifc/upload", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${authToken}` },
-      body: formData,
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "IFC 업로드 실패");
-      return;
-    }
-    const payload = (await res.json()) as { filename: string; sizeBytes: number; projectName?: string | null };
-    await refreshData(undefined, authToken);
-    setUploadStatus(`${payload.projectName || "프로젝트"} IFC 저장 완료: ${payload.filename}`);
-  }
-
   async function setIfcModelProject(modelId: string, projectId: string | null) {
     if (currentUser?.role !== "admin") {
       setUploadStatus("관리자 세션이 필요합니다");
@@ -954,18 +892,21 @@ function App() {
       setUploadStatus("관리자 세션이 필요합니다");
       return;
     }
-    setUploadStatus("색인 중");
+    setUploadStatus("Drive 동기화 중");
     const res = await fetch("/api/admin/reindex", {
       method: "POST",
       headers: { Authorization: `Bearer ${authToken}` },
     });
     if (!res.ok) {
-      setUploadStatus("색인 실패");
+      const payload = await res.json().catch(() => null);
+      setUploadStatus(payload?.detail ?? "Drive 동기화 실패");
       return;
     }
     const payload = (await res.json()) as { stats: IndexStats };
     setIndexStats(payload.stats);
-    setUploadStatus("색인 준비 완료");
+    await refreshData(undefined, authToken);
+    await refreshPublicStatus(authToken);
+    setUploadStatus("Drive 동기화 완료");
   }
 
   function selectPackForGraph(packId: string) {
@@ -1193,13 +1134,6 @@ function App() {
               </select>
               <ChevronDown size={16} />
             </label>
-            <input
-              ref={fileInputRef}
-              className="file-input"
-              type="file"
-              accept=".zip"
-              onChange={(event) => uploadPack(event.currentTarget.files?.[0])}
-            />
             <div className="topbar-user-cluster">
               <div className="role-pill">
                 <CircleUserRound size={17} />
@@ -1249,16 +1183,15 @@ function App() {
           />
         )}
 
-        {activeTab === "Ontology Packs" && (
-          <OntologyPacksView
+        {activeTab === "Sync" && (
+          <SyncView
             currentUser={currentUser}
+            ifcModels={ifcModels}
             packs={packs}
             projects={projects}
             selectedPackId={selectedPackId}
-            uploadProjectTarget={uploadProjectTarget}
-            onUploadIfc={uploadIfc}
-            onUploadProjectTargetChange={setUploadProjectTarget}
-            onUpload={() => fileInputRef.current?.click()}
+            uploadStatus={uploadStatus}
+            onSync={reindexPacks}
           />
         )}
 
@@ -1310,7 +1243,7 @@ function App() {
             onRefreshUsers={refreshAdminDirectory}
             onSetUserRole={updateManagedUserRole}
             onSetCompanyProjectAccess={updateCompanyProjectAccess}
-            onUpload={() => fileInputRef.current?.click()}
+            onUpload={reindexPacks}
           />
         )}
 
@@ -1718,7 +1651,7 @@ function DashboardView({
             )) : (
               <div className="compact-row static empty-row">
                 <strong>업로드된 IFC 모델 없음</strong>
-                <span>업로드 메뉴에서 IFC 모델을 추가하세요</span>
+                <span>동기화 탭에서 Drive 모델을 등록하세요</span>
               </div>
             )}
           </div>
@@ -2174,79 +2107,45 @@ function ProjectsView({
   );
 }
 
-function OntologyPacksView({
+function SyncView({
   currentUser,
+  ifcModels,
   packs,
   projects,
   selectedPackId,
-  uploadProjectTarget,
-  onUploadIfc,
-  onUploadProjectTargetChange,
-  onUpload,
+  uploadStatus,
+  onSync,
 }: {
   currentUser: CurrentUser | null;
+  ifcModels: IfcModel[];
   packs: Pack[];
   projects: Project[];
   selectedPackId: string;
-  uploadProjectTarget: UploadProjectTarget;
-  onUploadIfc: (file: File | undefined, projectId: string) => void;
-  onUploadProjectTargetChange: (target: UploadProjectTarget) => void;
-  onUpload: () => void;
+  uploadStatus: string;
+  onSync: () => void;
 }) {
   const isAdmin = currentUser?.role === "admin";
-  const ifcInputRef = useRef<HTMLInputElement | null>(null);
-  const [ifcProjectId, setIfcProjectId] = useState(projects[0]?.id ?? "");
   const projectByPackId = new Map<string, string>();
   projects.forEach((project) => {
     project.packIds.forEach((packId) => projectByPackId.set(packId, project.name));
   });
-  const ifcProject = projects.find((project) => project.id === ifcProjectId) ?? projects[0];
-
-  useEffect(() => {
-    if (!projects.length) {
-      setIfcProjectId("");
-      return;
-    }
-    setIfcProjectId((current) => (current && projects.some((project) => project.id === current) ? current : projects[0].id));
-  }, [projects]);
 
   return (
     <section className="management-grid">
       <div className="overview-panel ifc-upload-panel">
         <div className="panel-header slim">
           <div>
-            <h2>IFC 업로드</h2>
-            <span>{isAdmin ? "프로젝트 기준 IFC 원본 저장" : "관리자 세션이 필요합니다"}</span>
+            <h2>Drive 동기화</h2>
+            <span>{isAdmin ? "Google Drive에 올린 모델과 팩을 앱에 등록합니다" : "관리자 세션이 필요합니다"}</span>
           </div>
-          <Database size={19} />
+          <RefreshCw size={19} />
         </div>
         <div className="action-stack">
-          <label className="ifc-upload-target">
-            <span>대상 프로젝트</span>
-            <select
-              disabled={!isAdmin}
-              value={ifcProjectId}
-              onChange={(event) => setIfcProjectId(event.target.value)}
-            >
-              {projects.map((project) => (
-                <option key={project.id} value={project.id}>{project.name}</option>
-              ))}
-            </select>
-          </label>
-          <input
-            ref={ifcInputRef}
-            className="file-input"
-            type="file"
-            accept=".ifc,.ifczip,.zip"
-            onChange={(event) => {
-              onUploadIfc(event.currentTarget.files?.[0], ifcProjectId);
-              event.currentTarget.value = "";
-            }}
-          />
-          <button className="primary-button block" disabled={!isAdmin || !ifcProjectId} onClick={() => ifcInputRef.current?.click()}>
-            <Upload size={17} />
-            IFC 파일 업로드
+          <button className="primary-button block" disabled={!isAdmin} onClick={onSync}>
+            <RefreshCw size={17} />
+            Drive에서 동기화
           </button>
+          <span className="sync-status-text">{uploadStatus || "관리자가 Drive에 파일을 올린 뒤 동기화하세요"}</span>
         </div>
       </div>
 
@@ -2254,54 +2153,48 @@ function OntologyPacksView({
         <div className="panel-header slim">
           <div>
             <h2>IFC 모델</h2>
-            <span>뷰어 연결 전 원본 파일을 프로젝트에 매핑합니다</span>
+            <span>프로젝트별 ifc-models 폴더에서 동기화된 모델입니다</span>
           </div>
           <FileArchive size={19} />
         </div>
-        <div className="ifc-staging-body">
-          <div>
-            <strong>{ifcProject?.name ?? "프로젝트를 선택하세요"}</strong>
-            <span>{ifcProject ? `${ifcProject.packIds.length}개 온톨로지 팩과 함께 관리` : "IFC 업로드 대상 없음"}</span>
-          </div>
-          <div className="ifc-format-list">
-            <span>.ifc</span>
-            <span>.ifczip</span>
-            <span>.zip</span>
-          </div>
-          <p>IFC 뷰어가 연결되면 이 영역에서 모델 미리보기와 그래프 노드 하이라이트를 함께 제공합니다.</p>
+        <div className="pack-table">
+          {ifcModels.length ? ifcModels.map((model) => (
+            <div className="pack-table-row" key={model.id}>
+              <strong>{model.filename}</strong>
+              <span>{model.projectName || model.projectId || "미연결"}</span>
+              <span>{model.storage || "local"}</span>
+              <span>{model.sizeBytes ? fileSizeLabel(model.sizeBytes) : "-"}</span>
+              <em>{model.viewerStatus === "ready" ? "뷰어 준비" : "등록됨"}</em>
+            </div>
+          )) : (
+            <p className="empty-list-note">동기화된 IFC 모델이 없습니다.</p>
+          )}
         </div>
       </div>
 
       <div className="overview-panel ontology-upload-panel">
         <div className="panel-header slim">
           <div>
-            <h2>온톨로지 ZIP 업로드</h2>
-            <span>{isAdmin ? "팩 생성 및 재색인" : "관리자 세션이 필요합니다"}</span>
+            <h2>Drive 폴더 규칙</h2>
+            <span>관리자가 Drive에 직접 업로드합니다</span>
           </div>
           <PackageCheck size={19} />
         </div>
         <div className="action-stack">
-          <div className="upload-project-target">
-            <span>대상 프로젝트</span>
-            <select
-              disabled={!isAdmin}
-              value={uploadProjectTarget.projectId}
-              onChange={(event) =>
-                onUploadProjectTargetChange({
-                  ...uploadProjectTarget,
-                  projectId: event.target.value,
-                })
-              }
-            >
-              {projects.map((project) => (
-                <option key={project.id} value={project.id}>{project.name}</option>
-              ))}
-            </select>
+          <div className="sync-folder-list">
+            <a href={DRIVE_FOLDER_URLS.projects} target="_blank" rel="noreferrer">
+              <strong>프로젝트</strong>
+              프로젝트 탭에서 먼저 프로젝트를 생성하고, 생성된 project-id와 같은 이름으로 02_Projects 안에 폴더를 만듭니다.
+            </a>
+            <a href={DRIVE_FOLDER_URLS.projects} target="_blank" rel="noreferrer">
+              <strong>IFC/XKT</strong>
+              02_Projects/&lt;project-id&gt;/ifc-models
+            </a>
+            <a href={DRIVE_FOLDER_URLS.projects} target="_blank" rel="noreferrer">
+              <strong>팩 ZIP</strong>
+              02_Projects/&lt;project-id&gt;/ontology-packs
+            </a>
           </div>
-          <button className="primary-button block" disabled={!isAdmin || !uploadProjectTarget.projectId} onClick={onUpload}>
-            <Upload size={17} />
-            ZIP 팩 업로드
-          </button>
         </div>
       </div>
 
@@ -2309,7 +2202,7 @@ function OntologyPacksView({
         <div className="panel-header slim">
           <div>
             <h2>온톨로지 팩</h2>
-            <span>로컬 ZIP 팩 {packs.length}개 발견</span>
+            <span>프로젝트별 ontology-packs 폴더에서 동기화된 ZIP 팩 {packs.length}개</span>
           </div>
           <FileArchive size={19} />
         </div>
@@ -2595,12 +2488,8 @@ function AdminView({
         </div>
         <div className="action-stack">
           <button className="primary-button block" onClick={onUpload}>
-            <Upload size={17} />
-            팩 업로드
-          </button>
-          <button className="secondary-button" onClick={onReindex}>
             <RefreshCw size={17} />
-            저장소 재색인
+            Drive 동기화
           </button>
         </div>
       </div>
@@ -2760,7 +2649,7 @@ function AdminView({
           <Users size={19} />
         </div>
         <div className="policy-grid">
-          <span><CheckCircle2 size={16} /> 관리자: 회원 승인, 권한 변경, 팩 업로드, 재색인</span>
+          <span><CheckCircle2 size={16} /> 관리자: 회원 승인, 권한 변경, Drive 동기화, 재색인</span>
           <span><CheckCircle2 size={16} /> 멤버: 프로젝트와 그래프 탐색, MCP 연결 정보 확인</span>
           <span><CheckCircle2 size={16} /> 승인 대기: 로그인 차단</span>
         </div>
@@ -3159,7 +3048,7 @@ function GraphProjectEmptyState({ projectName }: { projectName?: string }) {
       <Database size={30} />
       <strong>온톨로지 팩이 없습니다.</strong>
       <span>{projectName ? `${projectName} 프로젝트에 연결된 온톨로지 팩이 없습니다.` : "선택한 프로젝트에 연결된 온톨로지 팩이 없습니다."}</span>
-      <em>업로드 탭에서 온톨로지 ZIP 팩을 이 프로젝트에 추가하면 그래프 탐색기를 사용할 수 있습니다.</em>
+      <em>Drive에 온톨로지 ZIP 팩을 올린 뒤 동기화 탭에서 등록하면 그래프 탐색기를 사용할 수 있습니다.</em>
     </div>
   );
 }

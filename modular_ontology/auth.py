@@ -38,8 +38,61 @@ class Session:
     expires_at: datetime
 
 
-def _hash_password(password: str) -> str:
+def _base64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _base64url_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
+SCRYPT_N = 2**14
+SCRYPT_R = 8
+SCRYPT_P = 1
+SCRYPT_DKLEN = 32
+
+
+def _legacy_sha256_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def _hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=SCRYPT_N,
+        r=SCRYPT_R,
+        p=SCRYPT_P,
+        dklen=SCRYPT_DKLEN,
+    )
+    return "scrypt${}${}${}${}${}".format(
+        SCRYPT_N,
+        SCRYPT_R,
+        SCRYPT_P,
+        _base64url_encode(salt),
+        _base64url_encode(digest),
+    )
+
+
+def _verify_password(password: str, password_hash: str) -> bool:
+    if password_hash.startswith("scrypt$"):
+        try:
+            _, raw_n, raw_r, raw_p, salt_b64, digest_b64 = password_hash.split("$", 5)
+            expected = _base64url_decode(digest_b64)
+            digest = hashlib.scrypt(
+                password.encode("utf-8"),
+                salt=_base64url_decode(salt_b64),
+                n=int(raw_n),
+                r=int(raw_r),
+                p=int(raw_p),
+                dklen=len(expected),
+            )
+            return hmac.compare_digest(digest, expected)
+        except (ValueError, TypeError, OSError):
+            return False
+    return hmac.compare_digest(password_hash, _legacy_sha256_password(password))
 
 
 def _default_admin_password_hash(env_name: str) -> str:
@@ -89,23 +142,18 @@ def _normalize_email(email: str) -> str:
     return normalized
 
 
-def _base64url_encode(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
-
-
-def _base64url_decode(data: str) -> bytes:
-    padding = "=" * (-len(data) % 4)
-    return base64.urlsafe_b64decode(data + padding)
-
-
-def _session_secret() -> bytes:
+def _configured_session_secret() -> bytes | None:
     configured = env("MODULAR_ONTOLOGY_SESSION_SECRET") or env("MODULAR_ONTOLOGY_AUTH_SECRET")
     if configured:
         return str(configured).encode("utf-8")
-    users_fingerprint = "|".join(
-        f"{user.id}:{user.email}:{user.password_hash}:{user.status}" for user in sorted(load_users().values(), key=lambda item: item.email)
-    )
-    return hashlib.sha256(f"modular-ontology-session:{users_fingerprint}".encode("utf-8")).digest()
+    return None
+
+
+def _session_secret() -> bytes:
+    configured = _configured_session_secret()
+    if not configured:
+        raise RuntimeError("MODULAR_ONTOLOGY_SESSION_SECRET is required for signed stateless sessions.")
+    return configured
 
 
 def _sign_token_payload(payload: str) -> str:
@@ -128,7 +176,15 @@ def _create_signed_token(user: User, expires_at: datetime) -> str:
     return f"v1.{payload}.{signature}"
 
 
+def _create_session_token(user: User, expires_at: datetime) -> str:
+    if _configured_session_secret():
+        return _create_signed_token(user, expires_at)
+    return secrets.token_urlsafe(32)
+
+
 def _user_from_signed_token(token: str) -> User | None:
+    if not _configured_session_secret():
+        return None
     parts = token.split(".")
     if len(parts) != 3 or parts[0] != "v1":
         return None
@@ -541,17 +597,45 @@ def set_user_company(email: str, company: str) -> User:
     return updated
 
 
+def _password_hash_needs_upgrade(password_hash: str) -> bool:
+    return not password_hash.startswith("scrypt$")
+
+
+def _upgrade_file_user_password_hash(email: str, password: str) -> User | None:
+    normalized_email = _normalize_email(email)
+    path = _users_file_path().resolve()
+    file_users = _load_file_users(path)
+    user = file_users.get(normalized_email)
+    if not user:
+        return None
+    upgraded = User(
+        id=user.id,
+        name=user.name,
+        email=user.email,
+        company=user.company,
+        role=user.role,
+        password_hash=_hash_password(password),
+        status=user.status,
+    )
+    file_users[normalized_email] = upgraded
+    _save_file_users(path, file_users)
+    _invalidate_users_cache()
+    return upgraded
+
+
 def authenticate(email: str, password: str) -> tuple[str, User]:
     user = load_users().get(email.strip().lower())
     if not user:
         raise PermissionError("Invalid email or password.")
-    if not hmac.compare_digest(user.password_hash, _hash_password(password)):
+    if not _verify_password(password, user.password_hash):
         raise PermissionError("Invalid email or password.")
     if user.status != "active":
         raise PermissionError("Account is waiting for administrator approval.")
+    if _password_hash_needs_upgrade(user.password_hash):
+        user = _upgrade_file_user_password_hash(user.email, password) or user
 
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=TOKEN_TTL_SECONDS)
-    token = _create_signed_token(user, expires_at)
+    token = _create_session_token(user, expires_at)
     SESSIONS[token] = Session(
         token=token,
         user_id=user.id,

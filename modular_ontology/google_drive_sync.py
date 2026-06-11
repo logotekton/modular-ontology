@@ -5,11 +5,13 @@ import json
 import mimetypes
 import os
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,7 @@ from .config import (
     LEGACY_ONTOLOGY_PACKS_FOLDER,
     MCP_TOKENS_FILE,
     ONTOLOGY_PACKS_FOLDER,
+    PROJECTS_FOLDER,
     env,
 )
 
@@ -36,6 +39,10 @@ RESUMABLE_UPLOAD_THRESHOLD = 5 * 1024 * 1024
 RESUMABLE_UPLOAD_CHUNK_SIZE = 16 * 1024 * 1024  # must be a multiple of 256 KiB
 DATABASE_FILENAME = "modular_ontology.sqlite3"
 LEGACY_DATABASE_FILENAME = "mod" + "dular_" + "graph.sqlite3"
+PROJECT_IFC_FOLDER = "ifc-models"
+PROJECT_PACKS_FOLDER = "ontology-packs"
+PROJECT_PACK_LINKS_FILENAME = ".drive-project-pack-links.json"
+_DB_SYNC_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -329,6 +336,7 @@ def sync_google_drive_storage(
     root = _children_by_name(client, root_folder_id)
     downloaded: list[str] = []
     missing: list[str] = []
+    warnings: list[str] = []
 
     admin = root.get(ADMIN_FOLDER)
     if admin and admin.is_folder:
@@ -349,6 +357,16 @@ def sync_google_drive_storage(
     else:
         missing.append(DATABASE_FOLDER)
 
+    projects = root.get(PROJECTS_FOLDER)
+    project_root_found = bool(projects and projects.is_folder)
+    if projects and projects.is_folder:
+        project_downloads, project_pack_links = _download_project_assets(client, projects.id, data_dir, warnings=warnings)
+        downloaded.extend(project_downloads)
+        _write_project_pack_links(data_dir, project_pack_links)
+    else:
+        _write_project_pack_links(data_dir, {})
+        missing.append(PROJECTS_FOLDER)
+
     pack_roots = [
         item
         for item in (root.get(ONTOLOGY_PACKS_FOLDER), root.get(LEGACY_ONTOLOGY_PACKS_FOLDER))
@@ -359,17 +377,17 @@ def sync_google_drive_storage(
             pack_folders = _children_by_name(client, packs.id)
             indexed = pack_folders.get("indexed")
             if indexed and indexed.is_folder:
-                downloaded.extend(_download_zip_files(client, indexed.id, data_dir / ONTOLOGY_PACKS_FOLDER / "indexed"))
-            elif packs.name == ONTOLOGY_PACKS_FOLDER:
+                downloaded.extend(_download_zip_files(client, indexed.id, data_dir / ONTOLOGY_PACKS_FOLDER / "indexed", warnings=warnings))
+            elif packs.name == ONTOLOGY_PACKS_FOLDER and not project_root_found:
                 missing.append(f"{ONTOLOGY_PACKS_FOLDER}/indexed")
-    else:
+    elif not project_root_found:
         missing.append(ONTOLOGY_PACKS_FOLDER)
 
     ifc_models = root.get(IFC_MODELS_FOLDER)
     if ifc_models and ifc_models.is_folder:
-        downloaded.extend(_download_ifc_metadata_files(client, ifc_models.id, data_dir / IFC_MODELS_FOLDER))
+        downloaded.extend(_download_ifc_metadata_files(client, ifc_models.id, data_dir / IFC_MODELS_FOLDER, warnings=warnings))
 
-    result = {"status": "synced", "synced_at": time.time(), "downloaded": downloaded, "missing": missing}
+    result = {"status": "synced", "synced_at": time.time(), "downloaded": downloaded, "missing": missing, "warnings": warnings}
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
@@ -482,22 +500,39 @@ def write_back_mcp_tokens_file(*, data_dir: Path = DATA_DIR, client: GoogleDrive
 
 
 def write_back_database_file(*, client: GoogleDriveClient | None = None) -> dict[str, Any]:
-    _checkpoint_sqlite(DB_PATH)
-    return write_back_google_drive_file(
-        DB_PATH,
-        [DATABASE_FOLDER],
-        client=client,
-        name=DATABASE_FILENAME,
-        mime_type="application/vnd.sqlite3",
-    )
+    with _DB_SYNC_LOCK:
+        _checkpoint_sqlite(DB_PATH, truncate=True)
+        return write_back_google_drive_file(
+            DB_PATH,
+            [DATABASE_FOLDER],
+            client=client,
+            name=DATABASE_FILENAME,
+            mime_type="application/vnd.sqlite3",
+        )
 
 
-def write_back_pack_file(pack_path: Path, *, client: GoogleDriveClient | None = None) -> dict[str, Any]:
+def write_back_pack_file(
+    pack_path: Path,
+    *,
+    project_id: str | None = None,
+    client: GoogleDriveClient | None = None,
+) -> dict[str, Any]:
+    if not project_id:
+        return {
+            "status": "skipped",
+            "reason": "Project-scoped pack write-back needs a project_id.",
+            "source": str(pack_path.resolve()),
+        }
+    safe_project_id = _safe_drive_filename(project_id)
+    name = pack_path.name
+    scoped_prefix = f"{safe_project_id}__"
+    if name.startswith(scoped_prefix):
+        name = name[len(scoped_prefix) :]
     return write_back_google_drive_file(
         pack_path,
-        [ONTOLOGY_PACKS_FOLDER, "indexed"],
+        [PROJECTS_FOLDER, safe_project_id, PROJECT_PACKS_FOLDER],
         client=client,
-        name=pack_path.name,
+        name=name,
         mime_type="application/zip",
         create_folders=True,
     )
@@ -509,9 +544,10 @@ def write_back_ifc_file(
     *,
     client: GoogleDriveClient | None = None,
 ) -> dict[str, Any]:
+    safe_project_id = _safe_drive_filename(project_id)
     return write_back_google_drive_file(
         ifc_path,
-        [IFC_MODELS_FOLDER, project_id, "files"],
+        [PROJECTS_FOLDER, safe_project_id, PROJECT_IFC_FOLDER],
         client=client,
         name=ifc_path.name,
         mime_type=_guess_mime_type(ifc_path),
@@ -525,9 +561,10 @@ def write_back_ifc_metadata_file(
     *,
     client: GoogleDriveClient | None = None,
 ) -> dict[str, Any]:
+    safe_project_id = _safe_drive_filename(project_id)
     return write_back_google_drive_file(
         metadata_path,
-        [IFC_MODELS_FOLDER, project_id, "metadata"],
+        [PROJECTS_FOLDER, safe_project_id, "metadata"],
         client=client,
         name=metadata_path.name,
         mime_type="application/json; charset=utf-8",
@@ -535,16 +572,50 @@ def write_back_ifc_metadata_file(
     )
 
 
+def ensure_project_drive_folders(
+    project_id: str,
+    *,
+    client: GoogleDriveClient | None = None,
+    root_folder_id: str | None = None,
+) -> dict[str, Any]:
+    root_folder_id = root_folder_id or str(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "")).strip()
+    if not root_folder_id:
+        return {"status": "skipped", "reason": "MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set."}
+    safe_project_id = _safe_drive_filename(project_id)
+    client = client or GoogleDriveClient.from_env()
+    projects_folder_id = _resolve_folder_path(client, root_folder_id, [PROJECTS_FOLDER], create_missing=True)
+    project_folder_id = _resolve_folder_path(client, root_folder_id, [PROJECTS_FOLDER, safe_project_id], create_missing=True)
+    ensured_paths = [f"{PROJECTS_FOLDER}/{safe_project_id}"]
+    for folder_name in (PROJECT_IFC_FOLDER, PROJECT_PACKS_FOLDER):
+        _resolve_folder_path(client, project_folder_id, [folder_name], create_missing=True)
+        ensured_paths.append(f"{PROJECTS_FOLDER}/{safe_project_id}/{folder_name}")
+    return {
+        "status": "ensured",
+        "projectId": safe_project_id,
+        "projectsFolderId": projects_folder_id,
+        "projectFolderId": project_folder_id,
+        "paths": ensured_paths,
+        "written_at": time.time(),
+    }
+
+
 def _children_by_name(client: GoogleDriveClient, folder_id: str) -> dict[str, DriveItem]:
     children: dict[str, DriveItem] = {}
-    duplicates: set[str] = set()
     for item in client.list_children(folder_id):
-        if item.name in children:
-            duplicates.add(item.name)
-        children[item.name] = item
-    if duplicates:
-        raise RuntimeError(f"Duplicate Google Drive item names in folder {folder_id}: {', '.join(sorted(duplicates))}")
+        existing = children.get(item.name)
+        if not existing or _prefer_drive_item(item, existing):
+            children[item.name] = item
     return children
+
+
+def _prefer_drive_item(candidate: DriveItem, current: DriveItem) -> bool:
+    if candidate.is_folder != current.is_folder:
+        return candidate.is_folder
+    candidate_time = _drive_time_to_epoch(candidate.modified_time) or 0
+    current_time = _drive_time_to_epoch(current.modified_time) or 0
+    if candidate_time != current_time:
+        return candidate_time > current_time
+    return candidate.id > current.id
 
 
 def _resolve_folder_path(
@@ -588,25 +659,268 @@ def _download_database_file(client: GoogleDriveClient, folder_id: str, target_di
     if not source:
         return []
     target = target_dir / DATABASE_FILENAME
-    client.download_file(source.id, target)
+    staging = target.with_name(f".{target.name}.download")
+    client.download_file(source.id, staging)
+    with _DB_SYNC_LOCK:
+        _remove_sqlite_sidecars(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staging, target)
+        _remove_sqlite_sidecars(target)
     return [str(target)]
 
 
-def _download_ifc_metadata_files(client: GoogleDriveClient, ifc_folder_id: str, target_dir: Path) -> list[str]:
+def _download_ifc_metadata_files(
+    client: GoogleDriveClient,
+    ifc_folder_id: str,
+    target_dir: Path,
+    *,
+    warnings: list[str] | None = None,
+) -> list[str]:
     downloaded: list[str] = []
     for project in client.list_children(ifc_folder_id):
         if not project.is_folder:
             continue
-        metadata_folder = _children_by_name(client, project.id).get("metadata")
-        if not metadata_folder or not metadata_folder.is_folder:
+        project_id = _safe_drive_filename_or_none(project.name, warnings, f"{IFC_MODELS_FOLDER} project folder")
+        if not project_id:
             continue
-        for item in client.list_children(metadata_folder.id):
-            if item.is_folder or not item.name.endswith(".metadata.json"):
-                continue
-            target = target_dir / _safe_drive_filename(project.name) / "metadata" / _safe_drive_filename(item.name)
-            client.download_file(item.id, target)
-            downloaded.append(str(target))
+        project_children = _children_by_name(client, project.id)
+        metadata_folder = project_children.get("metadata")
+        existing_metadata_names: set[str] = set()
+        if metadata_folder and metadata_folder.is_folder:
+            for item in client.list_children(metadata_folder.id):
+                if item.is_folder or not item.name.endswith(".metadata.json"):
+                    continue
+                metadata_name = _safe_drive_filename_or_none(item.name, warnings, f"{IFC_MODELS_FOLDER}/{project.name}/metadata")
+                if not metadata_name:
+                    continue
+                target = target_dir / project_id / "metadata" / metadata_name
+                if _is_project_metadata_file(target):
+                    existing_metadata_names.add(metadata_name)
+                    continue
+                client.download_file(item.id, target)
+                existing_metadata_names.add(metadata_name)
+                downloaded.append(str(target))
+
+        files_folder = project_children.get("files")
+        if files_folder and files_folder.is_folder:
+            downloaded.extend(
+                _register_ifc_files_from_drive_folder(
+                    client,
+                    files_folder.id,
+                    target_dir,
+                    project_id,
+                    project.name,
+                    f"{IFC_MODELS_FOLDER}/{project.name}/files",
+                    existing_metadata_names=existing_metadata_names,
+                    warnings=warnings,
+                )
+            )
     return downloaded
+
+
+def _download_project_assets(
+    client: GoogleDriveClient,
+    projects_folder_id: str,
+    data_dir: Path,
+    *,
+    warnings: list[str] | None = None,
+) -> tuple[list[str], dict[str, list[str]]]:
+    downloaded: list[str] = []
+    project_pack_links: dict[str, list[str]] = {}
+    for project in client.list_children(projects_folder_id):
+        if not project.is_folder:
+            continue
+        project_id = _safe_drive_filename_or_none(project.name, warnings, f"{PROJECTS_FOLDER} project folder")
+        if not project_id:
+            continue
+        project_children = _children_by_name(client, project.id)
+        metadata_folder = project_children.get("metadata")
+        existing_metadata_names: set[str] = set()
+        target_metadata_dir = data_dir / IFC_MODELS_FOLDER / project_id / "metadata"
+        if metadata_folder and metadata_folder.is_folder:
+            for item in client.list_children(metadata_folder.id):
+                if item.is_folder or not item.name.endswith(".metadata.json"):
+                    continue
+                metadata_name = _safe_drive_filename_or_none(item.name, warnings, f"{PROJECTS_FOLDER}/{project.name}/metadata")
+                if not metadata_name:
+                    continue
+                target = target_metadata_dir / metadata_name
+                client.download_file(item.id, target)
+                existing_metadata_names.add(metadata_name)
+                downloaded.append(str(target))
+
+        ifc_folder = project_children.get(PROJECT_IFC_FOLDER)
+        if ifc_folder and ifc_folder.is_folder:
+            active_metadata_names: set[str] = set()
+            downloaded.extend(
+                _register_ifc_files_from_drive_folder(
+                    client,
+                    ifc_folder.id,
+                    data_dir / IFC_MODELS_FOLDER,
+                    project_id,
+                    project.name,
+                    f"{PROJECTS_FOLDER}/{project.name}/{PROJECT_IFC_FOLDER}",
+                    existing_metadata_names=existing_metadata_names,
+                    active_metadata_names=active_metadata_names,
+                    source_is_project=True,
+                    warnings=warnings,
+                )
+            )
+            _prune_project_metadata(target_metadata_dir, active_metadata_names)
+
+        packs_folder = project_children.get(PROJECT_PACKS_FOLDER)
+        if packs_folder and packs_folder.is_folder:
+            pack_downloads = _download_project_zip_files(
+                client,
+                packs_folder.id,
+                data_dir / ONTOLOGY_PACKS_FOLDER / "indexed",
+                project_id,
+                warnings=warnings,
+            )
+            downloaded.extend(pack_downloads)
+            project_pack_links[project_id] = [_pack_id_from_zip(Path(path)) for path in pack_downloads]
+    return downloaded, project_pack_links
+
+
+def _register_ifc_files_from_drive_folder(
+    client: GoogleDriveClient,
+    files_folder_id: str,
+    target_dir: Path,
+    project_id: str,
+    project_name: str,
+    drive_folder_path: str,
+    *,
+    existing_metadata_names: set[str] | None = None,
+    active_metadata_names: set[str] | None = None,
+    source_is_project: bool = False,
+    warnings: list[str] | None = None,
+) -> list[str]:
+    downloaded: list[str] = []
+    existing_metadata_names = existing_metadata_names or set()
+    registered_metadata_names: set[str] = set()
+    file_items = [
+        item
+        for item in client.list_children(files_folder_id)
+        if not item.is_folder and Path(item.name).suffix.lower() in {".ifc", ".ifczip", ".zip", ".xkt"}
+    ]
+    file_items.sort(key=lambda item: (Path(item.name).suffix.lower() == ".xkt", item.name.lower()))
+    safe_names: dict[str, str] = {}
+    for item in file_items:
+        safe_name = _safe_drive_filename_or_none(item.name, warnings, drive_folder_path)
+        if safe_name:
+            safe_names[item.name] = safe_name
+    file_names = set(safe_names.values())
+    for item in file_items:
+        safe_name = safe_names.get(item.name)
+        if not safe_name:
+            continue
+        stem = Path(safe_name).stem
+        metadata_name = f"{stem}.metadata.json"
+        if metadata_name in registered_metadata_names:
+            continue
+        if active_metadata_names is not None:
+            active_metadata_names.add(metadata_name)
+        target = target_dir / project_id / "metadata" / metadata_name
+        if metadata_name in existing_metadata_names and not source_is_project:
+            continue
+        if _is_project_metadata_file(target) and not source_is_project:
+            existing_metadata_names.add(metadata_name)
+            continue
+        sibling_xkt = Path(safe_name).suffix.lower() == ".xkt" or f"{stem}.xkt" in file_names
+        metadata = {
+            "filename": safe_name,
+            "sizeBytes": item.size,
+            "projectId": project_id,
+            "projectName": project_name,
+            "uploadedAt": _drive_time_to_epoch(item.modified_time),
+            "storage": "google-drive",
+            "localPath": str(target_dir / project_id / "files" / safe_name),
+            "viewerStatus": "ready" if sibling_xkt else "pending-xkt",
+            "xktPath": str(target_dir / project_id / "files" / f"{stem}.xkt") if sibling_xkt else None,
+            "xktError": None if sibling_xkt else f"XKT file is not available in Google Drive {drive_folder_path} folder.",
+            "drive": {
+                "file": {
+                    "id": item.id,
+                    "name": item.name,
+                    "folder": drive_folder_path,
+                    "modifiedTime": item.modified_time,
+                }
+            },
+        }
+        if source_is_project and not _project_metadata_needs_update(target, metadata):
+            existing_metadata_names.add(metadata_name)
+            registered_metadata_names.add(metadata_name)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        existing_metadata_names.add(metadata_name)
+        registered_metadata_names.add(metadata_name)
+        downloaded.append(str(target))
+    return downloaded
+
+
+def _is_project_metadata_file(target: Path) -> bool:
+    try:
+        metadata = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    drive_folder = (
+        metadata.get("drive", {})
+        .get("file", {})
+        .get("folder")
+        if isinstance(metadata.get("drive"), dict)
+        else None
+    )
+    return isinstance(drive_folder, str) and drive_folder.startswith(f"{PROJECTS_FOLDER}/")
+
+
+def _project_metadata_needs_update(target: Path, metadata: dict[str, Any]) -> bool:
+    try:
+        existing = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+    if not _is_project_metadata_file(target):
+        return True
+    existing_drive_file = existing.get("drive", {}).get("file", {}) if isinstance(existing.get("drive"), dict) else {}
+    next_drive_file = metadata.get("drive", {}).get("file", {}) if isinstance(metadata.get("drive"), dict) else {}
+    comparable_keys = ("filename", "sizeBytes", "viewerStatus", "xktPath", "xktError")
+    for key in comparable_keys:
+        if existing.get(key) != metadata.get(key):
+            return True
+    for key in ("id", "name", "folder", "modifiedTime"):
+        if existing_drive_file.get(key) != next_drive_file.get(key):
+            return True
+    return False
+
+
+def _prune_project_metadata(metadata_dir: Path, active_metadata_names: set[str]) -> None:
+    if not metadata_dir.exists():
+        return
+    for target in metadata_dir.glob("*.metadata.json"):
+        if target.name in active_metadata_names:
+            continue
+        if _is_project_metadata_file(target):
+            target.unlink(missing_ok=True)
+
+
+def _write_project_pack_links(data_dir: Path, project_pack_links: dict[str, list[str]]) -> None:
+    marker = data_dir / PROJECTS_FOLDER / PROJECT_PACK_LINKS_FILENAME
+    if not project_pack_links:
+        marker.unlink(missing_ok=True)
+        return
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps(project_pack_links, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _drive_time_to_epoch(value: str) -> float | None:
+    if not value:
+        return None
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 def restore_ifc_files_from_drive(
@@ -622,31 +936,37 @@ def restore_ifc_files_from_drive(
     if not root_folder_id or not file_names:
         return []
     client = client or GoogleDriveClient.from_env()
+    wanted = {_safe_drive_filename(name) for name in file_names}
+    downloaded: list[str] = []
+    for drive_folder_path in (
+        [PROJECTS_FOLDER, project_folder, PROJECT_IFC_FOLDER],
+        [IFC_MODELS_FOLDER, project_folder, "files"],
+    ):
+        try:
+            folder_id = _resolve_folder_path(client, root_folder_id, drive_folder_path)
+        except RuntimeError:
+            continue
+        children = _children_by_name(client, folder_id)
+        for name in list(wanted):
+            item = children.get(name)
+            if not item or item.is_folder:
+                continue
+            target = target_dir / name
+            client.download_file(item.id, target)
+            downloaded.append(str(target))
+            wanted.remove(name)
+        if not wanted:
+            break
+    return downloaded
+
+
+def _safe_drive_filename_or_none(name: str, warnings: list[str] | None, context: str) -> str | None:
     try:
-        folder_id = _resolve_folder_path(client, root_folder_id, [IFC_MODELS_FOLDER, project_folder, "files"])
-    except RuntimeError:
-        return []
-    children = _children_by_name(client, folder_id)
-    downloaded: list[str] = []
-    for name in file_names:
-        item = children.get(name)
-        if not item or item.is_folder:
-            continue
-        target = target_dir / _safe_drive_filename(name)
-        client.download_file(item.id, target)
-        downloaded.append(str(target))
-    return downloaded
-
-
-def _download_zip_files(client: GoogleDriveClient, folder_id: str, target_dir: Path) -> list[str]:
-    downloaded: list[str] = []
-    for item in client.list_children(folder_id):
-        if item.is_folder or not item.name.lower().endswith(".zip"):
-            continue
-        target = target_dir / _safe_drive_filename(item.name)
-        client.download_file(item.id, target)
-        downloaded.append(str(target))
-    return downloaded
+        return _safe_drive_filename(name)
+    except RuntimeError as exc:
+        if warnings is not None:
+            warnings.append(f"{context}: {exc}")
+        return None
 
 
 def _safe_drive_filename(name: str) -> str:
@@ -661,7 +981,16 @@ def _guess_mime_type(path: Path) -> str:
     return guessed or "application/octet-stream"
 
 
-def _checkpoint_sqlite(path: Path) -> None:
+def _sqlite_sidecar_paths(path: Path) -> list[Path]:
+    return [Path(f"{path}-wal"), Path(f"{path}-shm")]
+
+
+def _remove_sqlite_sidecars(path: Path) -> None:
+    for sidecar in _sqlite_sidecar_paths(path):
+        sidecar.unlink(missing_ok=True)
+
+
+def _checkpoint_sqlite(path: Path, *, truncate: bool = False) -> None:
     if not path.exists() or path.suffix.lower() not in {".sqlite", ".sqlite3", ".db"}:
         return
     try:
@@ -669,11 +998,78 @@ def _checkpoint_sqlite(path: Path) -> None:
 
         conn = sqlite3.connect(path)
         try:
-            conn.execute("PRAGMA wal_checkpoint(FULL);")
+            mode = "TRUNCATE" if truncate else "FULL"
+            conn.execute(f"PRAGMA wal_checkpoint({mode});")
         finally:
             conn.close()
     except sqlite3.Error:
         return
+
+
+def _download_zip_files(
+    client: GoogleDriveClient,
+    folder_id: str,
+    target_dir: Path,
+    *,
+    warnings: list[str] | None = None,
+) -> list[str]:
+    downloaded: list[str] = []
+    for item in client.list_children(folder_id):
+        if item.is_folder or not item.name.lower().endswith(".zip"):
+            continue
+        safe_name = _safe_drive_filename_or_none(item.name, warnings, "legacy ontology pack folder")
+        if not safe_name:
+            continue
+        target = target_dir / safe_name
+        client.download_file(item.id, target)
+        downloaded.append(str(target))
+    return downloaded
+
+
+def _download_project_zip_files(
+    client: GoogleDriveClient,
+    folder_id: str,
+    target_dir: Path,
+    project_id: str,
+    *,
+    warnings: list[str] | None = None,
+) -> list[str]:
+    downloaded: list[str] = []
+    active_names: set[str] = set()
+    for item in client.list_children(folder_id):
+        if item.is_folder or not item.name.lower().endswith(".zip"):
+            continue
+        safe_name = _safe_drive_filename_or_none(item.name, warnings, f"{PROJECTS_FOLDER}/{project_id}/{PROJECT_PACKS_FOLDER}")
+        if not safe_name:
+            continue
+        target = target_dir / f"{project_id}__{safe_name}"
+        active_names.add(target.name)
+        client.download_file(item.id, target)
+        downloaded.append(str(target))
+    _prune_project_pack_cache(target_dir, project_id, active_names)
+    return downloaded
+
+
+def _pack_id_from_zip(path: Path) -> str:
+    try:
+        with zipfile.ZipFile(path) as zf:
+            if "manifest.json" in zf.namelist():
+                manifest = json.loads(zf.read("manifest.json").decode("utf-8-sig"))
+                pack_id = str(manifest.get("pack_id") or "").strip()
+                if pack_id:
+                    return pack_id
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile, json.JSONDecodeError):
+        pass
+    return path.stem
+
+
+def _prune_project_pack_cache(target_dir: Path, project_id: str, active_names: set[str]) -> None:
+    if not target_dir.exists():
+        return
+    prefix = f"{project_id}__"
+    for target in target_dir.glob(f"{prefix}*.zip"):
+        if target.name not in active_names:
+            target.unlink(missing_ok=True)
 
 
 def _load_service_account_info() -> dict[str, Any] | None:

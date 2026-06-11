@@ -16,6 +16,7 @@ from .pack_index import (
     query_terms,
     score_terms,
     summarize_pack,
+    unique_pack_files,
 )
 
 
@@ -83,7 +84,7 @@ def index_all_packs(db_path: Path | None = None) -> dict[str, Any]:
     try:
         init_db(conn)
         indexed = []
-        for pack in discover_pack_files():
+        for pack in unique_pack_files():
             indexed.append(index_pack(conn, pack))
         return {"status": "indexed", "packs": indexed, "stats": index_stats(conn)}
     finally:
