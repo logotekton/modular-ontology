@@ -119,7 +119,9 @@ type DynamicGraphMode = "free" | "typeOrbit" | "radial";
 type AiKeyStatus = "missing" | "untested" | "testing" | "valid" | "invalid";
 
 type IndexStats = {
+  users?: number;
   projects?: number;
+  ifcModels?: number;
   packs: number;
   documents: number;
   nodes: number;
@@ -224,7 +226,7 @@ type AppTab = (typeof nav)[number]["label"];
 const DEFAULT_TAB: AppTab = "Dashboard";
 
 const ROUTE_BY_TAB: Record<AppTab, string> = {
-  Dashboard: "/home",
+  Dashboard: "/dashboard",
   Projects: "/projects",
   "Graph Explorer": "/graph",
   "Model Explorer": "/model-explorer",
@@ -1530,10 +1532,10 @@ function LandingPage({
             <span>MCP로 AI를 연결해 프로젝트 정보를 질의합니다.</span>
           </p>
           <div className="landing-metrics">
-            <span><strong>{numberLabel(indexStats?.projects)}</strong>전체 프로젝트</span>
-            <span><strong>{numberLabel(indexStats?.packs)}</strong>전체 온톨로지 팩</span>
-            <span><strong>{numberLabel(indexStats?.nodes)}</strong>전체 색인 노드</span>
-            <span><strong>{numberLabel(indexStats?.edges)}</strong>전체 관계 엣지</span>
+            <span><strong>{numberLabel(indexStats?.users)}</strong>사용자</span>
+            <span><strong>{numberLabel(indexStats?.projects)}</strong>프로젝트</span>
+            <span><strong>{numberLabel(indexStats?.ifcModels)}</strong>IFC 모델</span>
+            <span><strong>{numberLabel(indexStats?.packs)}</strong>온톨로지 팩</span>
           </div>
         </div>
 

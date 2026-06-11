@@ -106,7 +106,11 @@ Share the `Modular Ontology` Google Drive folder with the service account email 
 - `00_Admin/users.json`
 - `00_Admin/mcp_remote.json`
 - `01_Database/modular_ontology.sqlite3`
-- `02_Ontology_Packs/indexed/*.zip`
+- `02_Projects/`
+- `03_IFC_Models/`
+- `04_Ontology_Packs/indexed/*.zip`
+- `05_MCP/`
+- `07_Backups/`
 
 Check sync status:
 
@@ -124,7 +128,7 @@ Runtime write-back is enabled for admin/user changes:
 
 - user, company, approval, role, and company-project access changes update `00_Admin/users.json`
 - project and pack-link changes update `01_Database/modular_ontology.sqlite3`
-- ontology pack uploads create or update ZIPs in `02_Ontology_Packs/indexed/`
+- ontology pack uploads create or update ZIPs in `04_Ontology_Packs/indexed/`
 
 Force a full write-back as an admin:
 

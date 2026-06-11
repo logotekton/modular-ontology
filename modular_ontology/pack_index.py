@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from .config import PACKS_DIR, ROOT, USE_STRUCTURED_DATA_DIR
+from .config import LEGACY_STRUCTURED_PACKS_DIR, PACKS_DIR, ROOT, USE_STRUCTURED_DATA_DIR
 
 UPLOAD_DIR = PACKS_DIR
 
@@ -41,7 +41,11 @@ class PackFile:
 def discover_pack_files(root: Path = ROOT) -> list[PackFile]:
     seen: set[Path] = set()
     packs: list[PackFile] = []
-    search_dirs = [PACKS_DIR] if USE_STRUCTURED_DATA_DIR else [root, PACKS_DIR, root / "data" / "packs"]
+    search_dirs = (
+        [PACKS_DIR, LEGACY_STRUCTURED_PACKS_DIR]
+        if USE_STRUCTURED_DATA_DIR
+        else [root, PACKS_DIR, root / "data" / "packs", LEGACY_STRUCTURED_PACKS_DIR]
+    )
     for directory in search_dirs:
         if not directory.exists():
             continue

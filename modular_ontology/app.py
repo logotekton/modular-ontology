@@ -38,7 +38,7 @@ from .auth import (
     set_user_company,
     set_user_role,
 )
-from .config import DATA_DIR, MCP_REMOTE_FILE, ROOT, env
+from .config import DATA_DIR, IFC_MODELS_FOLDER, MCP_REMOTE_FILE, ROOT, env
 from .google_drive_sync import (
     google_drive_sync_enabled,
     google_drive_sync_status,
@@ -69,7 +69,7 @@ from .store import connect, index_all_packs, index_pack, index_stats, init_db
 
 
 DIST_DIR = ROOT / "dist"
-IFC_UPLOAD_DIR = DATA_DIR / "03_IFC_Models"
+IFC_UPLOAD_DIR = DATA_DIR / IFC_MODELS_FOLDER
 PUBLIC_MCP_DOMAIN = str(env("MODULAR_ONTOLOGY_PUBLIC_MCP_DOMAIN", "modular-ontology.xyz"))
 PUBLIC_MCP_BASE_URL = f"https://{PUBLIC_MCP_DOMAIN}"
 PUBLIC_MCP_URL = f"{PUBLIC_MCP_BASE_URL}/mcp"
@@ -948,7 +948,9 @@ def packs(authorization: str | None = Header(default=None)) -> list[dict[str, An
 def index_status() -> dict[str, Any]:
     storage_status = ensure_runtime_storage()
     stats = index_stats()
+    stats["users"] = len(list_users())
     stats["projects"] = len(list_projects())
+    stats["ifcModels"] = len(list_ifc_models())
     stats["storage"] = storage_runtime_status(storage_status)
     return stats
 

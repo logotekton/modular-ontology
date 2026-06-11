@@ -33,7 +33,14 @@ from modular_ontology.pack_index import (
 )
 from modular_ontology.qa import answer_pack_question
 from modular_ontology.store import index_all_packs, search_documents
-from modular_ontology.google_drive_sync import DriveItem, GoogleDriveClient, google_drive_sync_status, sync_google_drive_storage, write_back_ifc_file
+from modular_ontology.google_drive_sync import (
+    DriveItem,
+    GoogleDriveClient,
+    google_drive_sync_status,
+    sync_google_drive_storage,
+    write_back_ifc_file,
+    write_back_pack_file,
+)
 
 
 client = TestClient(app)
@@ -120,6 +127,17 @@ def test_projects_replace_marketplace_with_project_pack_grouping() -> None:
     assert project_by_id["samcheok-building-b"]["packIds"]
     assert project_by_id["yeoju-modular-dormitory"]["packIds"]
     assert all(project["role"] == "Admin" for project in projects)
+
+
+def test_index_status_includes_landing_kpi_counts() -> None:
+    response = client.get("/api/index/status")
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert payload["users"] >= 0
+    assert payload["projects"] >= 0
+    assert payload["ifcModels"] >= 0
+    assert payload["packs"] >= 0
 
 
 def test_project_graph_api_returns_project_scoped_graph() -> None:
@@ -405,6 +423,44 @@ def test_ifc_drive_write_back_creates_project_folders(monkeypatch, tmp_path) -> 
         ("root/03_IFC_Models/samcheok-building-b", "files"),
     ]
     assert fake_client.uploads[0]["folder_id"] == "root/03_IFC_Models/samcheok-building-b/files"
+
+
+def test_pack_drive_write_back_uses_ontology_pack_folder(monkeypatch, tmp_path) -> None:
+    class FakeDriveClient:
+        def __init__(self) -> None:
+            self.children = {"root": []}
+            self.created = []
+            self.uploads = []
+
+        def list_children(self, folder_id):
+            return self.children.get(folder_id, [])
+
+        def create_folder(self, parent_id, name):
+            folder_id = f"{parent_id}/{name}"
+            item = DriveItem(folder_id, name, "application/vnd.google-apps.folder")
+            self.children.setdefault(parent_id, []).append(item)
+            self.children.setdefault(folder_id, [])
+            self.created.append((parent_id, name))
+            return item
+
+        def upload_file_by_name(self, folder_id, source, name=None, mime_type=None):
+            self.uploads.append({"folder_id": folder_id, "source": Path(source), "name": name, "mime_type": mime_type})
+            return {"status": "created", "id": "drive-pack", "name": name or Path(source).name}
+
+    pack_path = tmp_path / "sample-pack.zip"
+    pack_path.write_bytes(b"zip")
+    fake_client = FakeDriveClient()
+    monkeypatch.setenv("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "root")
+
+    result = write_back_pack_file(pack_path, client=fake_client)
+
+    assert result["status"] == "written"
+    assert result["drivePath"] == "04_Ontology_Packs/indexed/sample-pack.zip"
+    assert fake_client.created == [
+        ("root", "04_Ontology_Packs"),
+        ("root/04_Ontology_Packs", "indexed"),
+    ]
+    assert fake_client.uploads[0]["folder_id"] == "root/04_Ontology_Packs/indexed"
 
 
 def test_resumable_upload_retries_same_chunk_when_drive_omits_range(monkeypatch, tmp_path) -> None:
@@ -1583,7 +1639,7 @@ def test_google_drive_sync_downloads_runtime_storage(tmp_path) -> None:
             "root": [
                 DriveItem("admin", "00_Admin", "application/vnd.google-apps.folder"),
                 DriveItem("database", "01_Database", "application/vnd.google-apps.folder"),
-                DriveItem("packs", "02_Ontology_Packs", "application/vnd.google-apps.folder"),
+                DriveItem("packs", "04_Ontology_Packs", "application/vnd.google-apps.folder"),
             ],
             "admin": [
                 DriveItem("users", "users.json", "application/json"),
@@ -1625,8 +1681,68 @@ def test_google_drive_sync_downloads_runtime_storage(tmp_path) -> None:
     assert (tmp_path / "00_Admin" / "mcp_remote.json").exists()
     assert (tmp_path / "00_Admin" / "mcp_tokens.json").exists()
     assert (tmp_path / "01_Database" / "modular_ontology.sqlite3").read_bytes() == b"sqlite-bytes"
-    assert (tmp_path / "02_Ontology_Packs" / "indexed" / "sample-pack.zip").read_bytes() == b"zip-bytes"
-    assert not (tmp_path / "02_Ontology_Packs" / "indexed" / "README.md").exists()
+    assert (tmp_path / "04_Ontology_Packs" / "indexed" / "sample-pack.zip").read_bytes() == b"zip-bytes"
+    assert not (tmp_path / "04_Ontology_Packs" / "indexed" / "README.md").exists()
+
+
+def test_google_drive_sync_reads_legacy_pack_folder_into_new_layout(tmp_path) -> None:
+    class FakeDriveClient:
+        children = {
+            "root": [
+                DriveItem("packs", "02_Ontology_Packs", "application/vnd.google-apps.folder"),
+            ],
+            "packs": [DriveItem("indexed", "indexed", "application/vnd.google-apps.folder")],
+            "indexed": [DriveItem("pack", "legacy-pack.zip", "application/x-zip-compressed")],
+        }
+
+        def list_children(self, folder_id):
+            return self.children.get(folder_id, [])
+
+        def download_file(self, file_id, target):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"legacy-zip-bytes")
+
+    result = sync_google_drive_storage(
+        client=FakeDriveClient(),
+        root_folder_id="root",
+        data_dir=tmp_path,
+        force=True,
+    )
+
+    assert result["status"] == "synced"
+    assert (tmp_path / "04_Ontology_Packs" / "indexed" / "legacy-pack.zip").read_bytes() == b"legacy-zip-bytes"
+
+
+def test_google_drive_sync_merges_new_and_legacy_pack_folders(tmp_path) -> None:
+    class FakeDriveClient:
+        children = {
+            "root": [
+                DriveItem("new-packs", "04_Ontology_Packs", "application/vnd.google-apps.folder"),
+                DriveItem("legacy-packs", "02_Ontology_Packs", "application/vnd.google-apps.folder"),
+            ],
+            "new-packs": [DriveItem("new-indexed", "indexed", "application/vnd.google-apps.folder")],
+            "legacy-packs": [DriveItem("legacy-indexed", "indexed", "application/vnd.google-apps.folder")],
+            "new-indexed": [DriveItem("new-pack", "new-pack.zip", "application/x-zip-compressed")],
+            "legacy-indexed": [DriveItem("legacy-pack", "legacy-pack.zip", "application/x-zip-compressed")],
+        }
+
+        def list_children(self, folder_id):
+            return self.children.get(folder_id, [])
+
+        def download_file(self, file_id, target):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(file_id.encode("utf-8"))
+
+    result = sync_google_drive_storage(
+        client=FakeDriveClient(),
+        root_folder_id="root",
+        data_dir=tmp_path,
+        force=True,
+    )
+
+    assert result["status"] == "synced"
+    assert (tmp_path / "04_Ontology_Packs" / "indexed" / "new-pack.zip").read_bytes() == b"new-pack"
+    assert (tmp_path / "04_Ontology_Packs" / "indexed" / "legacy-pack.zip").read_bytes() == b"legacy-pack"
 
 
 def test_google_drive_sync_downloads_legacy_database_filename(tmp_path) -> None:
@@ -1637,7 +1753,7 @@ def test_google_drive_sync_downloads_legacy_database_filename(tmp_path) -> None:
             "root": [
                 DriveItem("admin", "00_Admin", "application/vnd.google-apps.folder"),
                 DriveItem("database", "01_Database", "application/vnd.google-apps.folder"),
-                DriveItem("packs", "02_Ontology_Packs", "application/vnd.google-apps.folder"),
+                DriveItem("packs", "04_Ontology_Packs", "application/vnd.google-apps.folder"),
             ],
             "admin": [],
             "database": [DriveItem("db", legacy_db_name, "application/octet-stream")],
@@ -1806,7 +1922,7 @@ def test_google_drive_sync_rejects_unsafe_pack_filename(tmp_path) -> None:
             "root": [
                 DriveItem("admin", "00_Admin", "application/vnd.google-apps.folder"),
                 DriveItem("database", "01_Database", "application/vnd.google-apps.folder"),
-                DriveItem("packs", "02_Ontology_Packs", "application/vnd.google-apps.folder"),
+                DriveItem("packs", "04_Ontology_Packs", "application/vnd.google-apps.folder"),
             ],
             "admin": [],
             "database": [],

@@ -9,6 +9,19 @@ T = TypeVar("T")
 
 ENV_PREFIX = "MODULAR_ONTOLOGY"
 LEGACY_ENV_PREFIXES = ("MOD" + "DULAR_GRAPH", "MODULAR_" + "GRAPH")
+ADMIN_FOLDER = "00_Admin"
+DATABASE_FOLDER = "01_Database"
+PROJECTS_FOLDER = "02_Projects"
+IFC_MODELS_FOLDER = "03_IFC_Models"
+ONTOLOGY_PACKS_FOLDER = "04_Ontology_Packs"
+MCP_FOLDER = "05_MCP"
+BACKUPS_FOLDER = "07_Backups"
+ARCHIVE_FOLDER = "99_Archive"
+
+LEGACY_ONTOLOGY_PACKS_FOLDER = "02_Ontology_Packs"
+LEGACY_PROJECTS_FOLDER = "03_Projects"
+LEGACY_MCP_FOLDER = "04_MCP"
+LEGACY_BACKUPS_FOLDER = "05_Backups"
 
 
 def env(name: str, default: T | None = None) -> str | T | None:
@@ -32,41 +45,44 @@ def _env_candidates(name: str) -> list[str]:
 ROOT = Path(env("MODULAR_ONTOLOGY_ROOT", Path(__file__).resolve().parents[1])).resolve()
 DEFAULT_DATA_DIR = Path("/tmp/modular-ontology") if os.environ.get("VERCEL") else ROOT / "data"
 DATA_DIR = Path(env("MODULAR_ONTOLOGY_DATA_DIR", DEFAULT_DATA_DIR)).resolve()
+STRUCTURED_PACKS_DIR = DATA_DIR / ONTOLOGY_PACKS_FOLDER / "indexed"
+LEGACY_STRUCTURED_PACKS_DIR = DATA_DIR / LEGACY_ONTOLOGY_PACKS_FOLDER / "indexed"
 USE_STRUCTURED_DATA_DIR = (
     env("MODULAR_ONTOLOGY_STRUCTURED_DATA_DIR") == "1"
     or bool(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID"))
-    or (DATA_DIR / "01_Database").exists()
-    or (DATA_DIR / "02_Ontology_Packs").exists()
-    or (DATA_DIR / "00_Admin").exists()
+    or (DATA_DIR / DATABASE_FOLDER).exists()
+    or (DATA_DIR / ONTOLOGY_PACKS_FOLDER).exists()
+    or (DATA_DIR / LEGACY_ONTOLOGY_PACKS_FOLDER).exists()
+    or (DATA_DIR / ADMIN_FOLDER).exists()
 )
 
 PACKS_DIR = Path(
     env(
         "MODULAR_ONTOLOGY_PACKS_DIR",
-        DATA_DIR / "02_Ontology_Packs" / "indexed" if USE_STRUCTURED_DATA_DIR else DATA_DIR / "packs",
+        STRUCTURED_PACKS_DIR if USE_STRUCTURED_DATA_DIR else DATA_DIR / "packs",
     )
 ).resolve()
 DB_PATH = Path(
     env(
         "MODULAR_ONTOLOGY_DB_PATH",
-        DATA_DIR / "01_Database" / "modular_ontology.sqlite3" if USE_STRUCTURED_DATA_DIR else DATA_DIR / "modular_ontology.sqlite3",
+        DATA_DIR / DATABASE_FOLDER / "modular_ontology.sqlite3" if USE_STRUCTURED_DATA_DIR else DATA_DIR / "modular_ontology.sqlite3",
     )
 ).resolve()
 USERS_FILE = Path(
     env(
         "MODULAR_ONTOLOGY_USERS_FILE",
-        DATA_DIR / "00_Admin" / "users.json" if USE_STRUCTURED_DATA_DIR else DATA_DIR / "users.json",
+        DATA_DIR / ADMIN_FOLDER / "users.json" if USE_STRUCTURED_DATA_DIR else DATA_DIR / "users.json",
     )
 ).resolve()
 MCP_REMOTE_FILE = Path(
     env(
         "MODULAR_ONTOLOGY_MCP_REMOTE_FILE",
-        DATA_DIR / "00_Admin" / "mcp_remote.json" if USE_STRUCTURED_DATA_DIR else DATA_DIR / "mcp_remote.json",
+        DATA_DIR / ADMIN_FOLDER / "mcp_remote.json" if USE_STRUCTURED_DATA_DIR else DATA_DIR / "mcp_remote.json",
     )
 ).resolve()
 MCP_TOKENS_FILE = Path(
     env(
         "MODULAR_ONTOLOGY_MCP_TOKENS_FILE",
-        DATA_DIR / "00_Admin" / "mcp_tokens.json" if USE_STRUCTURED_DATA_DIR else DATA_DIR / "mcp_tokens.json",
+        DATA_DIR / ADMIN_FOLDER / "mcp_tokens.json" if USE_STRUCTURED_DATA_DIR else DATA_DIR / "mcp_tokens.json",
     )
 ).resolve()

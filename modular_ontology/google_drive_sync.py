@@ -14,7 +14,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import DATA_DIR, DB_PATH, MCP_TOKENS_FILE, env
+from .config import (
+    ADMIN_FOLDER,
+    DATA_DIR,
+    DATABASE_FOLDER,
+    DB_PATH,
+    IFC_MODELS_FOLDER,
+    LEGACY_ONTOLOGY_PACKS_FOLDER,
+    MCP_TOKENS_FILE,
+    ONTOLOGY_PACKS_FOLDER,
+    env,
+)
 
 DRIVE_API = "https://www.googleapis.com/drive/v3"
 DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
@@ -320,39 +330,44 @@ def sync_google_drive_storage(
     downloaded: list[str] = []
     missing: list[str] = []
 
-    admin = root.get("00_Admin")
+    admin = root.get(ADMIN_FOLDER)
     if admin and admin.is_folder:
         downloaded.extend(
             _download_named_files(
                 client,
                 admin.id,
-                data_dir / "00_Admin",
+                data_dir / ADMIN_FOLDER,
                 {"users.json", "mcp_remote.json", "mcp_tokens.json"},
             )
         )
     else:
-        missing.append("00_Admin")
+        missing.append(ADMIN_FOLDER)
 
-    database = root.get("01_Database")
+    database = root.get(DATABASE_FOLDER)
     if database and database.is_folder:
-        downloaded.extend(_download_database_file(client, database.id, data_dir / "01_Database"))
+        downloaded.extend(_download_database_file(client, database.id, data_dir / DATABASE_FOLDER))
     else:
-        missing.append("01_Database")
+        missing.append(DATABASE_FOLDER)
 
-    packs = root.get("02_Ontology_Packs")
-    if packs and packs.is_folder:
-        pack_folders = _children_by_name(client, packs.id)
-        indexed = pack_folders.get("indexed")
-        if indexed and indexed.is_folder:
-            downloaded.extend(_download_zip_files(client, indexed.id, data_dir / "02_Ontology_Packs" / "indexed"))
-        else:
-            missing.append("02_Ontology_Packs/indexed")
+    pack_roots = [
+        item
+        for item in (root.get(ONTOLOGY_PACKS_FOLDER), root.get(LEGACY_ONTOLOGY_PACKS_FOLDER))
+        if item and item.is_folder
+    ]
+    if pack_roots:
+        for packs in pack_roots:
+            pack_folders = _children_by_name(client, packs.id)
+            indexed = pack_folders.get("indexed")
+            if indexed and indexed.is_folder:
+                downloaded.extend(_download_zip_files(client, indexed.id, data_dir / ONTOLOGY_PACKS_FOLDER / "indexed"))
+            elif packs.name == ONTOLOGY_PACKS_FOLDER:
+                missing.append(f"{ONTOLOGY_PACKS_FOLDER}/indexed")
     else:
-        missing.append("02_Ontology_Packs")
+        missing.append(ONTOLOGY_PACKS_FOLDER)
 
-    ifc_models = root.get("03_IFC_Models")
+    ifc_models = root.get(IFC_MODELS_FOLDER)
     if ifc_models and ifc_models.is_folder:
-        downloaded.extend(_download_ifc_metadata_files(client, ifc_models.id, data_dir / "03_IFC_Models"))
+        downloaded.extend(_download_ifc_metadata_files(client, ifc_models.id, data_dir / IFC_MODELS_FOLDER))
 
     result = {"status": "synced", "synced_at": time.time(), "downloaded": downloaded, "missing": missing}
     marker.parent.mkdir(parents=True, exist_ok=True)
@@ -372,16 +387,16 @@ def sync_google_drive_users_file(
 
     client = client or GoogleDriveClient.from_env()
     root = _children_by_name(client, root_folder_id)
-    admin = root.get("00_Admin")
+    admin = root.get(ADMIN_FOLDER)
     if not admin or not admin.is_folder:
-        return {"status": "synced", "synced_at": time.time(), "downloaded": [], "missing": ["00_Admin"], "scope": "users"}
+        return {"status": "synced", "synced_at": time.time(), "downloaded": [], "missing": [ADMIN_FOLDER], "scope": "users"}
 
-    downloaded = _download_named_files(client, admin.id, data_dir / "00_Admin", {"users.json"})
+    downloaded = _download_named_files(client, admin.id, data_dir / ADMIN_FOLDER, {"users.json"})
     return {
         "status": "synced",
         "synced_at": time.time(),
         "downloaded": downloaded,
-        "missing": [] if downloaded else ["00_Admin/users.json"],
+        "missing": [] if downloaded else [f"{ADMIN_FOLDER}/users.json"],
         "scope": "users",
     }
 
@@ -398,22 +413,22 @@ def sync_google_drive_mcp_tokens_file(
 
     client = client or GoogleDriveClient.from_env()
     root = _children_by_name(client, root_folder_id)
-    admin = root.get("00_Admin")
+    admin = root.get(ADMIN_FOLDER)
     if not admin or not admin.is_folder:
         return {
             "status": "synced",
             "synced_at": time.time(),
             "downloaded": [],
-            "missing": ["00_Admin"],
+            "missing": [ADMIN_FOLDER],
             "scope": "mcp_tokens",
         }
 
-    downloaded = _download_named_files(client, admin.id, data_dir / "00_Admin", {"mcp_tokens.json"})
+    downloaded = _download_named_files(client, admin.id, data_dir / ADMIN_FOLDER, {"mcp_tokens.json"})
     return {
         "status": "synced",
         "synced_at": time.time(),
         "downloaded": downloaded,
-        "missing": [] if downloaded else ["00_Admin/mcp_tokens.json"],
+        "missing": [] if downloaded else [f"{ADMIN_FOLDER}/mcp_tokens.json"],
         "scope": "mcp_tokens",
     }
 
@@ -448,8 +463,8 @@ def write_back_google_drive_file(
 
 def write_back_users_file(*, data_dir: Path = DATA_DIR, client: GoogleDriveClient | None = None) -> dict[str, Any]:
     return write_back_google_drive_file(
-        data_dir / "00_Admin" / "users.json",
-        ["00_Admin"],
+        data_dir / ADMIN_FOLDER / "users.json",
+        [ADMIN_FOLDER],
         client=client,
         name="users.json",
         mime_type="application/json; charset=utf-8",
@@ -459,7 +474,7 @@ def write_back_users_file(*, data_dir: Path = DATA_DIR, client: GoogleDriveClien
 def write_back_mcp_tokens_file(*, data_dir: Path = DATA_DIR, client: GoogleDriveClient | None = None) -> dict[str, Any]:
     return write_back_google_drive_file(
         Path(env("MODULAR_ONTOLOGY_MCP_TOKENS_FILE", MCP_TOKENS_FILE)),
-        ["00_Admin"],
+        [ADMIN_FOLDER],
         client=client,
         name="mcp_tokens.json",
         mime_type="application/json; charset=utf-8",
@@ -470,7 +485,7 @@ def write_back_database_file(*, client: GoogleDriveClient | None = None) -> dict
     _checkpoint_sqlite(DB_PATH)
     return write_back_google_drive_file(
         DB_PATH,
-        ["01_Database"],
+        [DATABASE_FOLDER],
         client=client,
         name=DATABASE_FILENAME,
         mime_type="application/vnd.sqlite3",
@@ -480,10 +495,11 @@ def write_back_database_file(*, client: GoogleDriveClient | None = None) -> dict
 def write_back_pack_file(pack_path: Path, *, client: GoogleDriveClient | None = None) -> dict[str, Any]:
     return write_back_google_drive_file(
         pack_path,
-        ["02_Ontology_Packs", "indexed"],
+        [ONTOLOGY_PACKS_FOLDER, "indexed"],
         client=client,
         name=pack_path.name,
         mime_type="application/zip",
+        create_folders=True,
     )
 
 
@@ -495,7 +511,7 @@ def write_back_ifc_file(
 ) -> dict[str, Any]:
     return write_back_google_drive_file(
         ifc_path,
-        ["03_IFC_Models", project_id, "files"],
+        [IFC_MODELS_FOLDER, project_id, "files"],
         client=client,
         name=ifc_path.name,
         mime_type=_guess_mime_type(ifc_path),
@@ -511,7 +527,7 @@ def write_back_ifc_metadata_file(
 ) -> dict[str, Any]:
     return write_back_google_drive_file(
         metadata_path,
-        ["03_IFC_Models", project_id, "metadata"],
+        [IFC_MODELS_FOLDER, project_id, "metadata"],
         client=client,
         name=metadata_path.name,
         mime_type="application/json; charset=utf-8",
@@ -607,7 +623,7 @@ def restore_ifc_files_from_drive(
         return []
     client = client or GoogleDriveClient.from_env()
     try:
-        folder_id = _resolve_folder_path(client, root_folder_id, ["03_IFC_Models", project_folder, "files"])
+        folder_id = _resolve_folder_path(client, root_folder_id, [IFC_MODELS_FOLDER, project_folder, "files"])
     except RuntimeError:
         return []
     children = _children_by_name(client, folder_id)
