@@ -947,9 +947,6 @@ def _write_project_pack_links(data_dir: Path, project_pack_links: dict[str, list
 
 def _write_project_folders(data_dir: Path, project_folders: list[dict[str, str]]) -> None:
     marker = data_dir / PROJECTS_FOLDER / PROJECT_FOLDERS_FILENAME
-    if not project_folders:
-        marker.unlink(missing_ok=True)
-        return
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps(project_folders, ensure_ascii=False, indent=2), encoding="utf-8")
 

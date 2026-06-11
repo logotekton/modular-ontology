@@ -833,6 +833,7 @@ def test_drive_project_folder_delete_removes_project_and_company_access(monkeypa
             {"folderId": "drive-folder-2", "projectId": "deleted-project", "name": "Deleted Project"},
         ]
     )
+    project_store.create_project(name="Legacy Seed Project", pack_ids=["legacy-pack"])
     set_company_project_access("Client Co", ["active-project", "deleted-project"])
     marker = tmp_path / "02_Projects" / ".drive-project-folders.json"
     marker.parent.mkdir(parents=True, exist_ok=True)
@@ -844,7 +845,7 @@ def test_drive_project_folder_delete_removes_project_and_company_access(monkeypa
     result = app_module._apply_drive_project_folders()
     projects = project_store.list_projects([])
 
-    assert result["deleted"] == ["deleted-project"]
+    assert set(result["deleted"]) == {"deleted-project", "legacy-seed-project"}
     assert [project["id"] for project in projects] == ["active-project"]
     assert get_company_project_access("Client Co") == ["active-project"]
 

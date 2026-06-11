@@ -5,7 +5,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .config import DB_PATH
+from .config import DB_PATH, env
 
 
 def connect(db_path: Path | None = None) -> sqlite3.Connection:
@@ -101,6 +101,8 @@ def _legacy_projects(packs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def seed_projects_from_packs(packs: list[dict[str, Any]], db_path: Path | None = None) -> None:
+    if env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID"):
+        return
     conn = connect(db_path)
     try:
         init_project_db(conn)
@@ -295,6 +297,7 @@ def sync_projects_from_drive_folders(
     deleted: list[str] = []
     conflicts: list[dict[str, str]] = []
     active_folder_ids = {item["folderId"] for item in normalized}
+    active_project_ids = {item["projectId"] for item in normalized}
     conn = connect(db_path)
     try:
         init_project_db(conn)
@@ -303,12 +306,12 @@ def sync_projects_from_drive_folders(
                 """
                 SELECT id, drive_folder_id
                 FROM projects
-                WHERE drive_folder_id IS NOT NULL AND drive_folder_id != ''
                 """
             ).fetchall():
-                if str(row["drive_folder_id"]) in active_folder_ids:
-                    continue
                 project_id = str(row["id"])
+                drive_folder_id = str(row["drive_folder_id"] or "")
+                if project_id in active_project_ids or drive_folder_id in active_folder_ids:
+                    continue
                 conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
                 deleted.append(project_id)
 
