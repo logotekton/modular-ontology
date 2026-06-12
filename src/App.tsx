@@ -217,10 +217,12 @@ const nav = [
 
 type AppTab = (typeof nav)[number]["label"];
 
+const LANDING_ROUTE = "/home";
+const ROOT_ROUTE = "/";
 const DEFAULT_TAB: AppTab = "Dashboard";
 
 const ROUTE_BY_TAB: Record<AppTab, string> = {
-  Dashboard: "/home",
+  Dashboard: "/dashboard",
   Projects: "/projects",
   "Graph Explorer": "/graph",
   "Model Explorer": "/model-explorer",
@@ -233,7 +235,6 @@ const TAB_BY_ROUTE = new Map<string, AppTab>(
   Object.entries(ROUTE_BY_TAB).map(([tab, route]) => [route, tab as AppTab])
 );
 TAB_BY_ROUTE.set("/upload", "Sync");
-TAB_BY_ROUTE.set("/dashboard", "Dashboard");
 
 const DRIVE_FOLDER_URLS = {
   projects: "https://drive.google.com/drive/folders/1qsFTMJphBJxLlgoSikRa5QZS9grvOA0W",
@@ -252,6 +253,12 @@ function tabFromPathname(pathname: string): AppTab {
 
 function routeForTab(tab: string) {
   return ROUTE_BY_TAB[tab as AppTab] ?? ROUTE_BY_TAB[DEFAULT_TAB];
+}
+
+function replacePath(path: string, state: Record<string, unknown> = {}) {
+  if (window.location.pathname !== path) {
+    window.history.replaceState(state, "", path);
+  }
 }
 
 const TAB_LABELS: Record<string, string> = {
@@ -401,13 +408,35 @@ function App() {
   }
 
   useEffect(() => {
-    navigateToTab(tabFromPathname(window.location.pathname), { replace: true });
     const handlePopState = () => {
+      const normalized = normalizeRoutePath(window.location.pathname);
+      if (!currentUser) {
+        replacePath(LANDING_ROUTE, { landing: true });
+        return;
+      }
+      if (normalized === ROOT_ROUTE || normalized === LANDING_ROUTE) {
+        navigateToTab(DEFAULT_TAB, { replace: true });
+        return;
+      }
       setActiveTab(tabFromPathname(window.location.pathname));
     };
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
-  }, []);
+  }, [currentUser]);
+
+  useEffect(() => {
+    if (!sessionReady) return;
+    const normalized = normalizeRoutePath(window.location.pathname);
+    if (!currentUser) {
+      replacePath(LANDING_ROUTE, { landing: true });
+      return;
+    }
+    if (normalized === ROOT_ROUTE || normalized === LANDING_ROUTE) {
+      navigateToTab(DEFAULT_TAB, { replace: true });
+      return;
+    }
+    navigateToTab(tabFromPathname(window.location.pathname), { replace: true });
+  }, [sessionReady, currentUser?.email, currentUser?.role]);
 
   useEffect(() => {
     refreshPublicStatus().catch(() => undefined);
@@ -616,6 +645,7 @@ function App() {
     await refreshData(undefined, payload.token);
     setLoginPassword("");
     setShowSignup(false);
+    navigateToTab(DEFAULT_TAB, { replace: true });
     setUploadStatus(`${roleLabel(payload.user.role)} 세션 활성화`);
   }
 
@@ -864,6 +894,8 @@ function App() {
     setAuthToken("");
     setCurrentUser(null);
     await refreshData(undefined, "");
+    setActiveTab(DEFAULT_TAB);
+    replacePath(LANDING_ROUTE, { landing: true });
     setUploadStatus("로그아웃됨");
   }
 
