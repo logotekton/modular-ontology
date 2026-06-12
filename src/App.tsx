@@ -11,11 +11,9 @@ import {
   Database,
   FileArchive,
   FolderKanban,
-  GitBranch,
   KeyRound,
   LoaderCircle,
   LockKeyhole,
-  Network,
   PackageCheck,
   PlugZap,
   RefreshCw,
@@ -1239,7 +1237,6 @@ function App() {
             currentUser={currentUser}
             companies={companies}
             companyProjectAccess={companyProjectAccess}
-            indexStats={indexStats}
             projects={projects}
             users={managedUsers}
             uploadStatus={uploadStatus}
@@ -2205,7 +2202,6 @@ function AdminView({
   companies,
   companyProjectAccess,
   currentUser,
-  indexStats,
   projects,
   users,
   uploadStatus,
@@ -2225,7 +2221,6 @@ function AdminView({
   companies: string[];
   companyProjectAccess: CompanyProjectAccess;
   currentUser: CurrentUser;
-  indexStats: IndexStats | null;
   projects: Project[];
   users: ManagedUser[];
   uploadStatus: string;
@@ -2505,22 +2500,6 @@ function AdminView({
       <div className="overview-panel wide">
         <div className="panel-header slim">
           <div>
-            <h2>색인 저장소</h2>
-            <span>SQLite 기반 문서, 노드, 엣지 색인</span>
-          </div>
-          <Database size={19} />
-        </div>
-        <div className="status-grid">
-          <StatusTile icon={FileArchive} label="팩" value={numberLabel(indexStats?.packs)} />
-          <StatusTile icon={Database} label="문서" value={numberLabel(indexStats?.documents)} />
-          <StatusTile icon={Network} label="노드" value={numberLabel(indexStats?.nodes)} />
-          <StatusTile icon={GitBranch} label="엣지" value={numberLabel(indexStats?.edges)} />
-        </div>
-      </div>
-
-      <div className="overview-panel wide">
-        <div className="panel-header slim">
-          <div>
             <h2>권한 정책</h2>
             <span>일반 계정은 관리자 메뉴에 접근할 수 없습니다</span>
           </div>
@@ -2533,24 +2512,6 @@ function AdminView({
         </div>
       </div>
     </section>
-  );
-}
-
-function StatusTile({
-  icon: Icon,
-  label,
-  value,
-}: {
-  icon: typeof Activity;
-  label: string;
-  value: string;
-}) {
-  return (
-    <div className="status-tile">
-      <Icon size={18} />
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
   );
 }
 
