@@ -16,6 +16,7 @@ google_drive_staging
 data
 tools/*.exe
 tools/xkt-converter
+tools/ontology-builder
 backups
 original file
 *.tar.gz

@@ -2272,16 +2272,26 @@ function AdminView({
   const [selectedCompany, setSelectedCompany] = useState("all");
   const [companyDraft, setCompanyDraft] = useState("");
   const [selectedUserEmail, setSelectedUserEmail] = useState("");
+  const suppressCompanyClickUntilRef = useRef(0);
   const unknownCompany = "미지정";
+  const unassignedCompanyFilter = "__unassigned__";
+  const isVirtualCompanyFilter = selectedCompany === unassignedCompanyFilter;
   const selectedProjectIds = companyProjectAccess[selectedCompany] ?? [];
   const selectedCompanyIsInternal =
     selectedCompany !== "all" &&
+    !isVirtualCompanyFilter &&
     (selectedCompany.toLowerCase().includes("kumkang") || selectedCompany.includes("금강"));
   const companyNames = Array.from(new Set(companies)).sort();
-  const visibleUsers = selectedCompany === "all" ? users : users.filter((user) => (user.company || "미지정") === selectedCompany);
+  const companyFilters = ["all", ...companyNames];
+  const visibleUsers =
+    selectedCompany === "all"
+      ? users
+      : selectedCompany === unassignedCompanyFilter
+        ? users.filter((user) => !user.company)
+        : users.filter((user) => user.company === selectedCompany);
 
   useEffect(() => {
-    setCompanyDraft(selectedCompany === "all" ? "" : selectedCompany);
+    setCompanyDraft(selectedCompany === "all" || selectedCompany === unassignedCompanyFilter ? "" : selectedCompany);
   }, [selectedCompany]);
 
   useEffect(() => {
@@ -2291,13 +2301,20 @@ function AdminView({
   }, [selectedUserEmail, users]);
 
   function companyStats(company: string) {
-    const companyUsers = company === "all" ? users : users.filter((user) => (user.company || "미지정") === company);
+    const companyUsers =
+      company === "all"
+        ? users
+        : company === unassignedCompanyFilter
+          ? users.filter((user) => !user.company)
+          : users.filter((user) => user.company === company);
     return {
       total: companyUsers.length,
       pending: companyUsers.filter((user) => user.status === "pending").length,
       admins: companyUsers.filter((user) => user.role === "admin").length,
     };
   }
+
+  const unassignedStats = companyStats(unassignedCompanyFilter);
 
   function addCompany() {
     const name = companyDraft.trim();
@@ -2307,13 +2324,13 @@ function AdminView({
   }
 
   function renameCompany() {
-    if (selectedCompany === "all" || !companyDraft.trim()) return;
+    if (selectedCompany === "all" || selectedCompany === unassignedCompanyFilter || !companyDraft.trim()) return;
     onRenameCompany(selectedCompany, companyDraft);
     setSelectedCompany(companyDraft.trim());
   }
 
   function deleteCompany() {
-    if (selectedCompany === "all") return;
+    if (selectedCompany === "all" || selectedCompany === unassignedCompanyFilter) return;
     const stats = companyStats(selectedCompany);
     onConfirm({
       title: "회사 삭제",
@@ -2341,26 +2358,32 @@ function AdminView({
 
   function dropUserOnCompany(event: DragEvent<HTMLElement>, company: string) {
     event.preventDefault();
-    if (company === "all") return;
+    event.stopPropagation();
+    suppressCompanyClickUntilRef.current = Date.now() + 350;
+    if (company === "all" || company === unassignedCompanyFilter) return;
     const email = event.dataTransfer.getData("text/plain");
     if (email) {
       onMoveUserCompany(email, company);
       setSelectedUserEmail(email);
-      setSelectedCompany(company);
     }
   }
 
   function selectCompanyCard(company: string) {
+    if (Date.now() < suppressCompanyClickUntilRef.current) return;
     setSelectedCompany(company);
+  }
+
+  function toggleUnassignedFilter() {
+    setSelectedUserEmail("");
+    setSelectedCompany((company) => company === unassignedCompanyFilter ? "all" : unassignedCompanyFilter);
   }
 
   function selectUserCard(user: ManagedUser) {
     setSelectedUserEmail(user.email);
-    if (user.company) setSelectedCompany(user.company);
   }
 
   function toggleCompanyProject(projectId: string) {
-    if (selectedCompany === "all" || selectedCompanyIsInternal) return;
+    if (selectedCompany === "all" || selectedCompany === unassignedCompanyFilter || selectedCompanyIsInternal) return;
     const nextIds = selectedProjectIds.includes(projectId)
       ? selectedProjectIds.filter((id) => id !== projectId)
       : [...selectedProjectIds, projectId];
@@ -2406,14 +2429,24 @@ function AdminView({
             <span>회사별로 회원가입 요청과 권한을 관리합니다</span>
           </div>
           <div className="company-action-bar">
+            <button
+              aria-pressed={selectedCompany === unassignedCompanyFilter}
+              className={selectedCompany === unassignedCompanyFilter ? "unassigned-filter-button active" : "unassigned-filter-button"}
+              title="회사 미지정 회원만 필터링"
+              type="button"
+              onClick={toggleUnassignedFilter}
+            >
+              미지정
+              <span>{unassignedStats.total}</span>
+            </button>
             <input
               value={companyDraft}
-              placeholder={selectedCompany === "all" ? "새 회사명" : "회사명"}
+              placeholder={selectedCompany === "all" || selectedCompany === unassignedCompanyFilter ? "새 회사명" : "회사명"}
               onChange={(event) => setCompanyDraft(event.target.value)}
             />
             <button type="button" onClick={addCompany}>회사 추가</button>
-            <button type="button" disabled={selectedCompany === "all"} onClick={renameCompany}>회사명 수정</button>
-            <button type="button" disabled={selectedCompany === "all"} onClick={deleteCompany}>회사 삭제</button>
+            <button type="button" disabled={selectedCompany === "all" || selectedCompany === unassignedCompanyFilter} onClick={renameCompany}>회사명 수정</button>
+            <button type="button" disabled={selectedCompany === "all" || selectedCompany === unassignedCompanyFilter} onClick={deleteCompany}>회사 삭제</button>
             <button className="icon-action" type="button" onClick={onRefreshUsers} title="새로고침">
               <RefreshCw size={17} />
             </button>
@@ -2421,15 +2454,20 @@ function AdminView({
         </div>
         <div className="company-admin-grid">
           <div className="company-list">
-            {["all", ...companyNames].map((company) => {
+            {companyFilters.map((company) => {
               const stats = companyStats(company);
+              const isDropTarget = company !== "all" && company !== unassignedCompanyFilter;
               return (
                 <button
-                  className={selectedCompany === company ? "company-card active" : "company-card"}
+                  className={[
+                    "company-card",
+                    selectedCompany === company ? "active" : "",
+                    isDropTarget ? "drop-target" : "",
+                  ].filter(Boolean).join(" ")}
                   key={company}
                   type="button"
                   onDragOver={(event) => {
-                    if (company !== "all") event.preventDefault();
+                    if (isDropTarget) event.preventDefault();
                   }}
                   onDrop={(event) => dropUserOnCompany(event, company)}
                   onClick={() => selectCompanyCard(company)}
@@ -2456,7 +2494,7 @@ function AdminView({
               >
                 <div>
                   <strong><span className="field-label">이름</span>{user.name}</strong>
-                  <span><span className="field-label">회사</span>{user.company} · {user.email}</span>
+                  <span><span className="field-label">회사</span>{user.company || unknownCompany} · {user.email}</span>
                 </div>
                 <em className={`status-badge ${user.status}`}>{user.status === "pending" ? "승인 대기" : "활성"}</em>
                 <select
@@ -2504,12 +2542,14 @@ function AdminView({
             <span>
               {selectedCompany === "all"
                 ? "회사를 선택하면 프로젝트 접근권한을 지정할 수 있습니다."
+                : selectedCompany === unassignedCompanyFilter
+                  ? "회사 미지정 회원은 회사 카드로 드래그해 소속을 지정할 수 있습니다."
                 : selectedCompanyIsInternal
                   ? "금강 계열 회사는 모든 프로젝트에 자동 접근합니다."
                   : "고객사/발주처는 관리자가 지정한 프로젝트만 볼 수 있습니다."}
             </span>
           </div>
-          {selectedCompany !== "all" && !selectedCompanyIsInternal && (
+          {selectedCompany !== "all" && selectedCompany !== unassignedCompanyFilter && !selectedCompanyIsInternal && (
             <div className="project-access-list">
               {projects.map((project) => (
                 <label key={project.id}>
