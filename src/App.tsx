@@ -16,6 +16,7 @@ import {
   LockKeyhole,
   PackageCheck,
   PlugZap,
+  Plus,
   RefreshCw,
   SendHorizontal,
   ServerCog,
@@ -45,11 +46,25 @@ type Pack = {
   id: string;
   title: string;
   filename: string;
+  displayFilename?: string;
+  displayName?: string;
+  commonCategory?: string | null;
+  commonScoped?: boolean;
+  projectScoped?: boolean;
   source: string;
   validationStatus: string;
   counts: Record<string, number>;
   modelSummary?: Record<string, unknown>;
   ingest?: { status: string; documents?: number; nodes?: number; edges?: number };
+};
+
+type PackDisplayGroup = {
+  id: string;
+  label: string;
+  subtitle: string;
+  packIds: string[];
+  packs: Pack[];
+  grouped: boolean;
 };
 
 type Project = {
@@ -307,6 +322,54 @@ function nodeTypeLabel(type?: string) {
   return NODE_TYPE_LABELS[type] ?? type;
 }
 
+function packTitle(pack: Pack) {
+  return pack.displayName || pack.title || pack.displayFilename || pack.filename || pack.id;
+}
+
+function commonPackCategory(pack: Pack) {
+  const direct = pack.commonCategory?.trim();
+  if (direct) return direct;
+  const match = pack.filename.match(/^_Common__(.+?)__/u);
+  return match?.[1]?.trim() || "";
+}
+
+function groupPacksForDisplay(packs: Pack[]): PackDisplayGroup[] {
+  const groups: PackDisplayGroup[] = [];
+  const commonGroups = new Map<string, PackDisplayGroup>();
+  for (const pack of packs) {
+    const category = commonPackCategory(pack);
+    if (category) {
+      const groupId = `common:${category}`;
+      let group = commonGroups.get(groupId);
+      if (!group) {
+        group = {
+          id: groupId,
+          label: category,
+          subtitle: "",
+          packIds: [],
+          packs: [],
+          grouped: true,
+        };
+        commonGroups.set(groupId, group);
+        groups.push(group);
+      }
+      group.packIds.push(pack.id);
+      group.packs.push(pack);
+      group.subtitle = `${numberLabel(group.packs.length)}개 공통 팩`;
+      continue;
+    }
+    groups.push({
+      id: `pack:${pack.id}`,
+      label: packTitle(pack),
+      subtitle: pack.displayFilename || pack.filename,
+      packIds: [pack.id],
+      packs: [pack],
+      grouped: false,
+    });
+  }
+  return groups;
+}
+
 function roleLabel(role?: string | null) {
   if (!role) return ROLE_LABELS.guest;
   return ROLE_LABELS[role] ?? role;
@@ -368,6 +431,7 @@ function App() {
   const graphPackOptions = selectedProject
     ? packs.filter((pack) => selectedProject.packIds.includes(pack.id))
     : [];
+  const graphPackGroups = groupPacksForDisplay(graphPackOptions);
   const visibleNav = nav.filter((item) => !["Admin", "Sync"].includes(item.label) || currentUser?.role === "admin");
 
   function navigateToTab(tab: string, options: { replace?: boolean } = {}) {
@@ -384,12 +448,15 @@ function App() {
     setSelectedGraphPackIds(graphPackOptions.map((pack) => pack.id));
   }
 
-  function toggleGraphPack(packId: string) {
+  function toggleGraphPackGroup(group: PackDisplayGroup) {
     setSelectedGraphPackIds((current) => {
-      if (current.includes(packId)) {
-        return current.length > 1 ? current.filter((id) => id !== packId) : current;
+      const groupIds = new Set(group.packIds);
+      const activeCount = group.packIds.filter((packId) => current.includes(packId)).length;
+      if (activeCount > 0) {
+        const next = current.filter((id) => !groupIds.has(id));
+        return next.length ? next : current;
       }
-      return [...current, packId];
+      return [...current, ...group.packIds.filter((packId) => !current.includes(packId))];
     });
   }
 
@@ -820,10 +887,10 @@ function App() {
     setUploadStatus(`${company} 회사의 프로젝트 접근권한을 저장했습니다.`);
   }
 
-  async function saveProject(form: ProjectForm) {
+  async function saveProject(form: ProjectForm): Promise<Project | null> {
     if (currentUser?.role !== "admin") {
       setUploadStatus("관리자 세션이 필요합니다");
-      return;
+      return null;
     }
     const isUpdate = Boolean(form.id);
     const res = await fetch(isUpdate ? `/api/admin/projects/${encodeURIComponent(form.id || "")}` : "/api/admin/projects", {
@@ -841,11 +908,14 @@ function App() {
     if (!res.ok) {
       const payload = await res.json().catch(() => null);
       setUploadStatus(payload?.detail ?? "프로젝트 저장 실패");
-      return;
+      return null;
     }
     const payload = (await res.json()) as { project: Project };
     await refreshData(undefined, authToken);
+    setSelectedProjectId(payload.project.id);
+    setSelectedGraphPackIds(payload.project.packIds);
     setUploadStatus(`${payload.project.name} 프로젝트를 저장했습니다.`);
+    return payload.project;
   }
 
   async function deleteProject(projectId: string) {
@@ -1314,16 +1384,24 @@ function App() {
                   전체 팩
                 </button>
                 <div>
-                  {graphPackOptions.map((pack) => (
-                    <label className={selectedGraphPackIds.includes(pack.id) ? "active" : ""} key={pack.id}>
+                  {graphPackGroups.map((group) => {
+                    const activeCount = group.packIds.filter((packId) => selectedGraphPackIds.includes(packId)).length;
+                    const isActive = activeCount > 0;
+                    return (
+                    <label
+                      className={isActive ? "active" : ""}
+                      key={group.id}
+                      title={group.grouped ? `${group.label}: ${group.packs.map(packTitle).join(", ")}` : group.subtitle}
+                    >
                       <input
-                        checked={selectedGraphPackIds.includes(pack.id)}
+                        checked={isActive}
                         type="checkbox"
-                        onChange={() => toggleGraphPack(pack.id)}
+                        onChange={() => toggleGraphPackGroup(group)}
                       />
-                      <span>{pack.title}</span>
+                      <span>{group.label}</span>
                     </label>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             ) : null}
@@ -1731,7 +1809,7 @@ function ProjectsView({
   packs: Pack[];
   projects: Project[];
   selectedPackId: string;
-  onSaveProject: (form: ProjectForm) => Promise<void> | void;
+  onSaveProject: (form: ProjectForm) => Promise<Project | null | void> | Project | null | void;
 }) {
   const isAdmin = currentUser?.role === "admin";
   const emptyForm: ProjectForm = {
@@ -1745,7 +1823,7 @@ function ProjectsView({
   const [selectedProjectId, setSelectedProjectId] = useState(projects[0]?.id ?? "");
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
   const [dialogDraft, setDialogDraft] = useState<ProjectForm>(emptyForm);
-  const [dialogMode, setDialogMode] = useState<"edit" | null>(null);
+  const [dialogMode, setDialogMode] = useState<"create" | "edit" | null>(null);
   const [pressedAction, setPressedAction] = useState("");
 
   useEffect(() => {
@@ -1763,6 +1841,7 @@ function ProjectsView({
         .map((packId) => packs.find((pack) => pack.id === packId))
         .filter((pack): pack is Pack => Boolean(pack))
     : [];
+  const linkedPackGroups = groupPacksForDisplay(linkedPacks);
   const linkedModels = selectedProject
     ? ifcModels.filter((model) => model.projectId === selectedProject.id)
     : [];
@@ -1784,6 +1863,14 @@ function ProjectsView({
     void callback();
   }
 
+  function openCreateDialog() {
+    setDialogDraft({
+      ...emptyForm,
+      manager: currentUser?.name ?? "",
+    });
+    setDialogMode("create");
+  }
+
   function openEditDialog() {
     if (!selectedProject) return;
     setDialogDraft({
@@ -1799,7 +1886,10 @@ function ProjectsView({
   }
 
   async function saveDialogDraft() {
-    await Promise.resolve(onSaveProject(dialogDraft));
+    const savedProject = await Promise.resolve(onSaveProject(dialogDraft));
+    if (savedProject && typeof savedProject === "object" && "id" in savedProject) {
+      setSelectedProjectId(String(savedProject.id));
+    }
     setDialogMode(null);
   }
 
@@ -1814,6 +1904,14 @@ function ProjectsView({
           </div>
           {isAdmin && (
             <div className="project-header-actions">
+              <button
+                className={actionButtonClass("project-create")}
+                type="button"
+                onClick={() => runProjectAction("project-create", openCreateDialog)}
+              >
+                <Plus size={14} />
+                추가
+              </button>
               <button
                 className={actionButtonClass("project-edit")}
                 disabled={!selectedProject}
@@ -1830,6 +1928,7 @@ function ProjectsView({
             const projectPacks = project.packIds
               .map((packId) => packs.find((pack) => pack.id === packId))
               .filter((pack): pack is Pack => Boolean(pack));
+            const projectPackGroups = groupPacksForDisplay(projectPacks);
             const projectModels = ifcModels.filter((model) => model.projectId === project.id);
             return (
               <button
@@ -1840,7 +1939,7 @@ function ProjectsView({
               >
                 <strong>{project.name}</strong>
                 <span>{project.company || "회사 미지정"} / {project.discipline || "분야 미지정"}</span>
-                <em>{projectModels.length}개 IFC / {projectPacks.length}개 온톨로지 팩</em>
+                <em>{projectModels.length}개 IFC / {projectPackGroups.length}개 온톨로지 항목</em>
               </button>
             );
           })}
@@ -1871,7 +1970,7 @@ function ProjectsView({
               </div>
               <div>
                 <dt>온톨로지 팩</dt>
-                <dd>{numberLabel(linkedPacks.length)}개</dd>
+                <dd>{numberLabel(linkedPackGroups.length)}개 항목 / {numberLabel(linkedPacks.length)}개 팩</dd>
               </div>
             </dl>
           </div>
@@ -1889,8 +1988,8 @@ function ProjectsView({
               <div>
                 <div className="mini-list">
                   <strong>온톨로지 팩</strong>
-                  {linkedPacks.length ? linkedPacks.map((pack) => (
-                    <span key={pack.id}>{pack.title}</span>
+                  {linkedPackGroups.length ? linkedPackGroups.map((group) => (
+                    <span key={group.id}>{group.label}{group.grouped ? ` (${group.subtitle})` : ""}</span>
                   )) : <em>연결된 온톨로지 팩 없음</em>}
                 </div>
               </div>
@@ -1929,15 +2028,19 @@ function ProjectsView({
           <div className="connection-list-panel">
             <div className="connection-list-title">
               <strong>온톨로지 팩</strong>
-              <span>{numberLabel(linkedPacks.length)}개 연결됨</span>
+              <span>{numberLabel(linkedPackGroups.length)}개 항목</span>
             </div>
             <div className="connection-scroll-list">
-              {linkedPacks.length ? linkedPacks.map((pack) => (
-                  <div className="connection-row active" key={pack.id}>
+              {linkedPackGroups.length ? linkedPackGroups.map((group) => (
+                  <div className="connection-row active" key={group.id}>
                     <FileArchive size={18} />
                     <span>
-                      <strong>{pack.title}</strong>
-                      <em>{pack.filename} / {numberLabel(pack.counts.edges)}개 엣지</em>
+                      <strong>{group.label}</strong>
+                      <em>
+                        {group.grouped
+                          ? `${group.subtitle} / ${numberLabel(group.packs.reduce((sum, pack) => sum + Number(pack.counts.edges || 0), 0))}개 엣지`
+                          : `${group.packs[0]?.displayFilename || group.packs[0]?.filename || ""} / ${numberLabel(group.packs[0]?.counts.edges)}개 엣지`}
+                      </em>
                     </span>
                   </div>
               )) : <p className="empty-list-note">선택 프로젝트에 연결된 온톨로지 팩이 없습니다.</p>}
@@ -1957,16 +2060,27 @@ function ProjectsView({
         >
           <div className="panel-header slim">
             <div>
-              <h2>프로젝트 편집</h2>
-              <span>프로젝트명은 Google Drive 폴더명으로만 변경됩니다</span>
+              <h2>{dialogMode === "create" ? "프로젝트 추가" : "프로젝트 편집"}</h2>
+              <span>
+                {dialogMode === "create"
+                  ? "Google Drive 하위 폴더와 README를 함께 생성합니다"
+                  : "프로젝트명은 Google Drive 폴더명으로도 반영됩니다"}
+              </span>
             </div>
             <FolderKanban size={19} />
           </div>
           <div className="project-form-grid">
+            <label className="full">
+              프로젝트명
+              <input
+                autoFocus
+                value={dialogDraft.name}
+                onChange={(event) => setDialogDraft({ ...dialogDraft, name: event.target.value })}
+              />
+            </label>
             <label>
               회사
               <input
-                autoFocus
                 value={dialogDraft.company}
                 onChange={(event) => setDialogDraft({ ...dialogDraft, company: event.target.value })}
               />
@@ -1999,11 +2113,11 @@ function ProjectsView({
             </button>
             <button
               className={actionButtonClass("project-save", "primary-button")}
-              disabled={!selectedProject}
+              disabled={!dialogDraft.name.trim() || (dialogMode === "edit" && !selectedProject)}
               type="button"
               onClick={() => runProjectAction("project-save", saveDialogDraft)}
             >
-              프로젝트 저장
+              {dialogMode === "create" ? "프로젝트 생성" : "프로젝트 저장"}
             </button>
           </div>
         </section>

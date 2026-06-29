@@ -5,9 +5,15 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <AssemblyName>ModularXktConverter</AssemblyName>
-    <RootNamespace>ModularXktConverter</RootNamespace>
+    <AssemblyName>ModularOntologyBuilder</AssemblyName>
+    <RootNamespace>ModularOntologyBuilder</RootNamespace>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
   </PropertyGroup>
+  <ItemGroup>
+    <Content Include="..\ontology-builder\scripts\*.py">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>scripts\%(Filename)%(Extension)</TargetPath>
+    </Content>
+  </ItemGroup>
 </Project>

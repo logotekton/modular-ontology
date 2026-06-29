@@ -192,10 +192,21 @@ def _edge(source: str, target: str, relation: str, pack_id: str, raw: dict[str, 
     }
 
 
-def _title_from_drive_filename(filename: str) -> str | None:
+def _display_filename_from_drive_cache(filename: str) -> str:
     if "__" not in filename:
-        return None
-    display_name = filename.split("__", 1)[1]
+        return filename
+    return filename.rsplit("__", 1)[1] or filename
+
+
+def _common_category_from_drive_cache(filename: str) -> str | None:
+    parts = filename.split("__", 2)
+    if len(parts) == 3 and parts[0] == "_Common" and parts[1].strip():
+        return parts[1].strip()
+    return None
+
+
+def _title_from_drive_filename(filename: str) -> str | None:
+    display_name = _display_filename_from_drive_cache(filename)
     stem = Path(display_name).stem.strip()
     if not stem:
         return None
@@ -233,15 +244,23 @@ def summarize_pack(pack: PackFile) -> dict[str, Any]:
         source_key = pack_id.lower()
         source = "Revit IFC" if "revit" in source_key else "Advance Steel" if "advance" in source_key else "Ontology"
         validation = build_summary.get("validation_status") or "READY"
+        display_filename = _display_filename_from_drive_cache(pack.path.name)
+        common_category = _common_category_from_drive_cache(pack.path.name)
         drive_title = _title_from_drive_filename(pack.path.name)
+        title = drive_title or manifest.get("title") or pack.id.replace("-", " ").title()
 
         return {
             "id": pack_id,
             "filename": pack.path.name,
-            "title": drive_title or manifest.get("title") or pack.id.replace("-", " ").title(),
+            "displayFilename": display_filename,
+            "displayName": title,
+            "title": title,
+            "commonCategory": common_category,
+            "commonScoped": pack.path.name.startswith("_Common__"),
             "format": manifest.get("format", "ontology-pack"),
             "description": manifest.get("description") or _extract_readme(zf),
             "source": source,
+            "projectScoped": "__" in pack.path.name,
             "sizeBytes": pack.path.stat().st_size,
             "validationStatus": validation,
             "counts": {
@@ -695,6 +714,8 @@ def list_sources(pack_id: str | None = None) -> dict[str, Any]:
             {
                 "pack_id": pack["id"],
                 "title": pack["title"],
+                "displayName": pack.get("displayName", pack["title"]),
+                "displayFilename": pack.get("displayFilename", pack.get("filename")),
                 "source": pack["source"],
                 "documents": pack["counts"].get("documents"),
                 "nodes": pack["counts"].get("nodes"),

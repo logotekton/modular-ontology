@@ -35,7 +35,7 @@ async def call_remote_mcp(url: str) -> None:
             tools = await session.list_tools()
             names = sorted(tool.name for tool in tools.tools)
             result = await session.call_tool(
-                "ask_pack_question",
+                "mo_question_answer",
                 {
                     "pack_id": "advance-steel-samcheok-bldg-b-bm25-evidence-pack",
                     "question": "Beam",

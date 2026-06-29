@@ -6,6 +6,7 @@ import mimetypes
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -42,6 +43,9 @@ DATABASE_FILENAME = "modular_ontology.sqlite3"
 LEGACY_DATABASE_FILENAME = "mod" + "dular_" + "graph.sqlite3"
 PROJECT_IFC_FOLDER = "ifc-models"
 PROJECT_PACKS_FOLDER = "ontology-packs"
+PROJECT_README_FILENAME = "README.md"
+COMMON_PROJECT_ID = "_Common"
+COMMON_PROJECT_PACK_LINKS_KEY = "__common__"
 PROJECT_PACK_LINKS_FILENAME = ".drive-project-pack-links.json"
 PROJECT_FOLDERS_FILENAME = ".drive-project-folders.json"
 _DB_SYNC_LOCK = threading.Lock()
@@ -592,14 +596,53 @@ def ensure_project_drive_folders(
     for folder_name in (PROJECT_IFC_FOLDER, PROJECT_PACKS_FOLDER):
         _resolve_folder_path(client, project_folder_id, [folder_name], create_missing=True)
         ensured_paths.append(f"{PROJECTS_FOLDER}/{safe_project_id}/{folder_name}")
+    readme_result = _ensure_project_readme_file(client, project_folder_id, safe_project_id)
     return {
         "status": "ensured",
         "projectId": safe_project_id,
         "projectsFolderId": projects_folder_id,
         "projectFolderId": project_folder_id,
         "paths": ensured_paths,
+        "files": [f"{PROJECTS_FOLDER}/{safe_project_id}/{PROJECT_README_FILENAME}"],
+        "readme": readme_result,
         "written_at": time.time(),
     }
+
+
+def _ensure_project_readme_file(client: GoogleDriveClient, project_folder_id: str, project_id: str) -> dict[str, Any]:
+    existing = _children_by_name(client, project_folder_id).get(PROJECT_README_FILENAME)
+    if existing and existing.is_folder:
+        raise RuntimeError(f"Google Drive item {PROJECT_README_FILENAME!r} is a folder, not a file.")
+    if existing:
+        return {"status": "exists", "id": existing.id, "name": PROJECT_README_FILENAME}
+
+    content = "\n".join(
+        [
+            f"# {project_id}",
+            "",
+            "Modular Ontology project workspace.",
+            "",
+            "## Folders",
+            "",
+            f"- `{PROJECT_IFC_FOLDER}`: IFC, IFCZIP, ZIP, and XKT model files.",
+            f"- `{PROJECT_PACKS_FOLDER}`: project ontology pack ZIP files.",
+            "",
+        ]
+    )
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".md", delete=False) as temp:
+            temp.write(content)
+            temp_path = Path(temp.name)
+        return client.upload_file_by_name(
+            project_folder_id,
+            temp_path,
+            PROJECT_README_FILENAME,
+            "text/markdown; charset=utf-8",
+        )
+    finally:
+        if temp_path:
+            temp_path.unlink(missing_ok=True)
 
 
 def _children_by_name(client: GoogleDriveClient, folder_id: str) -> dict[str, DriveItem]:
@@ -731,11 +774,25 @@ def _download_project_assets(
     downloaded: list[str] = []
     project_pack_links: dict[str, list[str]] = {}
     project_folders: list[dict[str, str]] = []
+    common_folder_found = False
     for project in client.list_children(projects_folder_id):
         if not project.is_folder:
             continue
         project_id = _safe_drive_filename_or_none(project.name, warnings, f"{PROJECTS_FOLDER} project folder")
         if not project_id:
+            continue
+        project_children = _children_by_name(client, project.id)
+        if project_id == COMMON_PROJECT_ID:
+            common_folder_found = True
+            common_downloads = _download_common_zip_files(
+                client,
+                project.id,
+                project_children,
+                data_dir / ONTOLOGY_PACKS_FOLDER / "indexed",
+                warnings=warnings,
+            )
+            downloaded.extend(common_downloads)
+            project_pack_links[COMMON_PROJECT_PACK_LINKS_KEY] = [_pack_id_from_zip(Path(path)) for path in common_downloads]
             continue
         project_folders.append(
             {
@@ -745,7 +802,6 @@ def _download_project_assets(
                 "modifiedTime": project.modified_time,
             }
         )
-        project_children = _children_by_name(client, project.id)
         metadata_folder = project_children.get("metadata")
         existing_metadata_names: set[str] = set()
         target_metadata_dir = data_dir / IFC_MODELS_FOLDER / project_id / "metadata"
@@ -792,8 +848,54 @@ def _download_project_assets(
             downloaded.extend(pack_downloads)
             project_pack_links[project_id] = [_pack_id_from_zip(Path(path)) for path in pack_downloads]
     _write_project_folders(data_dir, project_folders)
-    _prune_removed_project_assets(data_dir, {item["projectId"] for item in project_folders})
+    active_project_ids = {item["projectId"] for item in project_folders}
+    if common_folder_found:
+        active_project_ids.add(COMMON_PROJECT_ID)
+    _prune_removed_project_assets(data_dir, active_project_ids)
     return downloaded, project_pack_links
+
+
+def _download_common_zip_files(
+    client: GoogleDriveClient,
+    common_folder_id: str,
+    common_children: dict[str, DriveItem],
+    target_dir: Path,
+    *,
+    warnings: list[str] | None = None,
+) -> list[str]:
+    downloaded: list[str] = []
+    packs_folder = common_children.get(PROJECT_PACKS_FOLDER)
+    if packs_folder and packs_folder.is_folder:
+        downloaded.extend(
+            _download_project_zip_files(
+                client,
+                packs_folder.id,
+                target_dir,
+                COMMON_PROJECT_ID,
+                warnings=warnings,
+            )
+        )
+
+    for category in client.list_children(common_folder_id):
+        if not category.is_folder or category.name == PROJECT_PACKS_FOLDER:
+            continue
+        category_id = _safe_drive_filename_or_none(category.name, warnings, f"{PROJECTS_FOLDER}/{COMMON_PROJECT_ID} category folder")
+        if not category_id:
+            continue
+        category_children = _children_by_name(client, category.id)
+        category_packs = category_children.get(PROJECT_PACKS_FOLDER)
+        if not category_packs or not category_packs.is_folder:
+            continue
+        downloaded.extend(
+            _download_project_zip_files(
+                client,
+                category_packs.id,
+                target_dir,
+                f"{COMMON_PROJECT_ID}__{category_id}",
+                warnings=warnings,
+            )
+        )
+    return downloaded
 
 
 def _prune_removed_project_assets(data_dir: Path, active_project_ids: set[str]) -> None:

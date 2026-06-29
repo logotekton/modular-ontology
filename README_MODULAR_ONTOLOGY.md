@@ -106,6 +106,7 @@ Share the `Modular Ontology` Google Drive folder with the service account email 
 - `00_Admin/users.json`
 - `00_Admin/mcp_remote.json`
 - `01_Database/modular_ontology.sqlite3`
+- `02_Projects/_Common/<category>/ontology-packs/*.zip`
 - `02_Projects/<project-id>/ifc-models/*.{ifc,ifczip,zip,xkt}`
 - `02_Projects/<project-id>/ontology-packs/*.zip`
 - legacy compatibility: `03_IFC_Models/` and `04_Ontology_Packs/indexed/*.zip`
@@ -135,8 +136,11 @@ Model and pack files are uploaded by an administrator directly in Google Drive. 
 - Create the project in the app first. The app creates `02_Projects/<project-id>/` and its default upload folders in Drive.
 - IFC/XKT files: `02_Projects/<project-id>/ifc-models/`
 - ontology pack ZIP files: `02_Projects/<project-id>/ontology-packs/`
+- common ontology pack ZIP files, grouped by category:
+  - `02_Projects/_Common/시방서/ontology-packs/`
+  - `02_Projects/_Common/설계지침/ontology-packs/`
 
-During sync, IFC/XKT files without metadata are registered automatically as model metadata, pack ZIPs are reindexed into the project knowledge graph, and project-scoped packs are linked to the matching project. A project's `ontology-packs/` folder is authoritative for that project's pack links, so removing a ZIP from Drive and syncing removes that pack link from the project. Project-scoped ZIPs are cached locally with the project ID prefixed to avoid filename collisions. Legacy `03_IFC_Models/<project-id>/files/` and `04_Ontology_Packs/indexed/` folders are still read for backward compatibility.
+During sync, IFC/XKT files without metadata are registered automatically as model metadata, pack ZIPs are reindexed into the project knowledge graph, and project-scoped packs are linked to the matching project. Common packs under `_Common/<category>/ontology-packs` are linked to every project and are intended for shared references such as design guidelines, specifications, standards, and company rules. A project's `ontology-packs/` folder is authoritative for that project's pack links, so removing a ZIP from Drive and syncing removes that pack link from the project. Project-scoped and common ZIPs are cached locally with a scope prefix to avoid filename collisions. Legacy `03_IFC_Models/<project-id>/files/` and `04_Ontology_Packs/indexed/` folders are still read for backward compatibility.
 
 Force a full write-back as an admin:
 
@@ -173,13 +177,26 @@ Admin sessions can also rebuild the persistent SQLite ontology index from the cu
 
 Use `mcp-config.example.json` as the Codex/GPT MCP server template.
 
-Available tools:
+Canonical MCP tools use the `mo_<domain>_<action>` naming pattern. `mo` is short for Modular Ontology. New client flows should start from projects because packs are related evidence slices inside a project, not the primary user choice. Legacy tool names still work as aliases for existing clients.
 
-- `list_projects`
-- `list_packs`
-- `get_graph`
-- `search_pack`
-- `ask_pack_question`
+Core tools:
+
+- `mo_tool_manifest`
+- `mo_ontology_manifest`
+- `mo_server_status`
+- `mo_project_list`
+- `mo_project_overview`
+- `mo_project_pack_list`
+- `mo_project_search`
+- `mo_pack_list` returns project-grouped packs by default; use `flat=true` only for pack administration
+- `mo_pack_overview`
+- `mo_pack_schema`
+- `mo_node_type_list`
+- `mo_relation_type_list`
+- `mo_graph_get`
+- `mo_evidence_search`
+- `mo_evidence_trace`
+- `mo_question_answer`
 
 Verify the stdio MCP server:
 
@@ -247,7 +264,7 @@ $env:OPENAI_API_KEY="..."
 $env:MODULAR_ONTOLOGY_OPENAI_MODEL="gpt-4.1-mini"
 ```
 
-Then call `/api/query` or `ask_pack_question` with `use_openai: true`. If `MODULAR_ONTOLOGY_OPENAI_MODEL` is unset, the default model is `gpt-4.1-mini`.
+Then call `/api/query` or `mo_question_answer` with `use_openai: true`. If `MODULAR_ONTOLOGY_OPENAI_MODEL` is unset, the default model is `gpt-4.1-mini`.
 
 For the hosted web UI, production does not need a shared `OPENAI_API_KEY`. Users can enter their own OpenAI API key in the AI Query panel; the key is sent only with that request and is not written to server storage.
 

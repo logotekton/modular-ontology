@@ -40,6 +40,8 @@ from .auth import (
 )
 from .config import DATA_DIR, IFC_MODELS_FOLDER, MCP_REMOTE_FILE, PROJECTS_FOLDER, ROOT, env
 from .google_drive_sync import (
+    COMMON_PROJECT_ID,
+    COMMON_PROJECT_PACK_LINKS_KEY,
     PROJECT_FOLDERS_FILENAME,
     PROJECT_PACK_LINKS_FILENAME,
     ensure_project_drive_folders,
@@ -1111,10 +1113,15 @@ def _apply_drive_project_pack_links() -> dict[str, list[str]]:
 
     packs = list_packs()
     valid_pack_ids = {str(pack["id"]) for pack in packs}
+    common_pack_ids = [
+        str(pack_id).strip()
+        for pack_id in raw_links.get(COMMON_PROJECT_PACK_LINKS_KEY, [])
+        if str(pack_id).strip() in valid_pack_ids
+    ]
     project_prefixes = {
         f"{str(project_id).strip()}__"
         for project_id in raw_links
-        if str(project_id).strip()
+        if str(project_id).strip() and str(project_id).strip() != COMMON_PROJECT_PACK_LINKS_KEY
     }
     drive_scoped_pack_ids = {
         str(pack_id).strip()
@@ -1132,6 +1139,9 @@ def _apply_drive_project_pack_links() -> dict[str, list[str]]:
     applied: dict[str, list[str]] = {}
     for project_id, pack_ids in raw_links.items():
         project_id = str(project_id).strip()
+        if project_id == COMMON_PROJECT_PACK_LINKS_KEY:
+            applied[COMMON_PROJECT_PACK_LINKS_KEY] = common_pack_ids
+            continue
         if project_id not in projects_by_id or not isinstance(pack_ids, list):
             continue
         linked_pack_ids = [
@@ -1149,9 +1159,21 @@ def _apply_drive_project_pack_links() -> dict[str, list[str]]:
             for pack_id in existing_pack_ids
             if pack_id in valid_pack_ids and pack_id not in drive_scoped_pack_ids
         ]
-        authoritative_pack_ids = list(dict.fromkeys([*preserved_pack_ids, *linked_pack_ids]))
+        authoritative_pack_ids = list(dict.fromkeys([*preserved_pack_ids, *common_pack_ids, *linked_pack_ids]))
         set_project_packs(project_id, authoritative_pack_ids)
         applied[project_id] = authoritative_pack_ids
+    if common_pack_ids:
+        for project_id, project in projects_by_id.items():
+            if project_id in applied:
+                continue
+            existing_pack_ids = [
+                str(pack_id).strip()
+                for pack_id in project.get("packIds", [])
+                if str(pack_id).strip() in valid_pack_ids
+            ]
+            authoritative_pack_ids = list(dict.fromkeys([*existing_pack_ids, *common_pack_ids]))
+            set_project_packs(project_id, authoritative_pack_ids)
+            applied[project_id] = authoritative_pack_ids
     return applied
 
 

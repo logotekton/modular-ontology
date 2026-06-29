@@ -493,6 +493,7 @@ def test_ensure_project_drive_folders_creates_default_upload_folders(monkeypatch
         def __init__(self) -> None:
             self.children = {"root": []}
             self.created = []
+            self.uploads = []
 
         def list_children(self, folder_id):
             return self.children.get(folder_id, [])
@@ -504,6 +505,13 @@ def test_ensure_project_drive_folders_creates_default_upload_folders(monkeypatch
             self.children.setdefault(folder_id, [])
             self.created.append((parent_id, name))
             return item
+
+        def upload_file_by_name(self, folder_id, source, name=None, mime_type=None):
+            file_name = name or Path(source).name
+            item = DriveItem(f"{folder_id}/{file_name}", file_name, mime_type or "text/markdown")
+            self.children.setdefault(folder_id, []).append(item)
+            self.uploads.append({"folder_id": folder_id, "name": file_name, "mime_type": mime_type})
+            return {"status": "created", "id": item.id, "name": file_name}
 
     fake_client = FakeDriveClient()
     monkeypatch.setenv("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "root")
@@ -521,6 +529,14 @@ def test_ensure_project_drive_folders_creates_default_upload_folders(monkeypatch
         ("root/02_Projects", "client-plant-a"),
         ("root/02_Projects/client-plant-a", "ifc-models"),
         ("root/02_Projects/client-plant-a", "ontology-packs"),
+    ]
+    assert result["files"] == ["02_Projects/client-plant-a/README.md"]
+    assert fake_client.uploads == [
+        {
+            "folder_id": "root/02_Projects/client-plant-a",
+            "name": "README.md",
+            "mime_type": "text/markdown; charset=utf-8",
+        }
     ]
 
 
@@ -771,6 +787,46 @@ def test_drive_project_pack_links_preserve_manual_legacy_links(monkeypatch, tmp_
 
     assert applied == {"project-a": ["legacy-pack"]}
     assert projects[0]["packIds"] == ["legacy-pack"]
+
+
+def test_drive_common_pack_links_apply_to_all_projects(monkeypatch, tmp_path) -> None:
+    from modular_ontology import app as app_module
+    from modular_ontology import project_store
+
+    monkeypatch.setattr(app_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(project_store, "DB_PATH", tmp_path / "projects.sqlite3")
+    monkeypatch.setattr(
+        app_module,
+        "list_packs",
+        lambda: [
+            {"id": "project-pack", "filename": "project-a__project-pack.zip"},
+            {"id": "common-spec-pack", "filename": "_Common__standard-spec.zip"},
+        ],
+    )
+    monkeypatch.setattr(
+        app_module,
+        "list_projects",
+        lambda: project_store.list_projects([{"id": "project-pack"}, {"id": "common-spec-pack"}]),
+    )
+    project_store.create_project(name="Project A", pack_ids=["project-pack"])
+    project_store.create_project(name="Project B", pack_ids=[])
+    marker = tmp_path / "02_Projects" / ".drive-project-pack-links.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        json.dumps({"__common__": ["common-spec-pack"], "project-a": ["project-pack"]}),
+        encoding="utf-8",
+    )
+
+    applied = app_module._apply_drive_project_pack_links()
+    projects = {project["id"]: project for project in project_store.list_projects([{"id": "project-pack"}, {"id": "common-spec-pack"}])}
+
+    assert applied == {
+        "__common__": ["common-spec-pack"],
+        "project-a": ["common-spec-pack", "project-pack"],
+        "project-b": ["common-spec-pack"],
+    }
+    assert projects["project-a"]["packIds"] == ["common-spec-pack", "project-pack"]
+    assert projects["project-b"]["packIds"] == ["common-spec-pack"]
 
 
 def test_drive_project_folder_rename_updates_project_and_company_access(monkeypatch, tmp_path) -> None:
@@ -1330,22 +1386,117 @@ def test_pack_upload_is_session_admin_only_and_accepts_valid_zip(monkeypatch, tm
 
 def test_mcp_tools_return_json_payloads() -> None:
     packs = json.loads(mcp_server.list_packs())
+    mo_packs = json.loads(mcp_server.mo_pack_list())
+    flat_mo_packs = json.loads(mcp_server.mo_pack_list(flat=True))
+    project_packs = json.loads(mcp_server.mo_project_pack_list("samcheok-building-b"))
     projects = json.loads(mcp_server.list_projects())
+    manifest = json.loads(mcp_server.mo_tool_manifest())
+    ontology_manifest = json.loads(mcp_server.mo_ontology_manifest("advance-steel-samcheok-bldg-b-bm25-evidence-pack", 200, 400))
+    schema = json.loads(mcp_server.mo_pack_schema("advance-steel-samcheok-bldg-b-bm25-evidence-pack", 200, 400))
+    node_types = json.loads(mcp_server.mo_node_type_list("advance-steel-samcheok-bldg-b-bm25-evidence-pack", 400))
+    relation_types = json.loads(mcp_server.mo_relation_type_list("advance-steel-samcheok-bldg-b-bm25-evidence-pack", 400))
+    pack_overview = json.loads(mcp_server.mo_pack_overview("advance-steel-samcheok-bldg-b-bm25-evidence-pack", 120, 240))
+    project_overview = json.loads(mcp_server.mo_project_overview("samcheok-building-b", 80, 160))
+    project_search = json.loads(mcp_server.mo_project_search("samcheok-building-b", "Beam", 2))
+    evidence_trace = json.loads(mcp_server.mo_evidence_trace("advance-steel-samcheok-bldg-b-bm25-evidence-pack", "Beam", 2))
     graph = json.loads(mcp_server.get_graph("revit-yeoju-ar-ifc-workset-module-localcrab-pack", 20, 40))
     evidence = json.loads(mcp_server.search_pack("advance-steel-samcheok-bldg-b-bm25-evidence-pack", "Beam", 2))
     answer = json.loads(mcp_server.ask_pack_question("advance-steel-samcheok-bldg-b-bm25-evidence-pack", "Beam", 2))
+    mo_answer = json.loads(mcp_server.mo_question_answer("advance-steel-samcheok-bldg-b-bm25-evidence-pack", "Beam", 2))
     modules = json.loads(mcp_server.list_modules("advance-steel-samcheok-bldg-b-bm25-evidence-pack"))
     fasteners = json.loads(mcp_server.get_fasteners("advance-steel-samcheok-bldg-b-bm25-evidence-pack"))
 
     assert packs
+    assert flat_mo_packs == packs
+    assert mo_packs["mode"] == "project-first"
+    assert mo_packs["projects"]
+    assert project_packs["projects"][0]["project"]["id"] == "samcheok-building-b"
+    assert project_packs["projects"][0]["packCount"] == 1
     assert projects
+    assert manifest["naming"]["pattern"] == "mo_<domain>_<action>"
+    assert manifest["workflow"]["primaryUnit"] == "project"
+    assert "mo_ontology_manifest" in manifest["canonicalTools"]
+    assert "mo_question_answer" in manifest["canonicalTools"]
+    assert "mo_node_type_list" in manifest["canonicalTools"]
+    assert "mo_relation_type_list" in manifest["canonicalTools"]
+    assert "mo_project_overview" in manifest["canonicalTools"]
+    assert "mo_evidence_trace" in manifest["canonicalTools"]
+    assert "mo_distinct_property_values" in manifest["canonicalTools"]
+    assert "mo_filtered_search_nodes" in manifest["canonicalTools"]
+    assert "mo_aggregate_nodes" in manifest["canonicalTools"]
+    assert "mo_list_project_modules" in manifest["canonicalTools"]
+    assert manifest["legacyAliases"]["ask_pack_question"] == "mo_question_answer"
+    assert ontology_manifest["schemas"][0]["queryableFields"]["nodeFields"]
+    assert schema["nodeTypes"]
+    assert schema["relationTypes"]
+    assert schema["queryableFields"]["searchFields"]["nodes"]
+    assert node_types["nodeTypes"]
+    assert node_types["queryableNodeFields"]
+    assert relation_types["relationTypes"]
+    assert relation_types["queryableEdgeFields"]
+    assert pack_overview["pack"]["id"] == "advance-steel-samcheok-bldg-b-bm25-evidence-pack"
+    assert "mo_ontology_manifest" in pack_overview["recommendedTools"]
+    assert project_overview["projects"][0]["project"]["id"] == "samcheok-building-b"
+    assert project_overview["projects"][0]["packs"]
+    assert project_search["matchCount"] > 0
+    assert evidence_trace["evidence"]
+    assert evidence_trace["nodes"]["nodes"]
     assert graph["nodes"]
     assert isinstance(evidence, list)
     assert evidence
     assert answer["mode"] == "local-graph-rag"
+    assert mo_answer["mode"] == "local-graph-rag"
     assert answer["evidence"]
     assert modules["module_count"] == 24
     assert fasteners["bolt_quantity"] == 1011
+
+
+def test_mcp_query_tools_filter_project_and_aggregate_nodes() -> None:
+    pack_id = "advance-steel-samcheok-bldg-b-bm25-evidence-pack"
+
+    distinct_roles = json.loads(
+        mcp_server.mo_distinct_property_values(
+            pack_id,
+            "assembly_role",
+            node_type="Assembly",
+            limit=20,
+        )
+    )
+    filtered = json.loads(
+        mcp_server.mo_filtered_search_nodes(
+            pack_id,
+            node_type="Assembly",
+            where={"assembly_role": {"eq": "Column"}},
+            fields=["id", "assembly_mark", "assembly_role", "total_weight_kg", "formula"],
+            order_by=[{"field": "assembly_mark", "direction": "asc", "natural": True}],
+            limit=5,
+        )
+    )
+    aggregate = json.loads(
+        mcp_server.mo_aggregate_nodes(
+            pack_id,
+            node_type="Assembly",
+            where={"assembly_role": {"eq": "Column"}},
+            group_by=["assembly_role"],
+            metrics=[
+                {"field": "total_weight_kg", "agg": "sum", "as": "weight_kg"},
+                {"agg": "count", "as": "row_count"},
+            ],
+        )
+    )
+    modules = json.loads(mcp_server.mo_list_project_modules(project_id="samcheok-building-b", limit=50))
+    schema_profile = json.loads(mcp_server.mo_schema_profile(pack_id, sample_size=50))
+
+    assert "Column" in distinct_roles["values"]
+    assert filtered["count"] > 0
+    assert filtered["rows"]
+    assert "formula" not in filtered["rows"][0]
+    assert set(filtered["rows"][0]).issubset({"id", "assembly_mark", "assembly_role", "total_weight_kg"})
+    assert aggregate["rows"] == [{"assembly_role": "Column", "weight_kg": 4697.07888, "row_count": 25}]
+    assert modules["module_count"] >= 17
+    assert any(module["module_id"] == "1-02-A" for module in modules["modules"])
+    assert schema_profile["node_types"]
+    assert schema_profile["node_types"][0]["properties"]["assemblies"]["sample_values"][0]["type"] == "list"
 
 
 def test_mcp_company_scope_filters_projects_and_packs(monkeypatch, tmp_path) -> None:
@@ -1529,7 +1680,7 @@ def test_mcp_stdio_server_lists_and_calls_tools() -> None:
                 tools = await session.list_tools()
                 names = {tool.name for tool in tools.tools}
                 result = await session.call_tool(
-                    "ask_pack_question",
+                    "mo_question_answer",
                     {
                         "pack_id": "advance-steel-samcheok-bldg-b-bm25-evidence-pack",
                         "question": "Beam",
@@ -1539,6 +1690,27 @@ def test_mcp_stdio_server_lists_and_calls_tools() -> None:
                 payload = json.loads(result.content[0].text)
 
         assert {
+            "mo_tool_manifest",
+            "mo_ontology_manifest",
+            "mo_project_list",
+            "mo_project_overview",
+            "mo_project_pack_list",
+            "mo_project_search",
+            "mo_pack_list",
+            "mo_pack_overview",
+            "mo_pack_schema",
+            "mo_graph_get",
+            "mo_node_type_list",
+            "mo_distinct_property_values",
+            "mo_filtered_search_nodes",
+            "mo_aggregate_nodes",
+            "mo_list_project_modules",
+            "mo_query_quantity_evidence",
+            "mo_join_by_property",
+            "mo_relation_type_list",
+            "mo_evidence_search",
+            "mo_evidence_trace",
+            "mo_question_answer",
             "list_projects",
             "list_packs",
             "get_graph",
@@ -2253,6 +2425,67 @@ def test_google_drive_sync_namespaces_same_pack_filename_per_project(tmp_path) -
     }
 
 
+def test_google_drive_sync_reads_common_project_packs_without_creating_project(tmp_path) -> None:
+    class FakeDriveClient:
+        children = {
+            "root": [DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder")],
+            "projects-root": [
+                DriveItem("common", "_Common", "application/vnd.google-apps.folder"),
+                DriveItem("project-a", "project-a", "application/vnd.google-apps.folder"),
+            ],
+            "common": [
+                DriveItem("spec-category", "시방서", "application/vnd.google-apps.folder"),
+                DriveItem("guide-category", "설계지침", "application/vnd.google-apps.folder"),
+            ],
+            "spec-category": [DriveItem("spec-packs", "ontology-packs", "application/vnd.google-apps.folder")],
+            "guide-category": [DriveItem("guide-packs", "ontology-packs", "application/vnd.google-apps.folder")],
+            "project-a": [DriveItem("packs-a", "ontology-packs", "application/vnd.google-apps.folder")],
+            "spec-packs": [DriveItem("spec-pack", "standard-spec.zip", "application/x-zip-compressed")],
+            "guide-packs": [DriveItem("guide-pack", "design-guide.zip", "application/x-zip-compressed")],
+            "packs-a": [DriveItem("pack-a", "project-pack.zip", "application/x-zip-compressed")],
+        }
+
+        def list_children(self, folder_id):
+            return self.children.get(folder_id, [])
+
+        def download_file(self, file_id, target):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            pack_id = {
+                "spec-pack": "common-spec-pack",
+                "guide-pack": "common-design-guide-pack",
+                "pack-a": "project-a-pack",
+            }[file_id]
+            with zipfile.ZipFile(target, "w") as zf:
+                zf.writestr("manifest.json", json.dumps({"pack_id": pack_id}))
+
+    result = sync_google_drive_storage(
+        client=FakeDriveClient(),
+        root_folder_id="root",
+        data_dir=tmp_path,
+        force=True,
+    )
+
+    links_path = tmp_path / "02_Projects" / ".drive-project-pack-links.json"
+    folders_path = tmp_path / "02_Projects" / ".drive-project-folders.json"
+
+    assert result["status"] == "synced"
+    assert (tmp_path / "04_Ontology_Packs" / "indexed" / "_Common__시방서__standard-spec.zip").exists()
+    assert (tmp_path / "04_Ontology_Packs" / "indexed" / "_Common__설계지침__design-guide.zip").exists()
+    assert (tmp_path / "04_Ontology_Packs" / "indexed" / "project-a__project-pack.zip").exists()
+    assert json.loads(links_path.read_text(encoding="utf-8")) == {
+        "__common__": ["common-spec-pack", "common-design-guide-pack"],
+        "project-a": ["project-a-pack"],
+    }
+    assert json.loads(folders_path.read_text(encoding="utf-8")) == [
+        {
+            "folderId": "project-a",
+            "projectId": "project-a",
+            "name": "project-a",
+            "modifiedTime": "",
+        }
+    ]
+
+
 def test_project_scoped_pack_title_uses_drive_filename(tmp_path, monkeypatch) -> None:
     from modular_ontology import pack_index
 
@@ -2278,7 +2511,38 @@ def test_project_scoped_pack_title_uses_drive_filename(tmp_path, monkeypatch) ->
 
     assert pack["id"] == "revit-yeoju-ar-ifc-workset-module-localcrab-pack"
     assert pack["title"] == "여주 건축 온톨로지팩"
+    assert pack["displayName"] == "여주 건축 온톨로지팩"
+    assert pack["displayFilename"] == "여주_건축_온톨로지팩.zip"
+    assert pack["projectScoped"] is True
     assert pack["source"] == "Revit IFC"
+
+
+def test_common_project_pack_summary_exposes_category(tmp_path) -> None:
+    from modular_ontology import pack_index
+
+    pack_dir = tmp_path / "04_Ontology_Packs" / "indexed"
+    pack_dir.mkdir(parents=True)
+    pack_path = pack_dir / "_Common__시방서__standard-spec.zip"
+    with zipfile.ZipFile(pack_path, "w") as zf:
+        zf.writestr(
+            "manifest.json",
+            json.dumps(
+                {
+                    "pack_id": "common-standard-spec-pack",
+                    "title": "Standard Spec Pack",
+                    "entrypoints": {"nodes": "graph/nodes.jsonl", "edges": "graph/edges.jsonl"},
+                    "counts": {"nodes": 0, "edges": 0, "documents": 0},
+                }
+            ),
+        )
+        zf.writestr("graph/nodes.jsonl", "")
+        zf.writestr("graph/edges.jsonl", "")
+
+    pack = pack_index.summarize_pack(pack_index.PackFile(pack_path))
+
+    assert pack["displayFilename"] == "standard-spec.zip"
+    assert pack["commonCategory"] == "시방서"
+    assert pack["commonScoped"] is True
 
 
 def test_google_drive_sync_project_metadata_wins_over_legacy_ifc_folder(tmp_path) -> None:
