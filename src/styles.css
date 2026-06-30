@@ -431,10 +431,6 @@ nav {
   padding: 0 7px;
 }
 
-.sidebar-graph-controls .graph-mode-tabs {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-
 .sidebar-graph-controls .graph-type-filters {
   gap: 5px;
 }
@@ -1365,10 +1361,6 @@ h2 {
   cursor: default;
 }
 
-.sigma-stage.dragging-node {
-  cursor: default;
-}
-
 .graph-control-panel {
   position: absolute;
   top: 14px;
@@ -1409,32 +1401,6 @@ h2 {
   padding: 0 9px;
   font-size: 11px;
   font-weight: 900;
-}
-
-.graph-mode-tabs {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 4px;
-  border: 1px solid #dbe6ef;
-  border-radius: 8px;
-  background: #f4f8fc;
-  padding: 4px;
-}
-
-.graph-mode-tabs button {
-  min-height: 28px;
-  border: 0;
-  border-radius: 6px;
-  color: #64748b;
-  background: transparent;
-  font-size: 11px;
-  font-weight: 900;
-}
-
-.graph-mode-tabs button.active {
-  color: #0f766e;
-  background: #fff;
-  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
 }
 
 .graph-type-filters {

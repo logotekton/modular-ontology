@@ -131,7 +131,6 @@ type GraphPayload = {
 
 type GraphControls = typeof DEFAULT_GRAPH_CONTROLS;
 type LayoutQuality = "full" | "interactive";
-type DynamicGraphMode = "free" | "typeOrbit" | "radial";
 type AiKeyStatus = "missing" | "untested" | "testing" | "valid" | "invalid";
 
 type IndexStats = {
@@ -3123,23 +3122,15 @@ function GraphCanvas({
   onSelectNode: (node: GraphNode | null) => void;
 }) {
   const [controls, setControls] = useState<GraphControls>(DEFAULT_GRAPH_CONTROLS);
-  const [dynamicMode, setDynamicMode] = useState<DynamicGraphMode>("free");
   const [activeNodeTypes, setActiveNodeTypes] = useState<Set<string>>(new Set());
   const [layoutSeed, setLayoutSeed] = useState(0);
   const [controlHost, setControlHost] = useState<HTMLElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const rendererRef = useRef<Sigma | null>(null);
   const nodeLookupRef = useRef<Map<string, GraphNode>>(new Map());
-  const simulationFrameRef = useRef<number | null>(null);
   const controlsFrameRef = useRef<number | null>(null);
-  const velocitiesRef = useRef<Map<string, { x: number; y: number }>>(new Map());
-  const dynamicModeRef = useRef<DynamicGraphMode>("free");
   const controlsRef = useRef<GraphControls>(DEFAULT_GRAPH_CONTROLS);
   const graphStats = graph ? computeGraphViewStats(graph, activeNodeTypes) : null;
-
-  useEffect(() => {
-    dynamicModeRef.current = dynamicMode;
-  }, [dynamicMode]);
 
   useEffect(() => {
     controlsRef.current = controls;
@@ -3156,13 +3147,9 @@ function GraphCanvas({
     const sigmaGraph = new Graph({ multi: true, allowSelfLoops: true });
     const nodeLookup = new Map<string, GraphNode>();
     const positions = layoutGraphNodes(graph.nodes, graph.edges, controlsRef.current, "full");
-    const velocities = new Map<string, { x: number; y: number }>();
-    const draggedNodeRef: { id: string | null } = { id: null };
-    velocitiesRef.current = velocities;
     graph.nodes.forEach((node) => {
       const point = positions.get(node.id) ?? { x: 0, y: 0 };
       nodeLookup.set(node.id, node);
-      velocities.set(node.id, { x: 0, y: 0 });
       sigmaGraph.addNode(node.id, {
         x: point.x,
         y: point.y,
@@ -3195,15 +3182,18 @@ function GraphCanvas({
       }
     });
 
+    const denseGraph = graph.nodes.length > 1800 || graph.edges.length > 5000;
     const renderer = new Sigma(sigmaGraph, container, {
       defaultEdgeColor: GRAPH_EDGE_COLOR,
       defaultEdgeType: "line",
       enableEdgeEvents: false,
       enableCameraPanning: true,
+      hideEdgesOnMove: true,
+      hideLabelsOnMove: true,
       labelColor: { color: "#334155" },
-      labelDensity: 0.12,
+      labelDensity: denseGraph ? 0.05 : 0.12,
       labelGridCellSize: 72,
-      labelRenderedSizeThreshold: 8,
+      labelRenderedSizeThreshold: denseGraph ? 10 : 8,
       minCameraRatio: 0.08,
       maxCameraRatio: 8,
       renderEdgeLabels: false,
@@ -3225,25 +3215,6 @@ function GraphCanvas({
     });
     renderer.on("clickStage", () => {
       onSelectNode(null);
-    });
-    renderer.on("downNode", ({ node }) => {
-      draggedNodeRef.id = node;
-      sigmaGraph.setNodeAttribute(node, "highlighted", true);
-      container.classList.add("dragging-node");
-      renderer.getCamera().disable();
-    });
-    renderer.on("upNode", () => {
-      if (draggedNodeRef.id) sigmaGraph.setNodeAttribute(draggedNodeRef.id, "highlighted", false);
-      draggedNodeRef.id = null;
-      container.classList.remove("dragging-node");
-      renderer.getCamera().enable();
-    });
-    renderer.on("moveBody", ({ event }) => {
-      const nodeId = draggedNodeRef.id;
-      if (!nodeId) return;
-      const point = renderer.viewportToGraph({ x: event.x, y: event.y });
-      sigmaGraph.mergeNodeAttributes(nodeId, { x: point.x, y: point.y, fixed: true, zIndex: 20 });
-      velocities.set(nodeId, { x: 0, y: 0 });
     });
 
     let middlePan:
@@ -3308,27 +3279,13 @@ function GraphCanvas({
     window.addEventListener("mousemove", handleMouseMove);
     window.addEventListener("mouseup", handleMouseUp);
 
-    let frame = 0;
-    const runSimulation = () => {
-      frame += 1;
-      stepDynamicGraph(sigmaGraph, graph, velocities, controlsRef.current, dynamicModeRef.current, draggedNodeRef.id);
-      if (frame % 2 === 0) renderer.refresh();
-      simulationFrameRef.current = requestAnimationFrame(runSimulation);
-    };
-    simulationFrameRef.current = requestAnimationFrame(runSimulation);
-
     return () => {
-      if (simulationFrameRef.current !== null) {
-        cancelAnimationFrame(simulationFrameRef.current);
-        simulationFrameRef.current = null;
-      }
       container.removeEventListener("mousedown", handleMouseDown, true);
       container.removeEventListener("auxclick", blockMiddleClick, true);
       window.removeEventListener("mousemove", handleMouseMove);
       window.removeEventListener("mouseup", handleMouseUp);
       renderer.kill();
       if (rendererRef.current === renderer) rendererRef.current = null;
-      if (velocitiesRef.current === velocities) velocitiesRef.current = new Map();
     };
   }, [graph, layoutSeed, onSelectNode]);
 
@@ -3341,10 +3298,6 @@ function GraphCanvas({
       controlsFrameRef.current = null;
       const sigmaGraph = renderer.getGraph();
       const nodeIds: string[] = [];
-      velocitiesRef.current.forEach((velocity) => {
-        velocity.x = 0;
-        velocity.y = 0;
-      });
 
       graph.nodes.forEach((node) => {
         if (!sigmaGraph.hasNode(node.id)) return;
@@ -3423,11 +3376,9 @@ function GraphCanvas({
   const controlPanel = (
     <GraphControlPanel
         controls={controls}
-        mode={dynamicMode}
         nodeTypes={graph ? Array.from(new Set(graph.nodes.map((node) => node.type))) : []}
         activeNodeTypes={activeNodeTypes}
         onChange={setControls}
-        onModeChange={setDynamicMode}
         onReset={() => setLayoutSeed((seed) => seed + 1)}
         onToggleNodeType={(type) =>
           setActiveNodeTypes((current) => {
@@ -3458,143 +3409,6 @@ function edgeEndpointId(endpoint: GraphEdge["source"] | GraphEdge["target"]) {
   return typeof endpoint === "string" ? endpoint : endpoint?.id;
 }
 
-function stepDynamicGraph(
-  sigmaGraph: Graph,
-  payload: GraphPayload,
-  velocities: Map<string, { x: number; y: number }>,
-  controls: GraphControls,
-  mode: DynamicGraphMode,
-  draggedNodeId: string | null
-) {
-  const nodeIds = sigmaGraph.nodes().filter((nodeId) => !sigmaGraph.getNodeAttribute(nodeId, "hidden"));
-  const nodeIndex = new Map(payload.nodes.map((node) => [node.id, node]));
-  const typeOrder = Array.from(new Set(payload.nodes.map((node) => node.type)));
-  const graphRadius = Math.max(90, Math.sqrt(nodeIds.length) * controls.nodeDistance * 0.12);
-  const chargeRadius = Math.max(22, controls.nodeDistance * 0.18);
-  const chargeStrength = controls.repelForce * 0.00042;
-  const linkStrength = controls.linkForce * 0.012;
-  const centerStrength = Math.max(0.002, controls.centerForce * 0.18);
-  let freeCenterX = 0;
-  let freeCenterY = 0;
-
-  if (mode === "free" && nodeIds.length) {
-    nodeIds.forEach((nodeId) => {
-      freeCenterX += Number(sigmaGraph.getNodeAttribute(nodeId, "x") ?? 0);
-      freeCenterY += Number(sigmaGraph.getNodeAttribute(nodeId, "y") ?? 0);
-    });
-    freeCenterX /= nodeIds.length;
-    freeCenterY /= nodeIds.length;
-  }
-
-  payload.edges.forEach((edge) => {
-    const source = edgeEndpointId(edge.source);
-    const target = edgeEndpointId(edge.target);
-    if (!source || !target || !sigmaGraph.hasNode(source) || !sigmaGraph.hasNode(target)) return;
-    if (sigmaGraph.getNodeAttribute(source, "hidden") || sigmaGraph.getNodeAttribute(target, "hidden")) return;
-
-    const sourceX = Number(sigmaGraph.getNodeAttribute(source, "x") ?? 0);
-    const sourceY = Number(sigmaGraph.getNodeAttribute(source, "y") ?? 0);
-    const targetX = Number(sigmaGraph.getNodeAttribute(target, "x") ?? 0);
-    const targetY = Number(sigmaGraph.getNodeAttribute(target, "y") ?? 0);
-    const dx = targetX - sourceX;
-    const dy = targetY - sourceY;
-    const distance = Math.max(0.001, Math.hypot(dx, dy));
-    const desired = String(edge.relation).includes("chunk")
-      ? controls.nodeDistance * 0.055
-      : controls.nodeDistance * 0.092;
-    const pull = (distance - desired) * linkStrength;
-    const fx = (dx / distance) * pull;
-    const fy = (dy / distance) * pull;
-    if (source !== draggedNodeId) {
-      const velocity = velocities.get(source);
-      if (velocity) {
-        velocity.x += fx;
-        velocity.y += fy;
-      }
-    }
-    if (target !== draggedNodeId) {
-      const velocity = velocities.get(target);
-      if (velocity) {
-        velocity.x -= fx;
-        velocity.y -= fy;
-      }
-    }
-  });
-
-  for (let i = 0; i < nodeIds.length; i += 1) {
-    const a = nodeIds[i];
-    const aX = Number(sigmaGraph.getNodeAttribute(a, "x") ?? 0);
-    const aY = Number(sigmaGraph.getNodeAttribute(a, "y") ?? 0);
-    for (let j = i + 1; j < nodeIds.length; j += 1) {
-      const b = nodeIds[j];
-      const bX = Number(sigmaGraph.getNodeAttribute(b, "x") ?? 0);
-      const bY = Number(sigmaGraph.getNodeAttribute(b, "y") ?? 0);
-      let dx = bX - aX;
-      let dy = bY - aY;
-      let distance = Math.hypot(dx, dy);
-      if (distance > chargeRadius) continue;
-      if (distance < 0.001) {
-        const angle = ((stableHash(`${a}:${b}`) % 360) / 180) * Math.PI;
-        dx = Math.cos(angle);
-        dy = Math.sin(angle);
-        distance = 1;
-      }
-      const push = ((chargeRadius - distance) / chargeRadius) * chargeStrength;
-      const fx = (dx / distance) * push;
-      const fy = (dy / distance) * push;
-      const aVelocity = velocities.get(a);
-      const bVelocity = velocities.get(b);
-      if (a !== draggedNodeId && aVelocity) {
-        aVelocity.x -= fx;
-        aVelocity.y -= fy;
-      }
-      if (b !== draggedNodeId && bVelocity) {
-        bVelocity.x += fx;
-        bVelocity.y += fy;
-      }
-    }
-  }
-
-  nodeIds.forEach((nodeId, index) => {
-    if (nodeId === draggedNodeId) return;
-    const node = nodeIndex.get(nodeId);
-    const velocity = velocities.get(nodeId);
-    if (!node || !velocity) return;
-
-    const x = Number(sigmaGraph.getNodeAttribute(nodeId, "x") ?? 0);
-    const y = Number(sigmaGraph.getNodeAttribute(nodeId, "y") ?? 0);
-    let targetX = 0;
-    let targetY = 0;
-
-    if (mode === "free") {
-      velocity.x -= freeCenterX * centerStrength;
-      velocity.y -= freeCenterY * centerStrength;
-    } else if (mode === "typeOrbit") {
-      const typeIndex = Math.max(0, typeOrder.indexOf(node.type));
-      const angle = (typeIndex / Math.max(1, typeOrder.length)) * Math.PI * 2;
-      const jitter = ((stableHash(node.id) % 100) - 50) * 0.05;
-      targetX = Math.cos(angle) * graphRadius + jitter;
-      targetY = Math.sin(angle) * graphRadius + jitter;
-    } else if (mode === "radial") {
-      const degreeBias = node.type === "Module" ? 0.22 : node.type === "Assembly" ? 0.52 : node.type === "SinglePart" ? 0.82 : 1.06;
-      const angle = ((stableHash(node.id) % 3600) / 1800) * Math.PI + index * 0.002;
-      targetX = Math.cos(angle) * graphRadius * degreeBias;
-      targetY = Math.sin(angle) * graphRadius * degreeBias;
-    }
-
-    if (mode !== "free") {
-      velocity.x += (targetX - x) * centerStrength;
-      velocity.y += (targetY - y) * centerStrength;
-    }
-    velocity.x *= 0.82;
-    velocity.y *= 0.82;
-    const limit = mode === "free" ? 1.7 : 2.4;
-    const nextX = x + Math.max(-limit, Math.min(limit, velocity.x));
-    const nextY = y + Math.max(-limit, Math.min(limit, velocity.y));
-    sigmaGraph.mergeNodeAttributes(nodeId, { x: nextX, y: nextY });
-  });
-}
-
 function setCameraStateWithPan(
   renderer: Sigma,
   state: { x: number; y: number; angle: number; ratio: number }
@@ -3608,20 +3422,16 @@ function setCameraStateWithPan(
 
 function GraphControlPanel({
   controls,
-  mode,
   nodeTypes,
   activeNodeTypes,
   onChange,
-  onModeChange,
   onReset,
   onToggleNodeType,
 }: {
   controls: GraphControls;
-  mode: DynamicGraphMode;
   nodeTypes: string[];
   activeNodeTypes: Set<string>;
   onChange: (controls: GraphControls) => void;
-  onModeChange: (mode: DynamicGraphMode) => void;
   onReset: () => void;
   onToggleNodeType: (type: string) => void;
 }) {
@@ -3643,24 +3453,8 @@ function GraphControlPanel({
   return (
     <div className="graph-control-panel">
       <div className="graph-control-title">
-        <strong>Dynamic Graph</strong>
-        <button type="button" onClick={onReset}>다시 정렬</button>
-      </div>
-      <div className="graph-mode-tabs" role="tablist" aria-label="그래프 레이아웃 모드">
-        {[
-          ["free", "자유"],
-          ["typeOrbit", "타입별"],
-          ["radial", "방사형"],
-        ].map(([key, label]) => (
-          <button
-            className={mode === key ? "active" : ""}
-            key={key}
-            type="button"
-            onClick={() => onModeChange(key as DynamicGraphMode)}
-          >
-            {label}
-          </button>
-        ))}
+        <strong>Static Graph</strong>
+        <button type="button" onClick={onReset}>재배치</button>
       </div>
       <div className="graph-type-filters">
         {nodeTypes.map((type) => (
@@ -3824,49 +3618,95 @@ function layoutGraphNodes(
   return positions;
 }
 
-function resolveGraphOverlaps(
+type GraphLayoutItem = {
+  id: string;
+  radius: number;
+  point: { x: number; y: number };
+};
+
+function graphLayoutItems(
   nodes: GraphNode[],
   positions: Map<string, { x: number; y: number }>,
-  controls: GraphControls,
-  maxIterations = 120
+  controls: GraphControls
 ) {
-  const items = nodes
+  return nodes
     .map((node) => ({
       id: node.id,
       radius: graphCollisionRadius(node, controls),
       point: positions.get(node.id) ?? { x: 0, y: 0 },
     }))
     .sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function forEachNearbyGraphPair(
+  items: GraphLayoutItem[],
+  cellSize: number,
+  searchDistance: number,
+  visit: (a: GraphLayoutItem, b: GraphLayoutItem) => void
+) {
+  const safeCellSize = Math.max(1, cellSize);
+  const span = Math.max(1, Math.ceil(searchDistance / safeCellSize));
+  const buckets = new Map<string, number[]>();
+  const bucketKeys = items.map((item, index) => {
+    const x = Math.floor(item.point.x / safeCellSize);
+    const y = Math.floor(item.point.y / safeCellSize);
+    const key = `${x}:${y}`;
+    const bucket = buckets.get(key);
+    if (bucket) bucket.push(index);
+    else buckets.set(key, [index]);
+    return { x, y };
+  });
+
+  items.forEach((item, index) => {
+    const origin = bucketKeys[index];
+    for (let dx = -span; dx <= span; dx += 1) {
+      for (let dy = -span; dy <= span; dy += 1) {
+        const bucket = buckets.get(`${origin.x + dx}:${origin.y + dy}`);
+        if (!bucket) continue;
+        bucket.forEach((otherIndex) => {
+          if (otherIndex <= index) return;
+          visit(item, items[otherIndex]);
+        });
+      }
+    }
+  });
+}
+
+function resolveGraphOverlaps(
+  nodes: GraphNode[],
+  positions: Map<string, { x: number; y: number }>,
+  controls: GraphControls,
+  maxIterations = 120
+) {
+  const items = graphLayoutItems(nodes, positions, controls);
+  const maxRadius = Math.max(1, ...items.map((item) => item.radius));
+  const searchDistance = maxRadius * 2.05;
 
   for (let iteration = 0; iteration < maxIterations; iteration += 1) {
     let moved = false;
-    for (let i = 0; i < items.length; i += 1) {
-      for (let j = i + 1; j < items.length; j += 1) {
-        const a = items[i];
-        const b = items[j];
-        const minDistance = a.radius + b.radius;
-        let dx = b.point.x - a.point.x;
-        let dy = b.point.y - a.point.y;
-        let distance = Math.hypot(dx, dy);
+    forEachNearbyGraphPair(items, searchDistance, searchDistance, (a, b) => {
+      const minDistance = a.radius + b.radius;
+      let dx = b.point.x - a.point.x;
+      let dy = b.point.y - a.point.y;
+      let distance = Math.hypot(dx, dy);
 
-        if (distance >= minDistance) continue;
-        if (distance < 0.001) {
-          const angle = ((stableHash(`${a.id}:${b.id}`) % 360) / 180) * Math.PI;
-          dx = Math.cos(angle);
-          dy = Math.sin(angle);
-          distance = 1;
-        }
-
-        const push = ((minDistance - distance) / 2) * 1.08;
-        const ux = dx / distance;
-        const uy = dy / distance;
-        a.point.x -= ux * push;
-        a.point.y -= uy * push;
-        b.point.x += ux * push;
-        b.point.y += uy * push;
-        moved = true;
+      if (distance >= minDistance) return;
+      if (distance < 0.001) {
+        const angle = ((stableHash(`${a.id}:${b.id}`) % 360) / 180) * Math.PI;
+        dx = Math.cos(angle);
+        dy = Math.sin(angle);
+        distance = 1;
       }
-    }
+
+      const push = ((minDistance - distance) / 2) * 1.08;
+      const ux = dx / distance;
+      const uy = dy / distance;
+      a.point.x -= ux * push;
+      a.point.y -= uy * push;
+      b.point.x += ux * push;
+      b.point.y += uy * push;
+      moved = true;
+    });
     if (!moved) break;
   }
 
@@ -3879,40 +3719,30 @@ function applyGraphRepulsion(
   controls: GraphControls,
   quality: LayoutQuality
 ) {
-  const items = nodes
-    .map((node) => ({
-      id: node.id,
-      radius: graphCollisionRadius(node, controls),
-      point: positions.get(node.id) ?? { x: 0, y: 0 },
-    }))
-    .sort((a, b) => a.id.localeCompare(b.id));
+  const items = graphLayoutItems(nodes, positions, controls);
   const maxDistance = controls.nodeDistance / (quality === "full" ? 10 : 8);
   const strength = controls.repelForce / (quality === "full" ? 28000 : 14000);
 
-  for (let i = 0; i < items.length; i += 1) {
-    const a = items[i];
-    for (let j = i + 1; j < items.length; j += 1) {
-      const b = items[j];
-      let dx = b.point.x - a.point.x;
-      let dy = b.point.y - a.point.y;
-      let distance = Math.hypot(dx, dy);
-      if (distance > maxDistance) continue;
-      if (distance < 0.001) {
-        const angle = ((stableHash(`${a.id}:${b.id}`) % 360) / 180) * Math.PI;
-        dx = Math.cos(angle);
-        dy = Math.sin(angle);
-        distance = 1;
-      }
-
-      const push = ((maxDistance - distance) / maxDistance) * strength * (a.radius + b.radius);
-      const ux = dx / distance;
-      const uy = dy / distance;
-      a.point.x -= ux * push;
-      a.point.y -= uy * push;
-      b.point.x += ux * push;
-      b.point.y += uy * push;
+  forEachNearbyGraphPair(items, maxDistance, maxDistance, (a, b) => {
+    let dx = b.point.x - a.point.x;
+    let dy = b.point.y - a.point.y;
+    let distance = Math.hypot(dx, dy);
+    if (distance > maxDistance) return;
+    if (distance < 0.001) {
+      const angle = ((stableHash(`${a.id}:${b.id}`) % 360) / 180) * Math.PI;
+      dx = Math.cos(angle);
+      dy = Math.sin(angle);
+      distance = 1;
     }
-  }
+
+    const push = ((maxDistance - distance) / maxDistance) * strength * (a.radius + b.radius);
+    const ux = dx / distance;
+    const uy = dy / distance;
+    a.point.x -= ux * push;
+    a.point.y -= uy * push;
+    b.point.x += ux * push;
+    b.point.y += uy * push;
+  });
 
   items.forEach((item) => positions.set(item.id, item.point));
 }
