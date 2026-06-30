@@ -464,13 +464,16 @@ function App() {
     setSelectedGraphPackIds(graphPackOptions.map((pack) => pack.id));
   }
 
+  function clearGraphPacks() {
+    setSelectedGraphPackIds([]);
+  }
+
   function toggleGraphPackGroup(group: PackDisplayGroup) {
     setSelectedGraphPackIds((current) => {
       const groupIds = new Set(group.packIds);
       const activeCount = group.packIds.filter((packId) => current.includes(packId)).length;
       if (activeCount > 0) {
-        const next = current.filter((id) => !groupIds.has(id));
-        return next.length ? next : current;
+        return current.filter((id) => !groupIds.has(id));
       }
       return [...current, ...group.packIds.filter((packId) => !current.includes(packId))];
     });
@@ -601,7 +604,7 @@ function App() {
     if (!project) return;
     setSelectedGraphPackIds((current) => {
       const valid = current.filter((packId) => project.packIds.includes(packId));
-      return valid.length ? valid : project.packIds;
+      return valid;
     });
   }, [projects, selectedProjectId]);
 
@@ -684,7 +687,7 @@ function App() {
       projectData[0];
     if (nextProject) {
       setSelectedProjectId(nextProject.id);
-      setSelectedGraphPackIds(nextPackId && nextProject.packIds.includes(nextPackId) ? [nextPackId] : nextProject.packIds);
+      setSelectedGraphPackIds(nextPackId && nextProject.packIds.includes(nextPackId) ? [nextPackId] : []);
     } else {
       setSelectedProjectId("");
       setSelectedGraphPackIds([]);
@@ -929,7 +932,7 @@ function App() {
     const payload = (await res.json()) as { project: Project };
     await refreshData(undefined, authToken);
     setSelectedProjectId(payload.project.id);
-    setSelectedGraphPackIds(payload.project.packIds);
+    setSelectedGraphPackIds([]);
     setUploadStatus(`${payload.project.name} 프로젝트를 저장했습니다.`);
     return payload.project;
   }
@@ -1399,6 +1402,9 @@ function App() {
                 <button type="button" onClick={setAllGraphPacks}>
                   전체 팩
                 </button>
+                <button type="button" onClick={clearGraphPacks}>
+                  선택 해제
+                </button>
                 <div>
                   {graphPackGroups.map((group) => {
                     const activeCount = group.packIds.filter((packId) => selectedGraphPackIds.includes(packId)).length;
@@ -1422,7 +1428,11 @@ function App() {
               </div>
             ) : null}
             {graphPackOptions.length ? (
-              <GraphCanvas graph={graph} selectedNode={selectedNode} onSelectNode={setSelectedNode} />
+              selectedGraphPackIds.length ? (
+                <GraphCanvas graph={graph} selectedNode={selectedNode} onSelectNode={setSelectedNode} />
+              ) : (
+                <GraphProjectEmptyState hasPacks projectName={selectedProject?.name} />
+              )
             ) : (
               <GraphProjectEmptyState projectName={selectedProject?.name} />
             )}
@@ -3083,13 +3093,22 @@ function GraphStatsPanel({ stats }: { stats: GraphViewStats }) {
   );
 }
 
-function GraphProjectEmptyState({ projectName }: { projectName?: string }) {
+function GraphProjectEmptyState({ projectName, hasPacks = false }: { projectName?: string; hasPacks?: boolean }) {
+  const projectLabel = projectName ? `${projectName} 프로젝트` : "선택한 프로젝트";
   return (
     <div className="graph-project-empty-state project-empty-state">
       <Database size={30} />
-      <strong>온톨로지 팩이 없습니다.</strong>
-      <span>{projectName ? `${projectName} 프로젝트에 연결된 온톨로지 팩이 없습니다.` : "선택한 프로젝트에 연결된 온톨로지 팩이 없습니다."}</span>
-      <em>Drive에 온톨로지 ZIP 팩을 올린 뒤 동기화 탭에서 등록하면 그래프 탐색기를 사용할 수 있습니다.</em>
+      <strong>{hasPacks ? "표시할 팩을 선택하세요." : "온톨로지 팩이 없습니다."}</strong>
+      <span>
+        {hasPacks
+          ? `${projectLabel}에 연결된 팩은 있습니다. 상단 필터에서 폴더나 팩을 선택하면 그래프를 로드합니다.`
+          : `${projectLabel}에 연결된 온톨로지 팩이 없습니다.`}
+      </span>
+      <em>
+        {hasPacks
+          ? "처음에는 무거운 전체 그래프를 자동으로 불러오지 않습니다."
+          : "Drive에 온톨로지 ZIP 팩을 올린 뒤 동기화 탭에서 등록하면 그래프 탐색기를 사용할 수 있습니다."}
+      </em>
     </div>
   );
 }
