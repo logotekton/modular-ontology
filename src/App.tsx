@@ -442,6 +442,7 @@ function App() {
   const [companies, setCompanies] = useState<string[]>([]);
   const [companyProjectAccess, setCompanyProjectAccess] = useState<CompanyProjectAccess>({});
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogOptions | null>(null);
+  const skipNextSessionRefreshRef = useRef("");
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? projects[0];
   const selectedPackId = selectedGraphPackIds[0] ?? selectedProject?.packIds[0] ?? "";
   const graphPackOptions = selectedProject
@@ -517,9 +518,9 @@ function App() {
   }, [sessionReady, currentUser?.email, currentUser?.role]);
 
   useEffect(() => {
+    if (authToken) return;
     refreshPublicStatus().catch(() => undefined);
-    refreshData().catch((error: Error) => setStatus(error.message));
-  }, []);
+  }, [authToken]);
 
   useEffect(() => {
     if (openAiApiKey.trim()) {
@@ -533,6 +534,11 @@ function App() {
   }, [openAiApiKey]);
 
   useEffect(() => {
+    if (skipNextSessionRefreshRef.current && skipNextSessionRefreshRef.current === authToken) {
+      skipNextSessionRefreshRef.current = "";
+      setSessionReady(true);
+      return;
+    }
     setSessionReady(false);
     refreshSession(authToken)
       .catch(() => setCurrentUser(null))
@@ -718,6 +724,7 @@ function App() {
     }
     const payload = (await res.json()) as { token: string; user: CurrentUser };
     localStorage.setItem("modularOntologyToken", payload.token);
+    skipNextSessionRefreshRef.current = payload.token;
     setAuthToken(payload.token);
     setCurrentUser(payload.user);
     await refreshData(undefined, payload.token);
@@ -974,7 +981,13 @@ function App() {
     localStorage.removeItem("modularOntologyToken");
     setAuthToken("");
     setCurrentUser(null);
-    await refreshData(undefined, "");
+    setPacks([]);
+    setProjects([]);
+    setIfcModels([]);
+    setSelectedProjectId("");
+    setSelectedGraphPackIds([]);
+    setGraph(null);
+    await refreshPublicStatus("");
     setActiveTab(DEFAULT_TAB);
     replacePath(LANDING_ROUTE, { landing: true });
     setUploadStatus("로그아웃됨");
