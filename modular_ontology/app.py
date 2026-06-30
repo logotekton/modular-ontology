@@ -5,6 +5,7 @@ import json
 import os
 import shlex
 import subprocess
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -38,7 +39,7 @@ from .auth import (
     set_user_company,
     set_user_role,
 )
-from .config import DATA_DIR, IFC_MODELS_FOLDER, MCP_REMOTE_FILE, PROJECTS_FOLDER, ROOT, env
+from .config import DATA_DIR, IFC_MODELS_FOLDER, MCP_REMOTE_FILE, MCP_TOKENS_FILE, PROJECTS_FOLDER, ROOT, env
 from .google_drive_sync import (
     COMMON_PROJECT_ID,
     COMMON_PROJECT_PACK_LINKS_KEY,
@@ -110,10 +111,53 @@ configure_mcp_server(
 )
 remote_mcp_app = remote_mcp.streamable_http_app()
 
+_GOOGLE_DRIVE_SYNC_LOCK = threading.Lock()
+_GOOGLE_DRIVE_SCOPE_SYNC_LOCK = threading.Lock()
+_GOOGLE_DRIVE_SCOPE_SYNC_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _sync_ttl_seconds(scope: str, default: int = 60) -> int:
+    raw = env(
+        f"MODULAR_ONTOLOGY_GOOGLE_DRIVE_{scope.upper()}_SYNC_TTL_SECONDS",
+        env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_SCOPED_SYNC_TTL_SECONDS", str(default)),
+    )
+    try:
+        return max(0, int(str(raw)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _cached_scope_sync(scope: str, ttl: int) -> dict[str, Any] | None:
+    if ttl <= 0:
+        return None
+    cached = _GOOGLE_DRIVE_SCOPE_SYNC_CACHE.get(scope)
+    if not cached:
+        return None
+    synced_at = float(cached.get("synced_at", 0) or 0)
+    if synced_at and time.time() - synced_at < ttl:
+        result = dict(cached.get("result", {}))
+        return {"enabled": True, **result, "status": "cached"}
+    return None
+
+
+def _remember_scope_sync(scope: str, result: dict[str, Any]) -> None:
+    _GOOGLE_DRIVE_SCOPE_SYNC_CACHE[scope] = {
+        "synced_at": time.time(),
+        "result": dict(result),
+    }
+
+
+def _file_mtime_ns(path: Path) -> int | None:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
 
 def run_google_drive_sync(force: bool = False) -> dict[str, Any]:
     try:
-        result = sync_google_drive_storage(force=force)
+        with _GOOGLE_DRIVE_SYNC_LOCK:
+            result = sync_google_drive_storage(force=force)
         if result.get("status") == "synced":
             invalidate_users_cache()
         return result
@@ -121,11 +165,18 @@ def run_google_drive_sync(force: bool = False) -> dict[str, Any]:
         return {"status": "error", "error": str(exc)}
 
 
-def run_google_drive_users_sync() -> dict[str, Any]:
+def run_google_drive_users_sync(force: bool = False) -> dict[str, Any]:
     if not google_drive_sync_enabled():
         return {"enabled": False, "status": "disabled"}
     try:
-        result = sync_google_drive_users_file()
+        ttl = _sync_ttl_seconds("users")
+        with _GOOGLE_DRIVE_SCOPE_SYNC_LOCK:
+            if not force:
+                cached = _cached_scope_sync("users", ttl)
+                if cached:
+                    return cached
+            result = sync_google_drive_users_file()
+            _remember_scope_sync("users", result)
         if result.get("status") == "synced":
             invalidate_users_cache()
         return {"enabled": True, **result}
@@ -133,11 +184,18 @@ def run_google_drive_users_sync() -> dict[str, Any]:
         return {"enabled": True, "status": "error", "error": str(exc)}
 
 
-def run_google_drive_mcp_tokens_sync() -> dict[str, Any]:
+def run_google_drive_mcp_tokens_sync(force: bool = False) -> dict[str, Any]:
     if not google_drive_sync_enabled():
         return {"enabled": False, "status": "disabled"}
     try:
-        result = sync_google_drive_mcp_tokens_file()
+        ttl = _sync_ttl_seconds("mcp_tokens")
+        with _GOOGLE_DRIVE_SCOPE_SYNC_LOCK:
+            if not force:
+                cached = _cached_scope_sync("mcp_tokens", ttl)
+                if cached:
+                    return cached
+            result = sync_google_drive_mcp_tokens_file()
+            _remember_scope_sync("mcp_tokens", result)
         return {"enabled": True, **result}
     except Exception as exc:
         return {"enabled": True, "status": "error", "error": str(exc)}
@@ -723,7 +781,7 @@ def login(request: LoginRequest) -> dict[str, object]:
 
 @app.post("/api/auth/register")
 def register(request: RegisterRequest) -> dict[str, object]:
-    require_google_drive_sync(run_google_drive_users_sync())
+    require_google_drive_sync(run_google_drive_users_sync(force=True))
     try:
         user = register_user(request.email, request.password, request.name, request.company)
     except ValueError as exc:
@@ -772,7 +830,7 @@ def admin_company_project_access(authorization: str | None = Header(default=None
 @app.post("/api/admin/companies")
 def admin_add_company(request: CompanyRequest, authorization: str | None = Header(default=None)) -> dict[str, object]:
     require_admin(authorization)
-    require_google_drive_sync(run_google_drive_users_sync())
+    require_google_drive_sync(run_google_drive_users_sync(force=True))
     try:
         company = add_company(request.name)
     except ValueError as exc:
@@ -787,7 +845,7 @@ def admin_rename_company(
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
     require_admin(authorization)
-    require_google_drive_sync(run_google_drive_users_sync())
+    require_google_drive_sync(run_google_drive_users_sync(force=True))
     try:
         company = rename_company(request.name, request.new_name)
     except ValueError as exc:
@@ -803,7 +861,7 @@ def admin_delete_company(
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
     actor = require_admin(authorization)
-    require_google_drive_sync(run_google_drive_users_sync())
+    require_google_drive_sync(run_google_drive_users_sync(force=True))
     try:
         company, deleted_users = delete_company(name, delete_users=delete_users, actor_email=actor.email)
     except ValueError as exc:
@@ -819,7 +877,7 @@ def admin_approve_user(
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
     require_admin(authorization)
-    require_google_drive_sync(run_google_drive_users_sync())
+    require_google_drive_sync(run_google_drive_users_sync(force=True))
     try:
         user = approve_user(email, request.role)
     except KeyError as exc:
@@ -837,7 +895,7 @@ def admin_set_user_company(
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
     require_admin(authorization)
-    require_google_drive_sync(run_google_drive_users_sync())
+    require_google_drive_sync(run_google_drive_users_sync(force=True))
     try:
         user = set_user_company(email, request.company)
     except KeyError as exc:
@@ -851,7 +909,7 @@ def admin_set_user_company(
 @app.delete("/api/admin/users/{email}")
 def admin_delete_user(email: str, authorization: str | None = Header(default=None)) -> dict[str, object]:
     actor = require_admin(authorization)
-    require_google_drive_sync(run_google_drive_users_sync())
+    require_google_drive_sync(run_google_drive_users_sync(force=True))
     try:
         user = delete_user(email, actor_email=actor.email)
     except KeyError as exc:
@@ -869,7 +927,7 @@ def admin_set_user_role(
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
     require_admin(authorization)
-    require_google_drive_sync(run_google_drive_users_sync())
+    require_google_drive_sync(run_google_drive_users_sync(force=True))
     try:
         user = set_user_role(email, request.role)
     except KeyError as exc:
@@ -887,7 +945,7 @@ def admin_set_company_projects(
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
     require_admin(authorization)
-    require_google_drive_sync(run_google_drive_users_sync())
+    require_google_drive_sync(run_google_drive_users_sync(force=True))
     valid_project_ids = {project["id"] for project in list_projects()}
     invalid_project_ids = [project_id for project_id in request.project_ids if project_id not in valid_project_ids]
     if invalid_project_ids:
@@ -1604,12 +1662,20 @@ def _mcp_status_payload(request: Request, authorization: str | None, *, regenera
     user_url: dict[str, Any] | None = None
     token_sync: dict[str, Any] | None = None
     token_write_back: dict[str, Any] | None = None
-    user = current_user(authorization)
+    user = None
+    token = extract_bearer_token(authorization)
+    if token:
+        require_google_drive_sync(run_google_drive_users_sync())
+        user = get_user_by_token(token)
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid or expired session.")
     if regenerate_user_token and not user:
         raise HTTPException(status_code=401, detail="Login is required to regenerate an MCP URL.")
     if user and user.status == "active":
-        token_sync = run_google_drive_mcp_tokens_sync()
+        token_sync = run_google_drive_mcp_tokens_sync(force=regenerate_user_token or not MCP_TOKENS_FILE.exists())
+        token_file_mtime = _file_mtime_ns(MCP_TOKENS_FILE)
         token_record = regenerate_mcp_token_for_user(user) if regenerate_user_token else ensure_mcp_token_for_user(user)
+        token_file_changed = token_file_mtime != _file_mtime_ns(MCP_TOKENS_FILE)
         user_urls = build_user_mcp_urls(public_base_url, token_record["token"])
         user_url = {
             **user_urls,
@@ -1619,7 +1685,8 @@ def _mcp_status_payload(request: Request, authorization: str | None, *, regenera
             "company": token_record["company"],
             "role": token_record["role"],
         }
-        token_write_back = run_google_drive_write_back("mcp_tokens")
+        if token_file_changed:
+            token_write_back = run_google_drive_write_back("mcp_tokens")
     return {
         "status": "ready",
         "server": "python -m modular_ontology.mcp_server",

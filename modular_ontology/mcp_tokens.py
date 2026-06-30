@@ -60,16 +60,15 @@ def ensure_mcp_token_for_user(user: User, *, path: Path = MCP_TOKENS_FILE) -> di
             continue
         if record.get("status") != "active":
             continue
-        record.update(
-            {
-                "userName": user.name,
-                "company": user.company,
-                "role": user.role,
-                "updatedAt": now,
-            }
-        )
-        payload["tokens"] = tokens
-        _save_token_payload(payload, path)
+        next_values = {
+            "userName": user.name,
+            "company": user.company,
+            "role": user.role,
+        }
+        if any(record.get(key) != value for key, value in next_values.items()):
+            record.update({**next_values, "updatedAt": now})
+            payload["tokens"] = tokens
+            _save_token_payload(payload, path)
         return _public_token_record(record)
 
     record = {

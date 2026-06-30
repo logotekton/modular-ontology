@@ -34,7 +34,7 @@ from .config import (
 DRIVE_API = "https://www.googleapis.com/drive/v3"
 DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
 FOLDER_MIME = "application/vnd.google-apps.folder"
-DEFAULT_TTL_SECONDS = 300
+DEFAULT_TTL_SECONDS = 1800
 # Simple/multipart uploads hold the whole payload in memory and cannot resume,
 # so anything larger goes through a resumable upload session.
 RESUMABLE_UPLOAD_THRESHOLD = 5 * 1024 * 1024
