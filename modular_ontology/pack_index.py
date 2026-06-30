@@ -198,11 +198,16 @@ def _display_filename_from_drive_cache(filename: str) -> str:
     return filename.rsplit("__", 1)[1] or filename
 
 
-def _common_category_from_drive_cache(filename: str) -> str | None:
+def _drive_scope_and_category_from_cache(filename: str) -> tuple[str | None, str | None]:
     parts = filename.split("__", 2)
-    if len(parts) == 3 and parts[0] == "_Common" and parts[1].strip():
-        return parts[1].strip()
-    return None
+    if len(parts) == 3 and parts[0].strip() and parts[1].strip():
+        return parts[0].strip(), parts[1].strip()
+    return None, None
+
+
+def _common_category_from_drive_cache(filename: str) -> str | None:
+    scope, category = _drive_scope_and_category_from_cache(filename)
+    return category if scope == "_Common" else None
 
 
 def _title_from_drive_filename(filename: str) -> str | None:
@@ -245,7 +250,9 @@ def summarize_pack(pack: PackFile) -> dict[str, Any]:
         source = "Revit IFC" if "revit" in source_key else "Advance Steel" if "advance" in source_key else "Ontology"
         validation = build_summary.get("validation_status") or "READY"
         display_filename = _display_filename_from_drive_cache(pack.path.name)
+        drive_scope, drive_category = _drive_scope_and_category_from_cache(pack.path.name)
         common_category = _common_category_from_drive_cache(pack.path.name)
+        project_category = drive_category if drive_scope and drive_scope != "_Common" else None
         drive_title = _title_from_drive_filename(pack.path.name)
         title = drive_title or manifest.get("title") or pack.id.replace("-", " ").title()
 
@@ -256,6 +263,9 @@ def summarize_pack(pack: PackFile) -> dict[str, Any]:
             "displayName": title,
             "title": title,
             "commonCategory": common_category,
+            "driveScope": drive_scope,
+            "driveCategory": drive_category,
+            "projectCategory": project_category,
             "commonScoped": pack.path.name.startswith("_Common__"),
             "format": manifest.get("format", "ontology-pack"),
             "description": manifest.get("description") or _extract_readme(zf),

@@ -838,7 +838,7 @@ def _download_project_assets(
 
         packs_folder = project_children.get(PROJECT_PACKS_FOLDER)
         if packs_folder and packs_folder.is_folder:
-            pack_downloads = _download_project_zip_files(
+            pack_downloads = _download_project_grouped_zip_files(
                 client,
                 packs_folder.id,
                 data_dir / ONTOLOGY_PACKS_FOLDER / "indexed",
@@ -892,6 +892,43 @@ def _download_common_zip_files(
                 category_packs.id,
                 target_dir,
                 f"{COMMON_PROJECT_ID}__{category_id}",
+                warnings=warnings,
+            )
+        )
+    return downloaded
+
+
+def _download_project_grouped_zip_files(
+    client: GoogleDriveClient,
+    packs_folder_id: str,
+    target_dir: Path,
+    project_id: str,
+    *,
+    warnings: list[str] | None = None,
+) -> list[str]:
+    downloaded = _download_project_zip_files(
+        client,
+        packs_folder_id,
+        target_dir,
+        project_id,
+        warnings=warnings,
+    )
+    for category in client.list_children(packs_folder_id):
+        if not category.is_folder:
+            continue
+        category_id = _safe_drive_filename_or_none(
+            category.name,
+            warnings,
+            f"{PROJECTS_FOLDER}/{project_id}/{PROJECT_PACKS_FOLDER} category folder",
+        )
+        if not category_id:
+            continue
+        downloaded.extend(
+            _download_project_zip_files(
+                client,
+                category.id,
+                target_dir,
+                f"{project_id}__{category_id}",
                 warnings=warnings,
             )
         )

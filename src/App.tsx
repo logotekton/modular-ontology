@@ -49,6 +49,9 @@ type Pack = {
   displayFilename?: string;
   displayName?: string;
   commonCategory?: string | null;
+  driveScope?: string | null;
+  driveCategory?: string | null;
+  projectCategory?: string | null;
   commonScoped?: boolean;
   projectScoped?: boolean;
   source: string;
@@ -326,21 +329,34 @@ function packTitle(pack: Pack) {
   return pack.displayName || pack.title || pack.displayFilename || pack.filename || pack.id;
 }
 
-function commonPackCategory(pack: Pack) {
-  const direct = pack.commonCategory?.trim();
-  if (direct) return direct;
-  const match = pack.filename.match(/^_Common__(.+?)__/u);
-  return match?.[1]?.trim() || "";
+function packDriveParts(pack: Pack) {
+  const directScope = pack.driveScope?.trim();
+  const directCategory = pack.projectCategory?.trim() || pack.commonCategory?.trim() || pack.driveCategory?.trim();
+  if (directScope && directCategory) {
+    return { scope: directScope, category: directCategory };
+  }
+  const parts = pack.filename.split("__");
+  if (parts.length >= 3 && parts[0]?.trim() && parts[1]?.trim()) {
+    return { scope: parts[0].trim(), category: parts[1].trim() };
+  }
+  return { scope: "", category: "" };
+}
+
+function packGroupSubtitle(group: PackDisplayGroup) {
+  const count = numberLabel(group.packs.length);
+  if (group.packs.every((pack) => pack.commonScoped)) return `${count}개 공통 팩`;
+  if (group.packs.every((pack) => packDriveParts(pack).category)) return `${count}개 폴더 팩`;
+  return `${count}개 팩`;
 }
 
 function groupPacksForDisplay(packs: Pack[]): PackDisplayGroup[] {
   const groups: PackDisplayGroup[] = [];
-  const commonGroups = new Map<string, PackDisplayGroup>();
+  const folderGroups = new Map<string, PackDisplayGroup>();
   for (const pack of packs) {
-    const category = commonPackCategory(pack);
+    const { scope, category } = packDriveParts(pack);
     if (category) {
-      const groupId = `common:${category}`;
-      let group = commonGroups.get(groupId);
+      const groupId = `${scope || "drive"}:${category}`;
+      let group = folderGroups.get(groupId);
       if (!group) {
         group = {
           id: groupId,
@@ -350,12 +366,12 @@ function groupPacksForDisplay(packs: Pack[]): PackDisplayGroup[] {
           packs: [],
           grouped: true,
         };
-        commonGroups.set(groupId, group);
+        folderGroups.set(groupId, group);
         groups.push(group);
       }
       group.packIds.push(pack.id);
       group.packs.push(pack);
-      group.subtitle = `${numberLabel(group.packs.length)}개 공통 팩`;
+      group.subtitle = packGroupSubtitle(group);
       continue;
     }
     groups.push({

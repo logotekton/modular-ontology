@@ -2425,6 +2425,58 @@ def test_google_drive_sync_namespaces_same_pack_filename_per_project(tmp_path) -
     }
 
 
+def test_google_drive_sync_reads_project_pack_folders_as_groups(tmp_path) -> None:
+    class FakeDriveClient:
+        children = {
+            "root": [DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder")],
+            "projects-root": [DriveItem("project-a", "project-a", "application/vnd.google-apps.folder")],
+            "project-a": [DriveItem("packs-a", "ontology-packs", "application/vnd.google-apps.folder")],
+            "packs-a": [
+                DriveItem("direct-pack", "direct-pack.zip", "application/x-zip-compressed"),
+                DriveItem("revit-jsonl-folder", "revit-jsonl", "application/vnd.google-apps.folder"),
+            ],
+            "revit-jsonl-folder": [
+                DriveItem("objects-pack", "objects.zip", "application/x-zip-compressed"),
+                DriveItem("relationships-pack", "relationships.zip", "application/x-zip-compressed"),
+            ],
+        }
+
+        def list_children(self, folder_id):
+            return self.children.get(folder_id, [])
+
+        def download_file(self, file_id, target):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            pack_id = {
+                "direct-pack": "project-direct-pack",
+                "objects-pack": "project-revit-objects-pack",
+                "relationships-pack": "project-revit-relationships-pack",
+            }[file_id]
+            with zipfile.ZipFile(target, "w") as zf:
+                zf.writestr("manifest.json", json.dumps({"pack_id": pack_id}))
+
+    result = sync_google_drive_storage(
+        client=FakeDriveClient(),
+        root_folder_id="root",
+        data_dir=tmp_path,
+        force=True,
+    )
+
+    links_path = tmp_path / "02_Projects" / ".drive-project-pack-links.json"
+    indexed_dir = tmp_path / "04_Ontology_Packs" / "indexed"
+
+    assert result["status"] == "synced"
+    assert (indexed_dir / "project-a__direct-pack.zip").exists()
+    assert (indexed_dir / "project-a__revit-jsonl__objects.zip").exists()
+    assert (indexed_dir / "project-a__revit-jsonl__relationships.zip").exists()
+    assert json.loads(links_path.read_text(encoding="utf-8")) == {
+        "project-a": [
+            "project-direct-pack",
+            "project-revit-objects-pack",
+            "project-revit-relationships-pack",
+        ],
+    }
+
+
 def test_google_drive_sync_reads_common_project_packs_without_creating_project(tmp_path) -> None:
     class FakeDriveClient:
         children = {
@@ -2543,6 +2595,37 @@ def test_common_project_pack_summary_exposes_category(tmp_path) -> None:
     assert pack["displayFilename"] == "standard-spec.zip"
     assert pack["commonCategory"] == "시방서"
     assert pack["commonScoped"] is True
+
+
+def test_project_folder_pack_summary_exposes_category(tmp_path) -> None:
+    from modular_ontology import pack_index
+
+    pack_dir = tmp_path / "04_Ontology_Packs" / "indexed"
+    pack_dir.mkdir(parents=True)
+    pack_path = pack_dir / "project-a__revit-jsonl__objects.zip"
+    with zipfile.ZipFile(pack_path, "w") as zf:
+        zf.writestr(
+            "manifest.json",
+            json.dumps(
+                {
+                    "pack_id": "project-revit-objects-pack",
+                    "title": "Revit Objects Pack",
+                    "entrypoints": {"nodes": "graph/nodes.jsonl", "edges": "graph/edges.jsonl"},
+                    "counts": {"nodes": 0, "edges": 0, "documents": 0},
+                }
+            ),
+        )
+        zf.writestr("graph/nodes.jsonl", "")
+        zf.writestr("graph/edges.jsonl", "")
+
+    pack = pack_index.summarize_pack(pack_index.PackFile(pack_path))
+
+    assert pack["displayFilename"] == "objects.zip"
+    assert pack["driveScope"] == "project-a"
+    assert pack["driveCategory"] == "revit-jsonl"
+    assert pack["projectCategory"] == "revit-jsonl"
+    assert pack["commonCategory"] is None
+    assert pack["projectScoped"] is True
 
 
 def test_google_drive_sync_project_metadata_wins_over_legacy_ifc_folder(tmp_path) -> None:
