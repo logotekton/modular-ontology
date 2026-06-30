@@ -223,19 +223,6 @@ type ConfirmDialogOptions = {
   onConfirm: () => void;
 };
 
-type ApiTiming = {
-  id: string;
-  path: string;
-  method: string;
-  ok: boolean;
-  status: number;
-  clientMs: number;
-  serverMs: number | null;
-  serverTiming: string;
-  timingDetail: string;
-  capturedAt: number;
-};
-
 const nav = [
   { label: "Dashboard", icon: Activity },
   { label: "Projects", icon: FolderKanban },
@@ -413,56 +400,8 @@ function validationLabel(status?: string) {
   return status;
 }
 
-const API_TIMING_EVENT = "modular-ontology-api-timing";
-
-function emitApiTiming(timing: Omit<ApiTiming, "id" | "capturedAt">) {
-  const payload: ApiTiming = {
-    ...timing,
-    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    capturedAt: Date.now(),
-  };
-  window.dispatchEvent(new CustomEvent<ApiTiming>(API_TIMING_EVENT, { detail: payload }));
-  if (window.localStorage.getItem("modularOntologyPerfLog") === "1") {
-    console.info("[api-timing]", payload);
-  }
-}
-
-async function apiFetch(path: string, init: RequestInit = {}) {
-  const startedAt = performance.now();
-  const method = String(init.method || "GET").toUpperCase();
-  try {
-    const res = await fetch(path.startsWith("/api") ? `${API_BASE}${path}` : path, init);
-    const clientMs = performance.now() - startedAt;
-    const serverMsRaw = res.headers.get("x-response-time-ms");
-    const serverMs = serverMsRaw ? Number.parseFloat(serverMsRaw) : Number.NaN;
-    emitApiTiming({
-      path,
-      method,
-      ok: res.ok,
-      status: res.status,
-      clientMs,
-      serverMs: Number.isFinite(serverMs) ? serverMs : null,
-      serverTiming: res.headers.get("server-timing") || "",
-      timingDetail: res.headers.get("x-request-timing-detail") || "",
-    });
-    return res;
-  } catch (error) {
-    emitApiTiming({
-      path,
-      method,
-      ok: false,
-      status: 0,
-      clientMs: performance.now() - startedAt,
-      serverMs: null,
-      serverTiming: "",
-      timingDetail: "",
-    });
-    throw error;
-  }
-}
-
 async function getJson<T>(path: string, token?: string): Promise<T> {
-  const res = await apiFetch(path, {
+  const res = await fetch(`${API_BASE}${path}`, {
     headers: token ? { Authorization: `Bearer ${token}` } : undefined,
   });
   if (!res.ok) throw new Error(await res.text());
@@ -492,7 +431,6 @@ function App() {
   const [uploadStatus, setUploadStatus] = useState("");
   const [indexStats, setIndexStats] = useState<IndexStats | null>(null);
   const [mcpStatus, setMcpStatus] = useState<McpStatus | null>(null);
-  const [apiTimings, setApiTimings] = useState<ApiTiming[]>([]);
   const [authToken, setAuthToken] = useState(() => localStorage.getItem("modularOntologyToken") ?? "");
   const [sessionReady, setSessionReady] = useState(() => !localStorage.getItem("modularOntologyToken"));
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
@@ -547,16 +485,6 @@ function App() {
     setConfirmDialog(null);
     action?.();
   }
-
-  useEffect(() => {
-    const handleApiTiming = (event: Event) => {
-      const detail = (event as CustomEvent<ApiTiming>).detail;
-      if (!detail?.path) return;
-      setApiTimings((current) => [detail, ...current].slice(0, 12));
-    };
-    window.addEventListener(API_TIMING_EVENT, handleApiTiming);
-    return () => window.removeEventListener(API_TIMING_EVENT, handleApiTiming);
-  }, []);
 
   useEffect(() => {
     const handlePopState = () => {
@@ -729,7 +657,7 @@ function App() {
       setUploadStatus("로그인 후 MCP URL을 재발급할 수 있습니다.");
       return;
     }
-    const res = await apiFetch("/api/mcp/user-url/regenerate", {
+    const res = await fetch("/api/mcp/user-url/regenerate", {
       method: "POST",
       headers: { Authorization: `Bearer ${authToken}` },
     });
@@ -771,7 +699,7 @@ function App() {
       setCurrentUser(null);
       return;
     }
-    const res = await apiFetch("/api/auth/me", { headers: { Authorization: `Bearer ${token}` } });
+    const res = await fetch("/api/auth/me", { headers: { Authorization: `Bearer ${token}` } });
     const payload = (await res.json()) as { authenticated: boolean; user: CurrentUser | null };
     const user = payload.authenticated ? payload.user : null;
     setCurrentUser(user);
@@ -785,7 +713,7 @@ function App() {
       setUploadStatus("이메일과 비밀번호를 입력하세요.");
       return;
     }
-    const res = await apiFetch("/api/auth/login", {
+    const res = await fetch("/api/auth/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email: loginEmail, password: loginPassword }),
@@ -812,7 +740,7 @@ function App() {
       setUploadStatus("회원가입에는 이메일과 비밀번호가 필요합니다.");
       return;
     }
-    const res = await apiFetch("/api/auth/register", {
+    const res = await fetch("/api/auth/register", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(signupForm),
@@ -829,7 +757,7 @@ function App() {
 
   async function fetchAdminUsers() {
     if (!authToken) return;
-    const res = await apiFetch("/api/admin/users", {
+    const res = await fetch("/api/admin/users", {
       headers: { Authorization: `Bearer ${authToken}` },
     });
     if (!res.ok) throw new Error(await res.text());
@@ -839,7 +767,7 @@ function App() {
 
   async function fetchAdminCompanies() {
     if (!authToken) return;
-    const res = await apiFetch("/api/admin/companies", {
+    const res = await fetch("/api/admin/companies", {
       headers: { Authorization: `Bearer ${authToken}` },
     });
     if (!res.ok) throw new Error(await res.text());
@@ -849,7 +777,7 @@ function App() {
 
   async function fetchCompanyProjectAccess() {
     if (!authToken) return;
-    const res = await apiFetch("/api/admin/company-project-access", {
+    const res = await fetch("/api/admin/company-project-access", {
       headers: { Authorization: `Bearer ${authToken}` },
     });
     if (!res.ok) throw new Error(await res.text());
@@ -862,7 +790,7 @@ function App() {
   }
 
   async function approveManagedUser(email: string, role: "admin" | "member" = "member") {
-    const res = await apiFetch(`/api/admin/users/${encodeURIComponent(email)}/approve`, {
+    const res = await fetch(`/api/admin/users/${encodeURIComponent(email)}/approve`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
       body: JSON.stringify({ role }),
@@ -876,7 +804,7 @@ function App() {
   }
 
   async function updateManagedUserRole(email: string, role: "admin" | "member") {
-    const res = await apiFetch(`/api/admin/users/${encodeURIComponent(email)}/role`, {
+    const res = await fetch(`/api/admin/users/${encodeURIComponent(email)}/role`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
       body: JSON.stringify({ role }),
@@ -890,7 +818,7 @@ function App() {
   }
 
   async function addManagedCompany(name: string) {
-    const res = await apiFetch("/api/admin/companies", {
+    const res = await fetch("/api/admin/companies", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
       body: JSON.stringify({ name }),
@@ -904,7 +832,7 @@ function App() {
   }
 
   async function renameManagedCompany(name: string, newName: string) {
-    const res = await apiFetch("/api/admin/companies/rename", {
+    const res = await fetch("/api/admin/companies/rename", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
       body: JSON.stringify({ name, new_name: newName }),
@@ -919,7 +847,7 @@ function App() {
 
   async function deleteManagedCompany(name: string, deleteUsers = false) {
     const query = deleteUsers ? "?delete_users=true" : "";
-    const res = await apiFetch(`/api/admin/companies/${encodeURIComponent(name)}${query}`, {
+    const res = await fetch(`/api/admin/companies/${encodeURIComponent(name)}${query}`, {
       method: "DELETE",
       headers: { Authorization: `Bearer ${authToken}` },
     });
@@ -934,7 +862,7 @@ function App() {
   }
 
   async function deleteManagedUser(email: string) {
-    const res = await apiFetch(`/api/admin/users/${encodeURIComponent(email)}`, {
+    const res = await fetch(`/api/admin/users/${encodeURIComponent(email)}`, {
       method: "DELETE",
       headers: { Authorization: `Bearer ${authToken}` },
     });
@@ -948,7 +876,7 @@ function App() {
   }
 
   async function moveManagedUserCompany(email: string, company: string) {
-    const res = await apiFetch(`/api/admin/users/${encodeURIComponent(email)}/company`, {
+    const res = await fetch(`/api/admin/users/${encodeURIComponent(email)}/company`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
       body: JSON.stringify({ company }),
@@ -962,7 +890,7 @@ function App() {
   }
 
   async function updateCompanyProjectAccess(company: string, projectIds: string[]) {
-    const res = await apiFetch(`/api/admin/companies/${encodeURIComponent(company)}/projects`, {
+    const res = await fetch(`/api/admin/companies/${encodeURIComponent(company)}/projects`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
       body: JSON.stringify({ project_ids: projectIds }),
@@ -984,7 +912,7 @@ function App() {
       return null;
     }
     const isUpdate = Boolean(form.id);
-    const res = await apiFetch(isUpdate ? `/api/admin/projects/${encodeURIComponent(form.id || "")}` : "/api/admin/projects", {
+    const res = await fetch(isUpdate ? `/api/admin/projects/${encodeURIComponent(form.id || "")}` : "/api/admin/projects", {
       method: isUpdate ? "PUT" : "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
       body: JSON.stringify({
@@ -1014,7 +942,7 @@ function App() {
       setUploadStatus("관리자 세션이 필요합니다");
       return;
     }
-    const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}`, {
+    const res = await fetch(`/api/admin/projects/${encodeURIComponent(projectId)}`, {
       method: "DELETE",
       headers: { Authorization: `Bearer ${authToken}` },
     });
@@ -1032,7 +960,7 @@ function App() {
       setUploadStatus("관리자 세션이 필요합니다");
       return;
     }
-    const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/packs`, {
+    const res = await fetch(`/api/admin/projects/${encodeURIComponent(projectId)}/packs`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
       body: JSON.stringify({ pack_ids: packIds }),
@@ -1047,7 +975,7 @@ function App() {
   }
 
   async function logout() {
-    await apiFetch("/api/auth/logout", {
+    await fetch("/api/auth/logout", {
       method: "POST",
       headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
     }).catch(() => undefined);
@@ -1071,7 +999,7 @@ function App() {
       setUploadStatus("관리자 세션이 필요합니다");
       return;
     }
-    const res = await apiFetch("/api/admin/ifc/models/link", {
+    const res = await fetch("/api/admin/ifc/models/link", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
       body: JSON.stringify({ model_id: modelId, project_id: projectId }),
@@ -1092,7 +1020,7 @@ function App() {
       return;
     }
     setUploadStatus("Drive 동기화 및 XKT 변환 중");
-    const res = await apiFetch("/api/admin/reindex", {
+    const res = await fetch("/api/admin/reindex", {
       method: "POST",
       headers: { Authorization: `Bearer ${authToken}` },
     });
@@ -1136,7 +1064,7 @@ function App() {
     setOpenAiKeyStatus("testing");
     setOpenAiKeyMessage("");
     try {
-      const res = await apiFetch("/api/llm/openai/validate", {
+      const res = await fetch("/api/llm/openai/validate", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1195,7 +1123,7 @@ function App() {
     setAiQuestion("");
     setAiLoading(true);
     try {
-      const res = await apiFetch("/api/query", {
+      const res = await fetch("/api/query", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1372,7 +1300,6 @@ function App() {
 
         {activeTab === "Dashboard" && (
           <DashboardView
-            apiTimings={apiTimings}
             ifcModels={ifcModels}
             packs={packs}
             projects={projects}
@@ -1815,14 +1742,12 @@ function MetricsStrip({
 }
 
 function DashboardView({
-  apiTimings,
   ifcModels,
   packs,
   projects,
   onGoToTab,
   onOpenPack,
 }: {
-  apiTimings: ApiTiming[];
   ifcModels: IfcModel[];
   packs: Pack[];
   projects: Project[];
@@ -1893,58 +1818,8 @@ function DashboardView({
             ))}
           </div>
         </div>
-
-        <PerformancePanel apiTimings={apiTimings} />
       </div>
     </section>
-  );
-}
-
-function durationLabel(value: number | null | undefined) {
-  if (value == null) return "-";
-  if (value >= 1000) return `${(value / 1000).toFixed(2)}s`;
-  return `${Math.round(value)}ms`;
-}
-
-function shortApiPath(path: string) {
-  const [base, query] = path.split("?");
-  const compactBase = base.length > 44 ? `...${base.slice(-44)}` : base;
-  return query ? `${compactBase}?...` : compactBase;
-}
-
-function PerformancePanel({ apiTimings }: { apiTimings: ApiTiming[] }) {
-  return (
-    <div className="overview-panel dashboard-recents-section performance-panel">
-      <div className="panel-header slim">
-        <div>
-          <h2>API 성능 계측</h2>
-          <span>최근 브라우저 요청 / 서버 처리 시간</span>
-        </div>
-        <Activity size={19} />
-      </div>
-      <div className="performance-list">
-        {apiTimings.length ? (
-          apiTimings.slice(0, 8).map((timing) => (
-            <div
-              className={timing.ok ? "performance-row" : "performance-row error"}
-              key={timing.id}
-              title={timing.timingDetail ? `${timing.path}\n${timing.timingDetail}` : timing.path}
-            >
-              <span className="performance-path">{shortApiPath(timing.path)}</span>
-              <span>{timing.method}</span>
-              <strong>{durationLabel(timing.clientMs)}</strong>
-              <em>{durationLabel(timing.serverMs)}</em>
-              <i>{timing.status || "ERR"}</i>
-            </div>
-          ))
-        ) : (
-          <div className="performance-empty">
-            <strong>아직 기록된 API 요청이 없습니다.</strong>
-            <span>화면을 이동하거나 데이터를 새로고침하면 여기에 표시됩니다.</span>
-          </div>
-        )}
-      </div>
-    </div>
   );
 }
 

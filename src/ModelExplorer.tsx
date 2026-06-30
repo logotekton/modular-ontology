@@ -111,64 +111,8 @@ const MODEL_FILTER_KEYS = [
   { key: "family", label: "family" },
 ];
 
-const API_TIMING_EVENT = "modular-ontology-api-timing";
-
-function emitApiTiming(timing: {
-  path: string;
-  method: string;
-  ok: boolean;
-  status: number;
-  clientMs: number;
-  serverMs: number | null;
-  serverTiming: string;
-  timingDetail: string;
-}) {
-  window.dispatchEvent(
-    new CustomEvent(API_TIMING_EVENT, {
-      detail: {
-        ...timing,
-        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-        capturedAt: Date.now(),
-      },
-    }),
-  );
-}
-
-async function apiFetch(path: string, init: RequestInit = {}) {
-  const startedAt = performance.now();
-  const method = String(init.method || "GET").toUpperCase();
-  try {
-    const response = await fetch(path, init);
-    const serverMsRaw = response.headers.get("x-response-time-ms");
-    const serverMs = serverMsRaw ? Number.parseFloat(serverMsRaw) : Number.NaN;
-    emitApiTiming({
-      path,
-      method,
-      ok: response.ok,
-      status: response.status,
-      clientMs: performance.now() - startedAt,
-      serverMs: Number.isFinite(serverMs) ? serverMs : null,
-      serverTiming: response.headers.get("server-timing") || "",
-      timingDetail: response.headers.get("x-request-timing-detail") || "",
-    });
-    return response;
-  } catch (error) {
-    emitApiTiming({
-      path,
-      method,
-      ok: false,
-      status: 0,
-      clientMs: performance.now() - startedAt,
-      serverMs: null,
-      serverTiming: "",
-      timingDetail: "",
-    });
-    throw error;
-  }
-}
-
 async function getJson<T>(path: string, token?: string): Promise<T> {
-  const response = await apiFetch(path, {
+  const response = await fetch(path, {
     headers: token ? { Authorization: `Bearer ${token}` } : undefined,
   });
   if (!response.ok) throw new Error(await response.text());
