@@ -1890,7 +1890,7 @@ dd {
 
 .dashboard-recents-panel {
   display: grid;
-  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr) !important;
+  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr) minmax(128px, 0.85fr) !important;
   gap: 10px;
   min-height: 0;
 }
@@ -1901,6 +1901,82 @@ dd {
 
 .dashboard-scroll-list {
   align-content: start;
+}
+
+.performance-panel {
+  min-height: 0;
+}
+
+.performance-list {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 4px;
+  scrollbar-gutter: stable;
+}
+
+.performance-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 42px 58px 58px 42px;
+  align-items: center;
+  gap: 7px;
+  min-height: 28px;
+  border: 1px solid #dbe8f2;
+  border-radius: 7px;
+  background: #f8fbff;
+  color: #334155;
+  padding: 5px 8px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.performance-row.error {
+  border-color: #fecaca;
+  background: #fff7f7;
+  color: #991b1b;
+}
+
+.performance-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.performance-row strong,
+.performance-row em,
+.performance-row i {
+  text-align: right;
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.performance-row strong {
+  color: #0f766e;
+}
+
+.performance-row em {
+  color: #475569;
+}
+
+.performance-empty {
+  display: grid;
+  align-content: center;
+  min-height: 96px;
+  border: 1px dashed #cbd8e4;
+  border-radius: 8px;
+  color: #64748b;
+  background: #f8fbff;
+  padding: 12px;
+  font-size: 12px;
+}
+
+.performance-empty strong {
+  color: #334155;
+  font-size: 13px;
 }
 
 .mcp-workspace-grid {

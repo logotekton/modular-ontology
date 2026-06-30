@@ -1407,6 +1407,15 @@ def test_public_read_endpoints_do_not_sync_without_session(monkeypatch) -> None:
     assert sync_calls == []
 
 
+def test_api_responses_include_performance_headers() -> None:
+    response = client.get("/api/index/status")
+
+    assert response.status_code == 200
+    assert float(response.headers["x-response-time-ms"]) >= 0
+    assert response.headers["x-request-timing-count"].isdigit()
+    assert response.headers["server-timing"].startswith("app;dur=")
+
+
 def test_index_status_sync_query_runs_runtime_sync(monkeypatch) -> None:
     from modular_ontology import app as app_module
 

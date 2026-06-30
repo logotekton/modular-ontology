@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import os
 import shlex
@@ -86,6 +87,33 @@ VERCEL_MCP_HOSTS = (
     "modular-ontology-ythongs-projects.vercel.app,"
     "modular-ontology-ghddudxor12-8502-ythongs-projects.vercel.app"
 )
+_REQUEST_TIMINGS: contextvars.ContextVar[list[dict[str, Any]] | None] = contextvars.ContextVar(
+    "request_timings",
+    default=None,
+)
+
+
+def _record_request_timing(name: str, started_at: float) -> None:
+    timings = _REQUEST_TIMINGS.get()
+    if timings is None:
+        return
+    timings.append({"name": name, "duration_ms": round((time.perf_counter() - started_at) * 1000, 1)})
+
+
+def _server_timing_name(name: str) -> str:
+    safe_name = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in name)
+    return safe_name[:48] or "phase"
+
+
+def _server_timing_header(total_duration_ms: float, timings: list[dict[str, Any]]) -> str:
+    values = [f"app;dur={total_duration_ms:.1f}"]
+    seen: dict[str, int] = {}
+    for timing in timings[:12]:
+        name = _server_timing_name(str(timing.get("name") or "phase"))
+        seen[name] = seen.get(name, 0) + 1
+        metric_name = name if seen[name] == 1 else f"{name}-{seen[name]}"
+        values.append(f"{metric_name};dur={float(timing.get('duration_ms') or 0):.1f}")
+    return ", ".join(values)
 
 configure_mcp_server(
     host="127.0.0.1",
@@ -162,33 +190,49 @@ def google_drive_sync_on_startup() -> bool:
 
 
 def ensure_runtime_storage() -> dict[str, Any]:
-    if not google_drive_sync_enabled():
-        return {"enabled": False, "status": "disabled"}
-    status = google_drive_sync_status()
-    if status.get("status") in {"synced", "cached"}:
-        ttl = int(str(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_SYNC_TTL_SECONDS", "300")))
-        try:
-            synced_at = float(status.get("synced_at", 0) or 0)
-        except (TypeError, ValueError):
-            synced_at = 0
-        if ttl > 0 and synced_at and time.time() - synced_at < ttl:
-            return {"enabled": True, **status}
-    result = run_google_drive_sync()
-    if result.get("status") == "synced":
-        try:
-            stats = index_stats()
-            if stats.get("packs", 0) == 0 and list_packs():
-                reindex_result = index_all_packs()
-                result["reindexed"] = reindex_result.get("stats", {})
-            drive_projects = _apply_drive_project_folders()
-            if any(drive_projects.get(key) for key in ("created", "updated", "renamed", "deleted", "conflicts")):
-                result["driveProjects"] = drive_projects
-            links = _apply_drive_project_pack_links()
-            if links:
-                result["projectPackLinks"] = links
-        except Exception as exc:
-            result["reindexError"] = str(exc)
-    return {"enabled": True, **result}
+    total_started_at = time.perf_counter()
+    try:
+        if not google_drive_sync_enabled():
+            return {"enabled": False, "status": "disabled"}
+        status_started_at = time.perf_counter()
+        status = google_drive_sync_status()
+        _record_request_timing("drive.status", status_started_at)
+        if status.get("status") in {"synced", "cached"}:
+            ttl = int(str(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_SYNC_TTL_SECONDS", "300")))
+            try:
+                synced_at = float(status.get("synced_at", 0) or 0)
+            except (TypeError, ValueError):
+                synced_at = 0
+            if ttl > 0 and synced_at and time.time() - synced_at < ttl:
+                return {"enabled": True, **status}
+        sync_started_at = time.perf_counter()
+        result = run_google_drive_sync()
+        _record_request_timing("drive.sync", sync_started_at)
+        if result.get("status") == "synced":
+            try:
+                index_started_at = time.perf_counter()
+                stats = index_stats()
+                if stats.get("packs", 0) == 0 and list_packs():
+                    reindex_started_at = time.perf_counter()
+                    reindex_result = index_all_packs()
+                    _record_request_timing("index.rebuild", reindex_started_at)
+                    result["reindexed"] = reindex_result.get("stats", {})
+                _record_request_timing("index.status", index_started_at)
+                drive_projects_started_at = time.perf_counter()
+                drive_projects = _apply_drive_project_folders()
+                _record_request_timing("drive.projects", drive_projects_started_at)
+                if any(drive_projects.get(key) for key in ("created", "updated", "renamed", "deleted", "conflicts")):
+                    result["driveProjects"] = drive_projects
+                pack_links_started_at = time.perf_counter()
+                links = _apply_drive_project_pack_links()
+                _record_request_timing("drive.pack-links", pack_links_started_at)
+                if links:
+                    result["projectPackLinks"] = links
+            except Exception as exc:
+                result["reindexError"] = str(exc)
+        return {"enabled": True, **result}
+    finally:
+        _record_request_timing("drive.ensure", total_started_at)
 
 
 def storage_runtime_status(status: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -270,6 +314,38 @@ if (DIST_DIR / "assets").exists():
     app.mount("/assets", StaticFiles(directory=str(DIST_DIR / "assets")), name="assets")
 
 app.mount("/mcp", remote_mcp_app, name="remote-mcp")
+
+
+@app.middleware("http")
+async def add_performance_headers(request: Request, call_next):
+    timings: list[dict[str, Any]] = []
+    timing_token = _REQUEST_TIMINGS.set(timings)
+    started_at = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        _REQUEST_TIMINGS.reset(timing_token)
+        raise
+    duration_ms = (time.perf_counter() - started_at) * 1000
+    response.headers["X-Response-Time-Ms"] = f"{duration_ms:.1f}"
+    response.headers["X-Request-Timing-Count"] = str(len(timings))
+    response.headers["Server-Timing"] = _server_timing_header(duration_ms, timings)
+    _REQUEST_TIMINGS.reset(timing_token)
+    if _env_flag("MODULAR_ONTOLOGY_PERF_LOG", False) and request.url.path.startswith("/api/"):
+        print(
+            json.dumps(
+                {
+                    "event": "api_request",
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": response.status_code,
+                    "duration_ms": round(duration_ms, 1),
+                    "timings": timings,
+                },
+                ensure_ascii=False,
+            )
+        )
+    return response
 
 
 class QueryRequest(BaseModel):
