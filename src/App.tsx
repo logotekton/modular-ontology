@@ -645,10 +645,11 @@ function App() {
   }, [projects, selectedProjectId, selectedGraphPackIds, authToken]);
 
   async function refreshPublicStatus(token = authToken) {
-    await Promise.all([
-      getJson<IndexStats>("/api/index/status").then(setIndexStats),
-      getJson<McpStatus>("/api/mcp/status", token || undefined).then(setMcpStatus),
-    ]);
+    const tasks: Promise<unknown>[] = [getJson<IndexStats>("/api/index/status").then(setIndexStats)];
+    if (token) {
+      tasks.push(getJson<McpStatus>("/api/mcp/status", token).then(setMcpStatus));
+    }
+    await Promise.all(tasks);
   }
 
   async function regenerateMcpUrl() {
