@@ -149,6 +149,18 @@ def require_google_drive_sync(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = env(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def google_drive_sync_on_startup() -> bool:
+    default = not bool(os.environ.get("VERCEL"))
+    return google_drive_sync_enabled() and _env_flag("MODULAR_ONTOLOGY_SYNC_ON_STARTUP", default)
+
+
 def ensure_runtime_storage() -> dict[str, Any]:
     if not google_drive_sync_enabled():
         return {"enabled": False, "status": "disabled"}
@@ -233,7 +245,7 @@ def require_google_drive_write_back(result: dict[str, Any]) -> dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    if google_drive_sync_enabled():
+    if google_drive_sync_on_startup():
         run_google_drive_sync()
     async with remote_mcp.session_manager.run():
         yield
@@ -607,18 +619,21 @@ async def _write_upload_file_with_limit(file: UploadFile, target: Path, *, max_b
 
 
 def require_admin(authorization: str | None):
+    token = extract_bearer_token(authorization)
+    if not token:
+        raise HTTPException(status_code=403, detail="Only administrators can access this resource.")
     ensure_runtime_storage()
-    user = get_user_by_token(extract_bearer_token(authorization))
+    user = get_user_by_token(token)
     if not user or user.role != "admin":
         raise HTTPException(status_code=403, detail="Only administrators can access this resource.")
     return user
 
 
 def current_user(authorization: str | None):
-    ensure_runtime_storage()
     token = extract_bearer_token(authorization)
     if not token:
         return None
+    ensure_runtime_storage()
     user = get_user_by_token(token)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid or expired session.")
@@ -626,10 +641,10 @@ def current_user(authorization: str | None):
 
 
 def visible_projects_for_user(user) -> list[dict[str, Any]]:
-    ensure_runtime_storage()
-    projects = list_projects()
     if not user:
         return []
+    ensure_runtime_storage()
+    projects = list_projects()
     if is_internal_user(user):
         return projects
     allowed_project_ids = set(get_company_project_access(user.company))
@@ -647,9 +662,9 @@ def visible_pack_ids_for_user(user) -> set[str]:
 
 
 def ensure_pack_access(pack_id: str, user) -> None:
-    ensure_runtime_storage()
     if not user:
         raise HTTPException(status_code=401, detail="Authentication is required.")
+    ensure_runtime_storage()
     if is_internal_user(user):
         return
     if pack_id not in visible_pack_ids_for_user(user):
@@ -657,9 +672,9 @@ def ensure_pack_access(pack_id: str, user) -> None:
 
 
 def ensure_project_access(project_id: str, user) -> dict[str, Any]:
-    ensure_runtime_storage()
     if not user:
         raise HTTPException(status_code=401, detail="Authentication is required.")
+    ensure_runtime_storage()
     project = next((item for item in list_projects() if item["id"] == project_id), None)
     if not project:
         raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
@@ -1003,7 +1018,6 @@ def admin_set_project_pack_links(
 
 @app.get("/api/packs")
 def packs(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
-    ensure_runtime_storage()
     user = current_user(authorization)
     if not user:
         return []
@@ -1014,8 +1028,8 @@ def packs(authorization: str | None = Header(default=None)) -> list[dict[str, An
 
 
 @app.get("/api/index/status")
-def index_status() -> dict[str, Any]:
-    storage_status = ensure_runtime_storage()
+def index_status(sync: bool = False) -> dict[str, Any]:
+    storage_status = ensure_runtime_storage() if sync else google_drive_sync_status()
     stats = index_stats()
     stats["users"] = len(list_users())
     stats["projects"] = len(list_projects())
@@ -1426,11 +1440,11 @@ async def upload_ifc_model(
 
 @app.get("/api/ifc/models")
 def ifc_models(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
-    ensure_runtime_storage()
     user = current_user(authorization)
-    models = list_ifc_models()
     if not user:
         return []
+    ensure_runtime_storage()
+    models = list_ifc_models()
     if is_internal_user(user):
         return models
     allowed_project_ids = set(get_company_project_access(user.company))

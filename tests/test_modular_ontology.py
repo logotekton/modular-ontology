@@ -1384,6 +1384,64 @@ def test_pack_upload_is_session_admin_only_and_accepts_valid_zip(monkeypatch, tm
     assert True in sync_forces
 
 
+def test_public_read_endpoints_do_not_sync_without_session(monkeypatch) -> None:
+    from modular_ontology import app as app_module
+
+    sync_calls: list[bool] = []
+
+    def fake_ensure_runtime_storage():
+        sync_calls.append(True)
+        return {"enabled": True, "status": "synced", "downloaded": [], "missing": []}
+
+    monkeypatch.setattr(app_module, "ensure_runtime_storage", fake_ensure_runtime_storage)
+    monkeypatch.setattr(app_module, "index_stats", lambda: {"packs": 0, "documents": 0, "nodes": 0, "edges": 0})
+    monkeypatch.setattr(app_module, "list_users", lambda: [])
+    monkeypatch.setattr(app_module, "list_projects", lambda: [])
+    monkeypatch.setattr(app_module, "list_ifc_models", lambda: [])
+    monkeypatch.setattr(app_module, "google_drive_sync_status", lambda: {"status": "not-synced", "downloaded": [], "missing": []})
+
+    for path in ("/api/packs", "/api/projects", "/api/ifc/models", "/api/index/status"):
+        response = client.get(path)
+        assert response.status_code == 200
+
+    assert sync_calls == []
+
+
+def test_index_status_sync_query_runs_runtime_sync(monkeypatch) -> None:
+    from modular_ontology import app as app_module
+
+    sync_calls: list[bool] = []
+
+    def fake_ensure_runtime_storage():
+        sync_calls.append(True)
+        return {"enabled": True, "status": "synced", "downloaded": [], "missing": []}
+
+    monkeypatch.setattr(app_module, "ensure_runtime_storage", fake_ensure_runtime_storage)
+    monkeypatch.setattr(app_module, "index_stats", lambda: {"packs": 0, "documents": 0, "nodes": 0, "edges": 0})
+    monkeypatch.setattr(app_module, "list_users", lambda: [])
+    monkeypatch.setattr(app_module, "list_projects", lambda: [])
+    monkeypatch.setattr(app_module, "list_ifc_models", lambda: [])
+
+    response = client.get("/api/index/status?sync=true")
+
+    assert response.status_code == 200
+    assert sync_calls == [True]
+
+
+def test_google_drive_sync_on_startup_defaults_off_on_vercel(monkeypatch) -> None:
+    from modular_ontology import app as app_module
+
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setenv("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "drive-root")
+    monkeypatch.delenv("MODULAR_ONTOLOGY_SYNC_ON_STARTUP", raising=False)
+
+    assert app_module.google_drive_sync_on_startup() is False
+
+    monkeypatch.setenv("MODULAR_ONTOLOGY_SYNC_ON_STARTUP", "1")
+
+    assert app_module.google_drive_sync_on_startup() is True
+
+
 def test_mcp_tools_return_json_payloads() -> None:
     packs = json.loads(mcp_server.list_packs())
     mo_packs = json.loads(mcp_server.mo_pack_list())

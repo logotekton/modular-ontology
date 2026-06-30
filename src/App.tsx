@@ -460,14 +460,6 @@ function App() {
     }
   }
 
-  function setAllGraphPacks() {
-    setSelectedGraphPackIds(graphPackOptions.map((pack) => pack.id));
-  }
-
-  function clearGraphPacks() {
-    setSelectedGraphPackIds([]);
-  }
-
   function toggleGraphPackGroup(group: PackDisplayGroup) {
     setSelectedGraphPackIds((current) => {
       const groupIds = new Set(group.packIds);
@@ -1399,12 +1391,6 @@ function App() {
             </div>
             {graphPackOptions.length ? (
               <div className="graph-pack-filter" aria-label="프로젝트 팩 필터">
-                <button type="button" onClick={setAllGraphPacks}>
-                  전체 팩
-                </button>
-                <button type="button" onClick={clearGraphPacks}>
-                  선택 해제
-                </button>
                 <div>
                   {graphPackGroups.map((group) => {
                     const activeCount = group.packIds.filter((packId) => selectedGraphPackIds.includes(packId)).length;
