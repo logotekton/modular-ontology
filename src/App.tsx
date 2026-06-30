@@ -626,8 +626,8 @@ function App() {
     setGraph(null);
     setStatus("그래프 불러오는 중");
     const query = new URLSearchParams({
-      max_nodes: "760",
-      max_edges: "1400",
+      max_nodes: "4500",
+      max_edges: "10000",
       pack_ids: activePackIds.join(","),
     });
     getJson<GraphPayload>(`/api/projects/${encodeURIComponent(selectedProjectId)}/graph?${query.toString()}`, authToken)
