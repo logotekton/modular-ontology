@@ -232,6 +232,7 @@ type ApiTiming = {
   clientMs: number;
   serverMs: number | null;
   serverTiming: string;
+  timingDetail: string;
   capturedAt: number;
 };
 
@@ -442,6 +443,7 @@ async function apiFetch(path: string, init: RequestInit = {}) {
       clientMs,
       serverMs: Number.isFinite(serverMs) ? serverMs : null,
       serverTiming: res.headers.get("server-timing") || "",
+      timingDetail: res.headers.get("x-request-timing-detail") || "",
     });
     return res;
   } catch (error) {
@@ -453,6 +455,7 @@ async function apiFetch(path: string, init: RequestInit = {}) {
       clientMs: performance.now() - startedAt,
       serverMs: null,
       serverTiming: "",
+      timingDetail: "",
     });
     throw error;
   }
@@ -1922,7 +1925,11 @@ function PerformancePanel({ apiTimings }: { apiTimings: ApiTiming[] }) {
       <div className="performance-list">
         {apiTimings.length ? (
           apiTimings.slice(0, 8).map((timing) => (
-            <div className={timing.ok ? "performance-row" : "performance-row error"} key={timing.id}>
+            <div
+              className={timing.ok ? "performance-row" : "performance-row error"}
+              key={timing.id}
+              title={timing.timingDetail ? `${timing.path}\n${timing.timingDetail}` : timing.path}
+            >
               <span className="performance-path">{shortApiPath(timing.path)}</span>
               <span>{timing.method}</span>
               <strong>{durationLabel(timing.clientMs)}</strong>

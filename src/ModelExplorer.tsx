@@ -121,6 +121,7 @@ function emitApiTiming(timing: {
   clientMs: number;
   serverMs: number | null;
   serverTiming: string;
+  timingDetail: string;
 }) {
   window.dispatchEvent(
     new CustomEvent(API_TIMING_EVENT, {
@@ -148,6 +149,7 @@ async function apiFetch(path: string, init: RequestInit = {}) {
       clientMs: performance.now() - startedAt,
       serverMs: Number.isFinite(serverMs) ? serverMs : null,
       serverTiming: response.headers.get("server-timing") || "",
+      timingDetail: response.headers.get("x-request-timing-detail") || "",
     });
     return response;
   } catch (error) {
@@ -159,6 +161,7 @@ async function apiFetch(path: string, init: RequestInit = {}) {
       clientMs: performance.now() - startedAt,
       serverMs: null,
       serverTiming: "",
+      timingDetail: "",
     });
     throw error;
   }

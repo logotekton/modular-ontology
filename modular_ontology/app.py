@@ -115,6 +115,17 @@ def _server_timing_header(total_duration_ms: float, timings: list[dict[str, Any]
         values.append(f"{metric_name};dur={float(timing.get('duration_ms') or 0):.1f}")
     return ", ".join(values)
 
+
+def _request_timing_detail_header(timings: list[dict[str, Any]]) -> str:
+    values: list[str] = []
+    seen: dict[str, int] = {}
+    for timing in timings[:12]:
+        name = _server_timing_name(str(timing.get("name") or "phase"))
+        seen[name] = seen.get(name, 0) + 1
+        metric_name = name if seen[name] == 1 else f"{name}-{seen[name]}"
+        values.append(f"{metric_name}={float(timing.get('duration_ms') or 0):.1f}")
+    return ";".join(values)
+
 configure_mcp_server(
     host="127.0.0.1",
     port=8011,
@@ -330,6 +341,8 @@ async def add_performance_headers(request: Request, call_next):
     response.headers["X-Response-Time-Ms"] = f"{duration_ms:.1f}"
     response.headers["X-Request-Timing-Count"] = str(len(timings))
     response.headers["Server-Timing"] = _server_timing_header(duration_ms, timings)
+    if timings:
+        response.headers["X-Request-Timing-Detail"] = _request_timing_detail_header(timings)
     _REQUEST_TIMINGS.reset(timing_token)
     if _env_flag("MODULAR_ONTOLOGY_PERF_LOG", False) and request.url.path.startswith("/api/"):
         print(
