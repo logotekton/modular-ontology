@@ -2361,8 +2361,9 @@ dd {
 }
 
 .mini-list {
-  display: grid;
-  align-content: start;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
   gap: 7px;
   min-height: 0;
   height: 100%;
@@ -2378,12 +2379,17 @@ dd {
 
 .mini-list > strong {
   display: block;
+  flex: 0 0 auto;
   padding-bottom: 2px;
 }
 
 .mini-list span,
 .mini-list em {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
   min-width: 0;
+  min-height: 34px;
   overflow: hidden;
   border: 1px solid #dbe6ef;
   border-radius: 7px;
@@ -2393,6 +2399,7 @@ dd {
   font-size: 12px;
   font-style: normal;
   font-weight: 800;
+  line-height: 1.32;
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
