@@ -1349,16 +1349,17 @@ def reindex(full: bool = False, authorization: str | None = Header(default=None)
     require_admin(authorization)
     if not full:
         registry = require_google_drive_sync(run_google_drive_registry_sync(force=True))
+        result = index_all_packs()
         links = _apply_drive_project_pack_links()
-        return {
+        result.update({
             "status": "registry-synced",
-            "stats": index_stats(),
             "registry": registry,
             "xktConversion": {"status": "skipped", "reason": "fast registry sync"},
             "driveProjects": {"created": [], "updated": [], "renamed": [], "conflicts": []},
             "projectPackLinks": links,
             "projects": list_projects(),
-        }
+        })
+        return result
     conversion = run_google_drive_xkt_conversion()
     require_google_drive_sync(run_google_drive_sync(force=True))
     result = index_all_packs()

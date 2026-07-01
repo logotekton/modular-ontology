@@ -1019,7 +1019,7 @@ function App() {
       return;
     }
     setUploadStatus("Drive 동기화 및 XKT 변환 중");
-    const res = await fetch("/api/admin/reindex", {
+    const res = await fetch("/api/admin/storage/google-drive/sync", {
       method: "POST",
       headers: { Authorization: `Bearer ${authToken}` },
     });
@@ -1029,10 +1029,12 @@ function App() {
       return;
     }
     const payload = (await res.json()) as {
-      stats: IndexStats;
+      stats?: IndexStats;
+      reindexed?: IndexStats;
       xktConversion?: { status?: string; converted?: unknown[]; errors?: unknown[]; reason?: string };
     };
-    setIndexStats(payload.stats);
+    const nextStats = payload.reindexed ?? payload.stats;
+    if (nextStats) setIndexStats(nextStats);
     await refreshData(undefined, authToken);
     await refreshPublicStatus(authToken);
     const convertedCount = payload.xktConversion?.converted?.length ?? 0;
