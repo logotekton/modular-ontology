@@ -740,6 +740,10 @@ def sync_google_drive_registry_files(
     if ifc_models and ifc_models.is_folder:
         downloaded.extend(_download_ifc_metadata_files(client, ifc_models.id, data_dir / IFC_MODELS_FOLDER, warnings=warnings))
 
+    projects = root.get(PROJECTS_FOLDER)
+    if projects and projects.is_folder:
+        downloaded.extend(_download_project_ifc_metadata_files(client, projects.id, data_dir, warnings=warnings))
+
     result = {
         "status": "synced",
         "synced_at": time.time(),
@@ -751,6 +755,57 @@ def sync_google_drive_registry_files(
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
+
+
+def _download_project_ifc_metadata_files(
+    client: GoogleDriveClient,
+    projects_folder_id: str,
+    data_dir: Path,
+    *,
+    warnings: list[str] | None = None,
+) -> list[str]:
+    downloaded: list[str] = []
+    for project in client.list_children(projects_folder_id):
+        if not project.is_folder:
+            continue
+        project_id = _safe_drive_filename_or_none(project.name, warnings, f"{PROJECTS_FOLDER} project folder")
+        if not project_id:
+            continue
+        project_children = _children_by_name(client, project.id)
+        metadata_folder = project_children.get("metadata")
+        existing_metadata_names: set[str] = set()
+        target_metadata_dir = data_dir / IFC_MODELS_FOLDER / project_id / "metadata"
+        if metadata_folder and metadata_folder.is_folder:
+            for item in client.list_children(metadata_folder.id):
+                if item.is_folder or not item.name.endswith(".metadata.json"):
+                    continue
+                metadata_name = _safe_drive_filename_or_none(item.name, warnings, f"{PROJECTS_FOLDER}/{project.name}/metadata")
+                if not metadata_name:
+                    continue
+                target = target_metadata_dir / metadata_name
+                client.download_file(item.id, target)
+                existing_metadata_names.add(metadata_name)
+                downloaded.append(str(target))
+
+        ifc_folder = project_children.get(PROJECT_IFC_FOLDER)
+        if ifc_folder and ifc_folder.is_folder:
+            active_metadata_names: set[str] = set()
+            downloaded.extend(
+                _register_ifc_files_from_drive_folder(
+                    client,
+                    ifc_folder.id,
+                    data_dir / IFC_MODELS_FOLDER,
+                    project_id,
+                    project.name,
+                    f"{PROJECTS_FOLDER}/{project.name}/{PROJECT_IFC_FOLDER}",
+                    existing_metadata_names=existing_metadata_names,
+                    active_metadata_names=active_metadata_names,
+                    source_is_project=True,
+                    warnings=warnings,
+                )
+            )
+            _prune_project_metadata(target_metadata_dir, active_metadata_names)
+    return downloaded
 
 
 def _download_named_files(client: GoogleDriveClient, folder_id: str, target_dir: Path, names: set[str]) -> list[str]:

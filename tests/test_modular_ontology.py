@@ -39,6 +39,7 @@ from modular_ontology.google_drive_sync import (
     ensure_project_drive_folders,
     google_drive_sync_status,
     restore_ifc_files_from_drive,
+    sync_google_drive_registry_files,
     sync_google_drive_storage,
     write_back_ifc_file,
     write_back_pack_file,
@@ -2381,6 +2382,57 @@ def test_google_drive_sync_reads_project_scoped_models_and_packs(tmp_path) -> No
     assert metadata["projectId"] == "renamed-building"
     assert metadata["viewerStatus"] == "ready"
     assert metadata["drive"]["file"]["folder"] == "02_Projects/renamed-building/ifc-models"
+
+
+def test_google_drive_registry_sync_registers_project_scoped_ifc_metadata(tmp_path) -> None:
+    class FakeDriveClient:
+        children = {
+            "root": [
+                DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder"),
+            ],
+            "projects-root": [
+                DriveItem("project", "yeoju-modular-dormitory", "application/vnd.google-apps.folder"),
+            ],
+            "project": [
+                DriveItem("ifc-folder", "ifc-models", "application/vnd.google-apps.folder"),
+                DriveItem("packs-folder", "ontology-packs", "application/vnd.google-apps.folder"),
+            ],
+            "ifc-folder": [
+                DriveItem("ifc", "yeoju.ifc", "application/octet-stream", "2026-06-11T00:00:00Z", 1200),
+                DriveItem("xkt", "yeoju.xkt", "application/octet-stream", "2026-06-11T00:01:00Z", 800),
+            ],
+            "packs-folder": [
+                DriveItem("pack", "project-pack.zip", "application/x-zip-compressed"),
+            ],
+        }
+
+        def list_children(self, folder_id):
+            return self.children.get(folder_id, [])
+
+        def download_file(self, file_id, target):
+            raise AssertionError("registry sync should not download project IFC files or pack zips")
+
+    result = sync_google_drive_registry_files(
+        client=FakeDriveClient(),
+        root_folder_id="root",
+        data_dir=tmp_path,
+        force=True,
+    )
+
+    metadata_path = tmp_path / "03_IFC_Models" / "yeoju-modular-dormitory" / "metadata" / "yeoju.metadata.json"
+    pack_path = tmp_path / "04_Ontology_Packs" / "indexed" / "project-pack.zip"
+
+    assert result["status"] == "synced"
+    assert str(metadata_path) in result["downloaded"]
+    assert not pack_path.exists()
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["filename"] == "yeoju.ifc"
+    assert metadata["projectId"] == "yeoju-modular-dormitory"
+    assert metadata["storage"] == "google-drive"
+    assert metadata["viewerStatus"] == "ready"
+    assert metadata["xktPath"].endswith("03_IFC_Models\\yeoju-modular-dormitory\\files\\yeoju.xkt") or metadata["xktPath"].endswith("03_IFC_Models/yeoju-modular-dormitory/files/yeoju.xkt")
+    assert metadata["drive"]["file"]["folder"] == "02_Projects/yeoju-modular-dormitory/ifc-models"
 
 
 def test_drive_xkt_worker_converts_missing_project_xkt(monkeypatch, tmp_path) -> None:
