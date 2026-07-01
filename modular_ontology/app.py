@@ -49,6 +49,7 @@ from .google_drive_sync import (
     google_drive_sync_enabled,
     google_drive_sync_status,
     restore_ifc_files_from_drive,
+    sync_google_drive_registry_files,
     sync_google_drive_storage,
     sync_google_drive_mcp_tokens_file,
     sync_google_drive_users_file,
@@ -165,6 +166,19 @@ def run_google_drive_sync(force: bool = False) -> dict[str, Any]:
         return {"status": "error", "error": str(exc)}
 
 
+def run_google_drive_registry_sync(force: bool = False) -> dict[str, Any]:
+    if not google_drive_sync_enabled():
+        return {"enabled": False, "status": "disabled"}
+    try:
+        with _GOOGLE_DRIVE_SYNC_LOCK:
+            result = sync_google_drive_registry_files(force=force)
+        if result.get("status") == "synced":
+            invalidate_users_cache()
+        return {"enabled": True, **result}
+    except Exception as exc:
+        return {"enabled": True, "status": "error", "error": str(exc)}
+
+
 def run_google_drive_users_sync(force: bool = False) -> dict[str, Any]:
     if not google_drive_sync_enabled():
         return {"enabled": False, "status": "disabled"}
@@ -247,6 +261,30 @@ def ensure_runtime_storage() -> dict[str, Any]:
         except Exception as exc:
             result["reindexError"] = str(exc)
     return {"enabled": True, **result}
+
+
+def ensure_runtime_registry() -> dict[str, Any]:
+    if not google_drive_sync_enabled():
+        return {"enabled": False, "status": "disabled"}
+    storage_status = google_drive_sync_status()
+    stats = index_stats()
+    if stats.get("packs", 0) > 0 and storage_status.get("status") in {"synced", "cached"}:
+        ttl = int(str(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_REGISTRY_SYNC_TTL_SECONDS", str(1800))))
+        try:
+            synced_at = float(storage_status.get("synced_at", 0) or 0)
+        except (TypeError, ValueError):
+            synced_at = 0
+        if ttl > 0 and synced_at and time.time() - synced_at < ttl:
+            return {"enabled": True, **storage_status}
+    result = run_google_drive_registry_sync()
+    if result.get("status") in {"synced", "cached"}:
+        try:
+            links = _apply_drive_project_pack_links()
+            if links:
+                result["projectPackLinks"] = links
+        except Exception as exc:
+            result["registryApplyError"] = str(exc)
+    return result
 
 
 def storage_runtime_status(status: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -680,7 +718,7 @@ def require_admin(authorization: str | None):
     token = extract_bearer_token(authorization)
     if not token:
         raise HTTPException(status_code=403, detail="Only administrators can access this resource.")
-    ensure_runtime_storage()
+    ensure_runtime_registry()
     user = get_user_by_token(token)
     if not user or user.role != "admin":
         raise HTTPException(status_code=403, detail="Only administrators can access this resource.")
@@ -691,7 +729,7 @@ def current_user(authorization: str | None):
     token = extract_bearer_token(authorization)
     if not token:
         return None
-    ensure_runtime_storage()
+    ensure_runtime_registry()
     user = get_user_by_token(token)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid or expired session.")
@@ -701,7 +739,7 @@ def current_user(authorization: str | None):
 def visible_projects_for_user(user) -> list[dict[str, Any]]:
     if not user:
         return []
-    ensure_runtime_storage()
+    ensure_runtime_registry()
     projects = list_projects()
     if is_internal_user(user):
         return projects
@@ -710,7 +748,7 @@ def visible_projects_for_user(user) -> list[dict[str, Any]]:
 
 
 def visible_pack_ids_for_user(user) -> set[str]:
-    ensure_runtime_storage()
+    ensure_runtime_registry()
     return {
         pack_id
         for project in visible_projects_for_user(user)
@@ -722,7 +760,7 @@ def visible_pack_ids_for_user(user) -> set[str]:
 def ensure_pack_access(pack_id: str, user) -> None:
     if not user:
         raise HTTPException(status_code=401, detail="Authentication is required.")
-    ensure_runtime_storage()
+    ensure_runtime_registry()
     if is_internal_user(user):
         return
     if pack_id not in visible_pack_ids_for_user(user):
@@ -732,7 +770,7 @@ def ensure_pack_access(pack_id: str, user) -> None:
 def ensure_project_access(project_id: str, user) -> dict[str, Any]:
     if not user:
         raise HTTPException(status_code=401, detail="Authentication is required.")
-    ensure_runtime_storage()
+    ensure_runtime_registry()
     project = next((item for item in list_projects() if item["id"] == project_id), None)
     if not project:
         raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
@@ -966,7 +1004,7 @@ def projects(authorization: str | None = Header(default=None)) -> list[dict[str,
 @app.get("/api/projects/suggestions")
 def project_suggestions(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_admin(authorization)
-    ensure_runtime_storage()
+    ensure_runtime_registry()
     linked_pack_ids = {pack_id for project in list_projects() for pack_id in project.get("packIds", [])}
     suggestions = []
     for pack in list_packs():
@@ -1087,7 +1125,7 @@ def packs(authorization: str | None = Header(default=None)) -> list[dict[str, An
 
 @app.get("/api/index/status")
 def index_status(sync: bool = False) -> dict[str, Any]:
-    storage_status = ensure_runtime_storage() if sync else google_drive_sync_status()
+    storage_status = ensure_runtime_storage() if sync else ensure_runtime_registry()
     stats = index_stats()
     stats["users"] = len(list_users())
     stats["projects"] = len(list_projects())
@@ -1307,8 +1345,20 @@ def _remove_company_project_access(project_ids: list[str]) -> dict[str, list[str
 
 
 @app.post("/api/admin/reindex")
-def reindex(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+def reindex(full: bool = False, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_admin(authorization)
+    if not full:
+        registry = require_google_drive_sync(run_google_drive_registry_sync(force=True))
+        links = _apply_drive_project_pack_links()
+        return {
+            "status": "registry-synced",
+            "stats": index_stats(),
+            "registry": registry,
+            "xktConversion": {"status": "skipped", "reason": "fast registry sync"},
+            "driveProjects": {"created": [], "updated": [], "renamed": [], "conflicts": []},
+            "projectPackLinks": links,
+            "projects": list_projects(),
+        }
     conversion = run_google_drive_xkt_conversion()
     require_google_drive_sync(run_google_drive_sync(force=True))
     result = index_all_packs()
@@ -1329,7 +1379,7 @@ def graph(
     max_edges: int = 1600,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    ensure_runtime_storage()
+    ensure_runtime_registry()
     ensure_pack_access(pack_id, current_user(authorization))
     try:
         return build_graph(pack_id=pack_id, max_nodes=max_nodes, max_edges=max_edges)
@@ -1345,7 +1395,7 @@ def project_graph(
     max_edges: int = 1600,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    ensure_runtime_storage()
+    ensure_runtime_registry()
     user = current_user(authorization)
     project = ensure_project_access(project_id, user)
     project_pack_ids = [pack_id for pack_id in project.get("packIds", []) if isinstance(pack_id, str)]
@@ -1441,7 +1491,7 @@ async def upload_ifc_model(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_admin(authorization)
-    ensure_runtime_storage()
+    ensure_runtime_registry()
     target_project_id = (project_id or "").strip()
     project = ensure_project_access(target_project_id, current_user(authorization)) if target_project_id else None
     try:
@@ -1501,7 +1551,7 @@ def ifc_models(authorization: str | None = Header(default=None)) -> list[dict[st
     user = current_user(authorization)
     if not user:
         return []
-    ensure_runtime_storage()
+    ensure_runtime_registry()
     models = list_ifc_models()
     if is_internal_user(user):
         return models
@@ -1569,7 +1619,7 @@ def admin_link_ifc_model(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_admin(authorization)
-    ensure_runtime_storage()
+    ensure_runtime_registry()
     if google_drive_sync_enabled():
         try:
             _metadata_path, _raw_metadata, public_metadata = _read_ifc_metadata_by_id(request.model_id)
@@ -1604,7 +1654,7 @@ def admin_link_ifc_model(
 
 @app.post("/api/query")
 def query_ontology(request: QueryRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    ensure_runtime_storage()
+    ensure_runtime_registry()
     user = current_user(authorization)
     if request.use_openai and not user:
         raise HTTPException(status_code=401, detail="Login is required to use OpenAI AI Query.")

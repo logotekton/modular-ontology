@@ -4,12 +4,13 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from .config import LEGACY_STRUCTURED_PACKS_DIR, PACKS_DIR, ROOT, USE_STRUCTURED_DATA_DIR
+from .config import DB_PATH, LEGACY_STRUCTURED_PACKS_DIR, PACKS_DIR, ROOT, USE_STRUCTURED_DATA_DIR
 
 UPLOAD_DIR = PACKS_DIR
 
@@ -292,7 +293,100 @@ def _extract_readme(zf: zipfile.ZipFile) -> str:
 
 
 def list_packs() -> list[dict[str, Any]]:
-    return [summarize_pack(pack) for pack in unique_pack_files()]
+    packs = unique_pack_files()
+    if packs:
+        return [summarize_pack(pack) for pack in packs]
+    summaries = _db_pack_summaries()
+    if summaries:
+        return summaries
+    _sync_registry_from_drive()
+    return _db_pack_summaries()
+
+
+def _sync_registry_from_drive() -> None:
+    try:
+        from .google_drive_sync import google_drive_sync_enabled, sync_google_drive_registry_files
+
+        if google_drive_sync_enabled():
+            sync_google_drive_registry_files()
+    except Exception:
+        return
+
+
+def _db_connect(db_path: Path = DB_PATH) -> sqlite3.Connection | None:
+    if not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.Error:
+        return None
+
+
+def _pack_summary_from_db_row(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        summary = json.loads(row["summary_json"])
+    except (KeyError, TypeError, json.JSONDecodeError):
+        summary = {}
+    if not isinstance(summary, dict):
+        summary = {}
+    counts = summary.get("counts") if isinstance(summary.get("counts"), dict) else {}
+    return {
+        **summary,
+        "id": str(summary.get("id") or row["id"]),
+        "filename": str(summary.get("filename") or row["filename"]),
+        "displayFilename": str(summary.get("displayFilename") or summary.get("filename") or row["filename"]),
+        "displayName": str(summary.get("displayName") or summary.get("title") or row["title"]),
+        "title": str(summary.get("title") or row["title"]),
+        "source": str(summary.get("source") or row["source"]),
+        "validationStatus": str(summary.get("validationStatus") or row["validation_status"]),
+        "counts": {
+            "documents": int(counts.get("documents") or 0),
+            "nodes": int(counts.get("nodes") or 0),
+            "edges": int(counts.get("edges") or 0),
+        },
+    }
+
+
+def _db_pack_summaries(db_path: Path = DB_PATH) -> list[dict[str, Any]]:
+    conn = _db_connect(db_path)
+    if not conn:
+        return []
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, filename, title, source, validation_status, summary_json
+            FROM packs
+            ORDER BY title COLLATE NOCASE, filename COLLATE NOCASE
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+    return [_pack_summary_from_db_row(row) for row in rows]
+
+
+def _db_pack_summary(pack_id: str, db_path: Path = DB_PATH) -> dict[str, Any] | None:
+    conn = _db_connect(db_path)
+    if not conn:
+        return None
+    try:
+        row = conn.execute(
+            """
+            SELECT id, filename, title, source, validation_status, summary_json
+            FROM packs
+            WHERE id = ? OR filename = ?
+            LIMIT 1
+            """,
+            (pack_id, pack_id),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    return _pack_summary_from_db_row(row) if row else None
 
 
 def find_pack(pack_id: str) -> PackFile:
@@ -326,7 +420,10 @@ def list_pack_documents(
     suffix: str = ".md",
     limit: int = 200,
 ) -> dict[str, Any]:
-    pack = find_pack(pack_id)
+    try:
+        pack = find_pack(pack_id)
+    except FileNotFoundError:
+        return _list_pack_documents_from_db(pack_id, prefix=prefix, suffix=suffix, limit=limit)
     safe_prefix = _safe_zip_path(prefix) if prefix else ""
     safe_suffix = suffix or ""
     with zipfile.ZipFile(pack.path) as zf:
@@ -348,7 +445,10 @@ def list_pack_documents(
 
 
 def read_pack_document(pack_id: str, path: str, max_chars: int = 12000) -> dict[str, Any]:
-    pack = find_pack(pack_id)
+    try:
+        pack = find_pack(pack_id)
+    except FileNotFoundError:
+        return _read_pack_document_from_db(pack_id, path, max_chars=max_chars)
     safe_path = _safe_zip_path(path)
     with zipfile.ZipFile(pack.path) as zf:
         if safe_path not in zf.namelist():
@@ -361,6 +461,87 @@ def read_pack_document(pack_id: str, path: str, max_chars: int = 12000) -> dict[
         "content": clipped,
         "truncated": len(text) > len(clipped),
         "chars": len(text),
+    }
+
+
+def _list_pack_documents_from_db(
+    pack_id: str,
+    prefix: str = "documents/",
+    suffix: str = ".md",
+    limit: int = 200,
+) -> dict[str, Any]:
+    summary = _db_pack_summary(pack_id)
+    if not summary:
+        _sync_registry_from_drive()
+        summary = _db_pack_summary(pack_id)
+    if not summary:
+        raise FileNotFoundError(pack_id)
+    safe_prefix = _safe_zip_path(prefix) if prefix else ""
+    safe_suffix = suffix or ""
+    conn = _db_connect()
+    if not conn:
+        raise FileNotFoundError(pack_id)
+    try:
+        clauses = ["pack_id = ?"]
+        params: list[Any] = [summary["id"]]
+        if safe_prefix:
+            clauses.append("path LIKE ?")
+            params.append(f"{safe_prefix}%")
+        if safe_suffix:
+            clauses.append("path LIKE ?")
+            params.append(f"%{safe_suffix}")
+        rows = conn.execute(
+            f"SELECT path FROM documents WHERE {' AND '.join(clauses)} ORDER BY path LIMIT ?",
+            (*params, max(0, limit) + 1),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise FileNotFoundError(pack_id) from exc
+    finally:
+        conn.close()
+    documents = [str(row["path"]) for row in rows]
+    return {
+        "pack_id": summary["id"],
+        "prefix": safe_prefix,
+        "suffix": safe_suffix,
+        "count": len(documents),
+        "documents": documents[: max(0, limit)],
+        "truncated": len(documents) > max(0, limit),
+        "source": "sqlite-index",
+    }
+
+
+def _read_pack_document_from_db(pack_id: str, path: str, max_chars: int = 12000) -> dict[str, Any]:
+    summary = _db_pack_summary(pack_id)
+    if not summary:
+        _sync_registry_from_drive()
+        summary = _db_pack_summary(pack_id)
+    if not summary:
+        raise FileNotFoundError(pack_id)
+    safe_path = _safe_zip_path(path)
+    conn = _db_connect()
+    if not conn:
+        raise FileNotFoundError(f"{pack_id}:{safe_path}")
+    try:
+        row = conn.execute(
+            "SELECT title, body FROM documents WHERE pack_id = ? AND path = ? LIMIT 1",
+            (summary["id"], safe_path),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise FileNotFoundError(f"{pack_id}:{safe_path}") from exc
+    finally:
+        conn.close()
+    if not row:
+        raise FileNotFoundError(f"{pack_id}:{safe_path}")
+    text = str(row["body"] or "")
+    clipped = text[: max(0, max_chars)]
+    return {
+        "pack_id": summary["id"],
+        "path": safe_path,
+        "title": row["title"],
+        "content": clipped,
+        "truncated": len(text) > len(clipped),
+        "chars": len(text),
+        "source": "sqlite-index",
     }
 
 
@@ -717,7 +898,17 @@ def search_packs(query: str = "", limit: int = 20) -> list[dict[str, Any]]:
 
 
 def list_sources(pack_id: str | None = None) -> dict[str, Any]:
-    packs = [summarize_pack(find_pack(pack_id))] if pack_id else list_packs()
+    if pack_id:
+        try:
+            packs = [summarize_pack(find_pack(pack_id))]
+        except FileNotFoundError:
+            summary = _db_pack_summary(pack_id)
+            if not summary:
+                _sync_registry_from_drive()
+                summary = _db_pack_summary(pack_id)
+            packs = [summary] if summary else []
+    else:
+        packs = list_packs()
     return {
         "count": len(packs),
         "sources": [
@@ -738,8 +929,119 @@ def list_sources(pack_id: str | None = None) -> dict[str, Any]:
 
 
 def build_graph(pack_id: str, max_nodes: int = 900, max_edges: int = 1600) -> dict[str, Any]:
-    pack = find_pack(pack_id)
-    return build_graph_from_pack(pack, max_nodes=max_nodes, max_edges=max_edges)
+    try:
+        pack = find_pack(pack_id)
+        return build_graph_from_pack(pack, max_nodes=max_nodes, max_edges=max_edges)
+    except FileNotFoundError:
+        graph = _build_graph_from_db(pack_id, max_nodes=max_nodes, max_edges=max_edges)
+        if graph:
+            return graph
+        raise
+
+
+def _node_size_for_type(node_type: str) -> int:
+    if node_type in {"Module", "Document"}:
+        return 11
+    if node_type in {"Assembly", "Category"}:
+        return 8
+    if node_type == "Chunk":
+        return 4
+    return 5
+
+
+def _build_graph_from_db(pack_id: str, max_nodes: int = 900, max_edges: int = 1600) -> dict[str, Any] | None:
+    summary = _db_pack_summary(pack_id)
+    if not summary:
+        _sync_registry_from_drive()
+        summary = _db_pack_summary(pack_id)
+    if not summary:
+        return None
+    conn = _db_connect()
+    if not conn:
+        return None
+    try:
+        total_nodes = int(conn.execute("SELECT COUNT(*) FROM nodes WHERE pack_id = ?", (summary["id"],)).fetchone()[0])
+        total_edges = int(conn.execute("SELECT COUNT(*) FROM edges WHERE pack_id = ?", (summary["id"],)).fetchone()[0])
+        node_rows = conn.execute(
+            """
+            SELECT id, label, type, properties_json
+            FROM nodes
+            WHERE pack_id = ?
+            ORDER BY type, label
+            LIMIT ?
+            """,
+            (summary["id"], max(0, max_nodes)),
+        ).fetchall()
+        visible_node_ids = {str(row["id"]) for row in node_rows}
+        edge_rows = conn.execute(
+            """
+            SELECT id, source, target, relation, properties_json
+            FROM edges
+            WHERE pack_id = ?
+            LIMIT ?
+            """,
+            (summary["id"], max(0, max_edges) * 4 + 200),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+    nodes = []
+    for row in node_rows:
+        node_type = str(row["type"] or "Element")
+        try:
+            properties = json.loads(row["properties_json"] or "{}")
+        except json.JSONDecodeError:
+            properties = {}
+        nodes.append(
+            {
+                "id": str(row["id"]),
+                "label": str(row["label"] or row["id"]),
+                "type": node_type,
+                "packId": summary["id"],
+                "size": _node_size_for_type(node_type),
+                "color": TYPE_COLORS.get(node_type, "#64748b"),
+                "properties": properties,
+            }
+        )
+
+    edges = []
+    for row in edge_rows:
+        source = str(row["source"] or "")
+        target = str(row["target"] or "")
+        if source not in visible_node_ids or target not in visible_node_ids:
+            continue
+        try:
+            properties = json.loads(row["properties_json"] or "{}")
+        except json.JSONDecodeError:
+            properties = {}
+        edges.append(
+            {
+                "id": str(row["id"]),
+                "source": source,
+                "target": target,
+                "relation": str(row["relation"] or "related_to"),
+                "label": str(row["relation"] or "related_to"),
+                "packId": summary["id"],
+                "properties": properties,
+            }
+        )
+        if len(edges) >= max_edges:
+            break
+
+    return {
+        "pack": summary,
+        "nodes": nodes,
+        "edges": edges,
+        "stats": {
+            "visibleNodes": len(nodes),
+            "visibleEdges": len(edges),
+            "totalNodes": total_nodes,
+            "totalEdges": total_edges,
+        },
+        "source": "sqlite-index",
+    }
 
 
 def build_multi_pack_graph(
@@ -1015,7 +1317,10 @@ def list_projects() -> list[dict[str, Any]]:
 
 
 def search_pack(pack_id: str, query: str, limit: int = 8) -> list[dict[str, Any]]:
-    pack = find_pack(pack_id)
+    try:
+        pack = find_pack(pack_id)
+    except FileNotFoundError:
+        return _search_pack_from_db(pack_id, query, limit=limit)
     terms = query_terms(query)
     if not terms:
         return []
@@ -1045,6 +1350,64 @@ def search_pack(pack_id: str, query: str, limit: int = 8) -> list[dict[str, Any]
                     },
                 )
             )
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [item[1] for item in scored[:limit]]
+
+
+def _search_pack_from_db(pack_id: str, query: str, limit: int = 8) -> list[dict[str, Any]]:
+    terms = query_terms(query)
+    if not terms:
+        return []
+    summary = _db_pack_summary(pack_id)
+    if not summary:
+        _sync_registry_from_drive()
+        summary = _db_pack_summary(pack_id)
+    if not summary:
+        return []
+    conn = _db_connect()
+    if not conn:
+        return []
+    try:
+        clauses = []
+        params: list[Any] = [summary["id"]]
+        for term in terms:
+            like = f"%{term}%"
+            clauses.append("(body LIKE ? OR title LIKE ? OR path LIKE ?)")
+            params.extend([like, like, like])
+        rows = conn.execute(
+            "SELECT path, title, body FROM documents "
+            f"WHERE pack_id = ? AND ({' OR '.join(clauses)})",
+            params,
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for row in rows:
+        text = str(row["body"] or "")
+        lower = text.lower()
+        score = score_terms(lower + " " + str(row["title"]).lower() + " " + str(row["path"]).lower(), terms)
+        if score <= 0:
+            continue
+        hit = first_term_hit(lower, terms)
+        if hit < 0:
+            hit = 0
+        start = max(0, hit - 120)
+        end = min(len(text), hit + 260)
+        scored.append(
+            (
+                score,
+                {
+                    "path": row["path"],
+                    "title": row["title"],
+                    "snippet": re.sub(r"\s+", " ", text[start:end]).strip(),
+                    "score": round(score, 3),
+                    "source": "sqlite-index",
+                },
+            )
+        )
     scored.sort(key=lambda item: item[0], reverse=True)
     return [item[1] for item in scored[:limit]]
 

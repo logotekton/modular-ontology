@@ -686,6 +686,73 @@ def _sync_marker(data_dir: Path) -> Path:
     return data_dir / ".google-drive-sync.json"
 
 
+def _registry_sync_marker(data_dir: Path) -> Path:
+    return data_dir / ".google-drive-registry-sync.json"
+
+
+def sync_google_drive_registry_files(
+    *,
+    client: GoogleDriveClient | None = None,
+    root_folder_id: str | None = None,
+    data_dir: Path = DATA_DIR,
+    force: bool = False,
+) -> dict[str, Any]:
+    root_folder_id = root_folder_id or str(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "")).strip()
+    if not root_folder_id:
+        return {"status": "skipped", "reason": "MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set.", "scope": "registry"}
+
+    ttl = int(str(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_REGISTRY_SYNC_TTL_SECONDS", str(DEFAULT_TTL_SECONDS))))
+    marker = _registry_sync_marker(data_dir)
+    if not force and ttl > 0 and marker.exists():
+        try:
+            previous = json.loads(marker.read_text(encoding="utf-8"))
+            if time.time() - float(previous.get("synced_at", 0)) < ttl:
+                return {"status": "cached", **previous}
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+
+    client = client or GoogleDriveClient.from_env()
+    root = _children_by_name(client, root_folder_id)
+    downloaded: list[str] = []
+    missing: list[str] = []
+    warnings: list[str] = []
+
+    admin = root.get(ADMIN_FOLDER)
+    if admin and admin.is_folder:
+        downloaded.extend(
+            _download_named_files(
+                client,
+                admin.id,
+                data_dir / ADMIN_FOLDER,
+                {"users.json", "mcp_remote.json", "mcp_tokens.json"},
+            )
+        )
+    else:
+        missing.append(ADMIN_FOLDER)
+
+    database = root.get(DATABASE_FOLDER)
+    if database and database.is_folder:
+        downloaded.extend(_download_database_file(client, database.id, data_dir / DATABASE_FOLDER))
+    else:
+        missing.append(DATABASE_FOLDER)
+
+    ifc_models = root.get(IFC_MODELS_FOLDER)
+    if ifc_models and ifc_models.is_folder:
+        downloaded.extend(_download_ifc_metadata_files(client, ifc_models.id, data_dir / IFC_MODELS_FOLDER, warnings=warnings))
+
+    result = {
+        "status": "synced",
+        "synced_at": time.time(),
+        "downloaded": downloaded,
+        "missing": missing,
+        "warnings": warnings,
+        "scope": "registry",
+    }
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
+
+
 def _download_named_files(client: GoogleDriveClient, folder_id: str, target_dir: Path, names: set[str]) -> list[str]:
     downloaded: list[str] = []
     for item in client.list_children(folder_id):
