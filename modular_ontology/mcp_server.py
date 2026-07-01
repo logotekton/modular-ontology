@@ -36,6 +36,7 @@ from .pack_index import (
     score_terms,
 )
 from .qa import answer_pack_question
+from .store import connect as connect_index_db, init_db as init_index_db
 
 
 try:
@@ -932,6 +933,38 @@ def _pack_logical_name(pack_id: str) -> str:
     source = manifest.get("source") if isinstance(manifest.get("source"), dict) else {}
     if source.get("derived_file"):
         return str(source.get("derived_file")).removesuffix(".jsonl")
+    pack_id_lower = str(pack_id).lower()
+    for logical in (
+        "drawing_evidence",
+        "drawing_documents",
+        "schedule_rows",
+        "schedule_tables",
+        "quantity_facts",
+        "material_facts",
+        "bim_objects",
+        "relationships",
+    ):
+        if logical in pack_id_lower:
+            return logical
+    for pack in read_packs():
+        if str(pack.get("id") or "") != str(pack_id):
+            continue
+        text = " ".join(
+            str(pack.get(key) or "")
+            for key in ("filename", "displayFilename", "displayName", "title")
+        ).lower()
+        for logical in (
+            "drawing_evidence",
+            "drawing_documents",
+            "schedule_rows",
+            "schedule_tables",
+            "quantity_facts",
+            "material_facts",
+            "bim_objects",
+            "relationships",
+        ):
+            if logical in text or logical.replace("_", " ") in text:
+                return logical
     return ""
 
 
@@ -964,10 +997,11 @@ def _resolve_pack_ids(
     projects_by_id = _visible_project_by_id()
     packs_by_id = _visible_pack_by_id()
     candidates: list[str] = []
+    explicit_pack_id = str(pack_id) if pack_id else ""
     if pack_ids:
         candidates = [str(item) for item in _normalize_tool_list(pack_ids)]
     elif pack_id:
-        candidates = [str(pack_id)]
+        candidates = [explicit_pack_id]
         if include_sibling_shards:
             logical = logical_pack or _pack_logical_name(str(pack_id))
             if logical:
@@ -975,7 +1009,8 @@ def _resolve_pack_ids(
                     pool = [candidate for candidate in _project_pack_ids(projects_by_id[project_id]) if candidate in packs_by_id]
                 else:
                     pool = list(packs_by_id)
-                candidates = [candidate for candidate in pool if _pack_logical_name(candidate) == logical]
+                siblings = [candidate for candidate in pool if _pack_logical_name(candidate) == logical]
+                candidates = list(dict.fromkeys([explicit_pack_id, *siblings]))
     elif project_id:
         if project_id not in projects_by_id:
             return []
@@ -988,7 +1023,8 @@ def _resolve_pack_ids(
         if candidate not in packs_by_id or not _pack_is_visible(candidate):
             continue
         if logical_pack and _pack_logical_name(candidate) != logical_pack:
-            continue
+            if not (explicit_pack_id and candidate == explicit_pack_id and not _pack_logical_name(candidate)):
+                continue
         if candidate not in resolved:
             resolved.append(candidate)
     return resolved
@@ -1264,7 +1300,16 @@ def _iter_drawing_entity_rows(root: Path):
 
 
 def _drawing_entity_context(row: dict) -> dict:
-    return row.get("source_context") if isinstance(row.get("source_context"), dict) else {}
+    context = row.get("source_context") if isinstance(row.get("source_context"), dict) else {}
+    if context:
+        return context
+    return {
+        "sheet_number": row.get("sheet_number") or row.get("sheet_no"),
+        "sheet_name": row.get("sheet_name"),
+        "view_name": row.get("view_name"),
+        "view_type": row.get("view_type"),
+        "source_kind": row.get("source_kind"),
+    }
 
 
 def _drawing_entity_geometry(row: dict) -> dict:
@@ -1272,7 +1317,7 @@ def _drawing_entity_geometry(row: dict) -> dict:
 
 
 def _dxf_source_file(row: dict) -> str | None:
-    value = row.get("dxf_file_name")
+    value = row.get("dxf_file_name") or row.get("source_file") or row.get("file_name")
     if value:
         return str(value)
     path = row.get("dxf_path")
@@ -1310,6 +1355,11 @@ def _point_xy(point: object) -> list[float] | None:
 
 def _bbox_from_entity_row(row: dict) -> list[float] | None:
     bbox = row.get("bbox") or row.get("bounding_box")
+    if isinstance(bbox, list) and len(bbox) >= 4:
+        try:
+            return [float(value) for value in bbox[:4]]
+        except (TypeError, ValueError):
+            pass
     if isinstance(bbox, dict):
         minimum = bbox.get("min") if isinstance(bbox.get("min"), dict) else {}
         maximum = bbox.get("max") if isinstance(bbox.get("max"), dict) else {}
@@ -1329,6 +1379,20 @@ def _drawing_entity_line(row: dict) -> dict | None:
     geometry = _drawing_entity_geometry(row)
     start = _point_xy(geometry.get("first_point") or geometry.get("start_point") or geometry.get("start"))
     end = _point_xy(geometry.get("second_point") or geometry.get("end_point") or geometry.get("end"))
+    if not start:
+        raw_start = row.get("start_point")
+        if isinstance(raw_start, list) and len(raw_start) >= 2:
+            try:
+                start = [float(raw_start[0]), float(raw_start[1])]
+            except (TypeError, ValueError):
+                start = None
+    if not end:
+        raw_end = row.get("end_point")
+        if isinstance(raw_end, list) and len(raw_end) >= 2:
+            try:
+                end = [float(raw_end[0]), float(raw_end[1])]
+            except (TypeError, ValueError):
+                end = None
     if start and end:
         return {"start": start, "end": end}
     return None
@@ -1366,13 +1430,20 @@ def _classify_drawing_entity_type(row: dict) -> str:
     return "drawing_entity"
 
 
-def _drawing_entity_payload(row: dict, root: Path, source_pack_id: str, score: float = 1.0) -> dict:
+def _drawing_entity_payload(row: dict, root: Path | None, source_pack_id: str, score: float = 1.0) -> dict:
     context = _drawing_entity_context(row)
-    entity_key = row.get("entity_key") or row.get("record_key")
+    entity_key = row.get("entity_key") or row.get("record_key") or row.get("source_entity_key")
     entity_type = str(row.get("entity_type") or row.get("record_type") or "")
     geometry = _drawing_entity_geometry(row)
     line = _drawing_entity_line(row)
     insert_point = _point_xy(geometry.get("insert_point") or geometry.get("insertion_point"))
+    if not insert_point:
+        raw_insert = row.get("insert") or row.get("insert_point")
+        if isinstance(raw_insert, list) and len(raw_insert) >= 2:
+            try:
+                insert_point = [float(raw_insert[0]), float(raw_insert[1])]
+            except (TypeError, ValueError):
+                insert_point = None
     payload = {
         "sheet_no": context.get("sheet_number"),
         "sheet_name": context.get("sheet_name"),
@@ -1395,15 +1466,15 @@ def _drawing_entity_payload(row: dict, root: Path, source_pack_id: str, score: f
         "source_file": _dxf_source_file(row),
         "source_path": row.get("dxf_path"),
         "source_kind": row.get("source_kind"),
-        "source_jsonl": str(root / "drawing_entities.jsonl"),
+        "source_jsonl": str(root / "drawing_entities.jsonl") if root else str(row.get("source_jsonl") or "sqlite-index"),
         "source_pack_id": source_pack_id,
-        "source_chunk_id": f"drawing_entity:{entity_key}" if entity_key else None,
+        "source_chunk_id": row.get("source_chunk_id") or (f"drawing_entity:{entity_key}" if entity_key else None),
         "source_entity_key": entity_key,
         "confidence": 0.82 if entity_type in {"TEXT", "MTEXT", "DIMENSION"} else 0.65,
         "score": round(score, 3),
     }
     if entity_type == "DIMENSION":
-        measurement = _to_number(geometry.get("measurement"))
+        measurement = _to_number(geometry.get("measurement") if geometry.get("measurement") is not None else row.get("value_mm"))
         if measurement is not None:
             payload["value_mm"] = measurement
             payload["value"] = measurement
@@ -1506,6 +1577,88 @@ def _dxf_request_roots(
     return roots
 
 
+def _dxf_request_pack_ids(
+    *,
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+) -> list[str]:
+    return _resolve_pack_ids(
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        project_id=project_id,
+        logical_pack="drawing_evidence",
+    )
+
+
+def _dxf_roots_for_pack_ids(active_pack_ids: Sequence[str]) -> list[tuple[Path, str]]:
+    roots: list[tuple[Path, str]] = []
+    seen: set[Path] = set()
+    for active_pack_id in active_pack_ids:
+        derived_dir = _pack_source_derived_dir(str(active_pack_id))
+        if not derived_dir:
+            continue
+        root = derived_dir.parent
+        if root.exists() and root not in seen:
+            roots.append((root, str(active_pack_id)))
+            seen.add(root)
+    return roots
+
+
+def _iter_index_dxf_entity_rows(pack_id: str):
+    conn = None
+    try:
+        conn = connect_index_db()
+        init_index_db(conn)
+        rows = conn.execute(
+            """
+            SELECT id, label, properties_json
+            FROM nodes
+            WHERE pack_id = ?
+              AND (
+                properties_json LIKE '%dxf_entity%'
+                OR properties_json LIKE '%drawing_entities%'
+                OR properties_json LIKE '%"entity_type"%'
+              )
+            """,
+            (pack_id,),
+        ).fetchall()
+    except Exception:
+        return
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    supported = {"LAYER", "LINE", "LWPOLYLINE", "POLYLINE", "TEXT", "MTEXT", "HATCH", "DIMENSION", "INSERT", "ARC", "CIRCLE", "ELLIPSE", "SPLINE"}
+    for row in rows:
+        try:
+            properties = json.loads(row["properties_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(properties, dict):
+            continue
+        entity_type = str(properties.get("entity_type") or "").upper()
+        if entity_type not in supported and properties.get("evidence_type") != "dxf_entity":
+            continue
+        properties.setdefault("source_chunk_id", row["id"])
+        properties.setdefault("text", properties.get("raw_text") or row["label"])
+        yield properties
+
+
+def _iter_dxf_entity_rows_for_request(active_pack_ids: Sequence[str]):
+    roots = _dxf_roots_for_pack_ids(active_pack_ids)
+    raw_pack_ids = {source_pack_id for _root, source_pack_id in roots}
+    for root, source_pack_id in roots:
+        for row in _iter_drawing_entity_rows(root):
+            yield row, root, source_pack_id
+    for active_pack_id in active_pack_ids:
+        if active_pack_id in raw_pack_ids:
+            continue
+        for row in _iter_index_dxf_entity_rows(str(active_pack_id)):
+            yield row, None, str(active_pack_id)
+
+
 def _entity_type_filter(entity_type: Sequence[str] | str | None) -> set[str]:
     return {str(item).upper() for item in _normalize_tool_list(entity_type)}
 
@@ -1562,7 +1715,7 @@ def _project_payload(payload: dict, fields: Sequence | None = None) -> dict:
     return projected
 
 
-def _dxf_payload_for_match(row: dict, root: Path, source_pack_id: str, score: float = 1.0) -> dict:
+def _dxf_payload_for_match(row: dict, root: Path | None, source_pack_id: str, score: float = 1.0) -> dict:
     payload = _drawing_entity_payload(row, root, source_pack_id, score=score)
     geometry = _drawing_entity_geometry(row)
     if "value_mm" not in payload:
@@ -1642,30 +1795,29 @@ def _dxf_entity_search_payload(
     limit: int = 50,
     offset: int = 0,
 ) -> dict:
-    roots = _dxf_request_roots(project_id=project_id, pack_id=pack_id, pack_ids=pack_ids)
+    active_pack_ids = _dxf_request_pack_ids(project_id=project_id, pack_id=pack_id, pack_ids=pack_ids)
     entity_types = _entity_type_filter(entity_type)
     terms = query_terms(query)
     scored_rows: list[tuple[float, dict]] = []
     total = 0
     select_fields = fields or _dxf_entity_default_fields()
-    for root, source_pack_id in roots:
-        for row in _iter_drawing_entity_rows(root):
-            matched, score = _dxf_row_matches_basic_filters(
-                row,
-                query=query,
-                terms=terms,
-                sheet_no=sheet_no,
-                source_file=source_file,
-                entity_types=entity_types,
-                layer=layer,
-            )
-            if not matched:
-                continue
-            payload = _dxf_payload_for_match(row, root, source_pack_id, score=score)
-            if where and not _row_matches_where(payload, where):
-                continue
-            total += 1
-            scored_rows.append((score, _project_payload(payload, select_fields)))
+    for row, root, source_pack_id in _iter_dxf_entity_rows_for_request(active_pack_ids):
+        matched, score = _dxf_row_matches_basic_filters(
+            row,
+            query=query,
+            terms=terms,
+            sheet_no=sheet_no,
+            source_file=source_file,
+            entity_types=entity_types,
+            layer=layer,
+        )
+        if not matched:
+            continue
+        payload = _dxf_payload_for_match(row, root, source_pack_id, score=score)
+        if where and not _row_matches_where(payload, where):
+            continue
+        total += 1
+        scored_rows.append((score, _project_payload(payload, select_fields)))
     if terms:
         scored_rows.sort(key=lambda item: item[0], reverse=True)
     start = max(0, offset)
@@ -1673,7 +1825,7 @@ def _dxf_entity_search_payload(
     return {
         "project_id": project_id or None,
         "pack_id": pack_id or None,
-        "pack_ids": [source_pack_id for _, source_pack_id in roots],
+        "pack_ids": active_pack_ids,
         "query": query,
         "sheet_no": sheet_no or None,
         "source_file": source_file or None,
@@ -1697,28 +1849,27 @@ def _dxf_entity_summary_payload(
     source_file: str = "",
     limit_layers: int = 50,
 ) -> dict:
-    roots = _dxf_request_roots(project_id=project_id, pack_id=pack_id, pack_ids=pack_ids)
+    active_pack_ids = _dxf_request_pack_ids(project_id=project_id, pack_id=pack_id, pack_ids=pack_ids)
     entity_counts: Counter[str] = Counter()
     layer_counts: Counter[str] = Counter()
     file_counts: Counter[str] = Counter()
     sheet_counts: Counter[str] = Counter()
     total = 0
-    for root, _source_pack_id in roots:
-        for row in _iter_drawing_entity_rows(root):
-            context = _drawing_entity_context(row)
-            if sheet_no and str(context.get("sheet_number") or "").casefold() != str(sheet_no).casefold():
-                continue
-            if source_file and not _source_file_matches(row, source_file):
-                continue
-            total += 1
-            entity_counts[str(row.get("entity_type") or row.get("record_type") or "UNKNOWN")] += 1
-            layer_counts[str(row.get("layer") or "<none>")] += 1
-            file_counts[str(_dxf_source_file(row) or "<unknown>")] += 1
-            sheet_counts[str(context.get("sheet_number") or "<none>")] += 1
+    for row, _root, _source_pack_id in _iter_dxf_entity_rows_for_request(active_pack_ids):
+        context = _drawing_entity_context(row)
+        if sheet_no and str(context.get("sheet_number") or "").casefold() != str(sheet_no).casefold():
+            continue
+        if source_file and not _source_file_matches(row, source_file):
+            continue
+        total += 1
+        entity_counts[str(row.get("entity_type") or row.get("record_type") or "UNKNOWN")] += 1
+        layer_counts[str(row.get("layer") or "<none>")] += 1
+        file_counts[str(_dxf_source_file(row) or "<unknown>")] += 1
+        sheet_counts[str(context.get("sheet_number") or "<none>")] += 1
     return {
         "project_id": project_id or None,
         "pack_id": pack_id or None,
-        "pack_ids": [source_pack_id for _, source_pack_id in roots],
+        "pack_ids": active_pack_ids,
         "sheet_no": sheet_no or None,
         "source_file": source_file or None,
         "total_entities": total,
@@ -1738,18 +1889,17 @@ def _dxf_layer_summary_payload(
     source_file: str = "",
     limit: int = 100,
 ) -> dict:
-    roots = _dxf_request_roots(project_id=project_id, pack_id=pack_id, pack_ids=pack_ids)
+    active_pack_ids = _dxf_request_pack_ids(project_id=project_id, pack_id=pack_id, pack_ids=pack_ids)
     layer_entity_counts: dict[str, Counter[str]] = {}
-    for root, _source_pack_id in roots:
-        for row in _iter_drawing_entity_rows(root):
-            context = _drawing_entity_context(row)
-            if sheet_no and str(context.get("sheet_number") or "").casefold() != str(sheet_no).casefold():
-                continue
-            if source_file and not _source_file_matches(row, source_file):
-                continue
-            layer_name = str(row.get("layer") or "<none>")
-            entity_name = str(row.get("entity_type") or row.get("record_type") or "UNKNOWN")
-            layer_entity_counts.setdefault(layer_name, Counter())[entity_name] += 1
+    for row, _root, _source_pack_id in _iter_dxf_entity_rows_for_request(active_pack_ids):
+        context = _drawing_entity_context(row)
+        if sheet_no and str(context.get("sheet_number") or "").casefold() != str(sheet_no).casefold():
+            continue
+        if source_file and not _source_file_matches(row, source_file):
+            continue
+        layer_name = str(row.get("layer") or "<none>")
+        entity_name = str(row.get("entity_type") or row.get("record_type") or "UNKNOWN")
+        layer_entity_counts.setdefault(layer_name, Counter())[entity_name] += 1
     layers = []
     for layer_name, counts in layer_entity_counts.items():
         layers.append({"layer": layer_name, "total": sum(counts.values()), "entity_counts": dict(counts.most_common())})
@@ -1797,27 +1947,26 @@ def _dxf_bbox_query_payload(
     limit: int = 100,
     offset: int = 0,
 ) -> dict:
-    roots = _dxf_request_roots(project_id=project_id, pack_id=pack_id, pack_ids=pack_ids)
+    active_pack_ids = _dxf_request_pack_ids(project_id=project_id, pack_id=pack_id, pack_ids=pack_ids)
     entity_types = _entity_type_filter(entity_type)
     rows: list[dict] = []
     total = 0
     select_fields = fields or _dxf_entity_default_fields()
-    for root, source_pack_id in roots:
-        for row in _iter_drawing_entity_rows(root):
-            matched, score = _dxf_row_matches_basic_filters(
-                row,
-                sheet_no=sheet_no,
-                source_file=source_file,
-                entity_types=entity_types,
-                layer=layer,
-            )
-            if not matched:
-                continue
-            payload = _dxf_payload_for_match(row, root, source_pack_id, score=score)
-            if not _bbox_relation(payload.get("bbox"), bbox, mode):
-                continue
-            total += 1
-            rows.append(_project_payload(payload, select_fields))
+    for row, root, source_pack_id in _iter_dxf_entity_rows_for_request(active_pack_ids):
+        matched, score = _dxf_row_matches_basic_filters(
+            row,
+            sheet_no=sheet_no,
+            source_file=source_file,
+            entity_types=entity_types,
+            layer=layer,
+        )
+        if not matched:
+            continue
+        payload = _dxf_payload_for_match(row, root, source_pack_id, score=score)
+        if not _bbox_relation(payload.get("bbox"), bbox, mode):
+            continue
+        total += 1
+        rows.append(_project_payload(payload, select_fields))
     start = max(0, offset)
     end = start + max(0, limit)
     return {

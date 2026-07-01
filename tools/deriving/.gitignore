@@ -1,0 +1,9 @@
+upstream/
+build/
+derived/
+opencrab_data/
+.venv/
+*.zip
+*.pyc
+__pycache__/
+
