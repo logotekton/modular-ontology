@@ -4,8 +4,10 @@ import argparse
 import fnmatch
 import json
 import re
+import zipfile
 from collections import Counter
 from collections.abc import Sequence
+from pathlib import Path
 
 from .auth import get_company_project_access
 from .config import env
@@ -17,6 +19,7 @@ from .pack_index import (
     get_module as read_module,
     get_node_context as read_node_context,
     get_section_weight_index as read_section_weight_index,
+    find_pack,
     list_assembly_marks as read_assembly_marks,
     list_edges as read_edges,
     list_modules as read_modules,
@@ -26,9 +29,11 @@ from .pack_index import (
     list_projects as read_projects,
     list_sources as read_sources,
     read_pack_document as read_document,
+    query_terms,
     search_pack as search_pack_evidence,
     search_packs as search_pack_catalog,
     search_nodes as search_graph_nodes,
+    score_terms,
 )
 from .qa import answer_pack_question
 
@@ -62,8 +67,21 @@ TOOL_ALIASES = {
     "list_sources": "mo_source_list",
     "list_pack_documents": "mo_document_list",
     "read_pack_document": "mo_document_read",
+    "read_chunk_by_id": "mo_chunk_read",
     "search_pack": "mo_evidence_search",
     "search_documents": "mo_evidence_search",
+    "query_quantity_facts": "mo_quantity_facts_query",
+    "search_drawing_text": "mo_drawing_text_search",
+    "extract_room_area_tags": "mo_room_area_tag_extract",
+    "extract_dimensions_from_view": "mo_dimensions_extract",
+    "calculate_area_from_dimensions": "mo_area_from_dimensions_calculate",
+    "extract_schedule_table": "mo_schedule_table_extract",
+    "dxf_entity_summary": "mo_dxf_entity_summary",
+    "dxf_entity_search": "mo_dxf_entity_search",
+    "dxf_text_search": "mo_dxf_text_search",
+    "dxf_dimension_search": "mo_dxf_dimension_search",
+    "dxf_layer_summary": "mo_dxf_layer_summary",
+    "dxf_bbox_query": "mo_dxf_bbox_query",
     "query": "mo_question_answer",
     "ask_pack_question": "mo_question_answer",
     "get_graph": "mo_graph_get",
@@ -94,8 +112,25 @@ TOOL_MANIFEST = [
     {"name": "mo_source_list", "legacy": ["list_sources"], "domain": "source", "action": "list"},
     {"name": "mo_document_list", "legacy": ["list_pack_documents"], "domain": "document", "action": "list"},
     {"name": "mo_document_read", "legacy": ["read_pack_document"], "domain": "document", "action": "read"},
+    {"name": "mo_chunk_read", "legacy": ["read_chunk_by_id"], "domain": "chunk", "action": "read"},
     {"name": "mo_evidence_search", "legacy": ["search_pack", "search_documents"], "domain": "evidence", "action": "search"},
     {"name": "mo_evidence_trace", "legacy": [], "domain": "evidence", "action": "trace"},
+    {"name": "mo_drawing_text_search", "legacy": ["search_drawing_text"], "domain": "drawing_text", "action": "search"},
+    {"name": "mo_room_area_tag_extract", "legacy": ["extract_room_area_tags"], "domain": "room_area_tag", "action": "extract"},
+    {"name": "mo_dimensions_extract", "legacy": ["extract_dimensions_from_view"], "domain": "dimension", "action": "extract"},
+    {
+        "name": "mo_area_from_dimensions_calculate",
+        "legacy": ["calculate_area_from_dimensions"],
+        "domain": "measurement",
+        "action": "calculate_area_from_dimensions",
+    },
+    {"name": "mo_schedule_table_extract", "legacy": ["extract_schedule_table"], "domain": "schedule_table", "action": "extract"},
+    {"name": "mo_dxf_entity_summary", "legacy": ["dxf_entity_summary"], "domain": "dxf_entity", "action": "summary"},
+    {"name": "mo_dxf_entity_search", "legacy": ["dxf_entity_search"], "domain": "dxf_entity", "action": "search"},
+    {"name": "mo_dxf_text_search", "legacy": ["dxf_text_search"], "domain": "dxf_text", "action": "search"},
+    {"name": "mo_dxf_dimension_search", "legacy": ["dxf_dimension_search"], "domain": "dxf_dimension", "action": "search"},
+    {"name": "mo_dxf_layer_summary", "legacy": ["dxf_layer_summary"], "domain": "dxf_layer", "action": "summary"},
+    {"name": "mo_dxf_bbox_query", "legacy": ["dxf_bbox_query"], "domain": "dxf_entity", "action": "bbox_query"},
     {"name": "mo_question_answer", "legacy": ["query", "ask_pack_question"], "domain": "question", "action": "answer"},
     {"name": "mo_graph_get", "legacy": ["get_graph"], "domain": "graph", "action": "get"},
     {"name": "mo_node_type_list", "legacy": [], "domain": "node_type", "action": "list"},
@@ -111,6 +146,7 @@ TOOL_MANIFEST = [
     {"name": "mo_module_list", "legacy": ["list_modules"], "domain": "module", "action": "list"},
     {"name": "mo_list_project_modules", "legacy": [], "domain": "module", "action": "project_list"},
     {"name": "mo_list_module_elements", "legacy": [], "domain": "module", "action": "element_list"},
+    {"name": "mo_quantity_facts_query", "legacy": ["query_quantity_facts"], "domain": "quantity_fact", "action": "query"},
     {"name": "mo_query_quantity_evidence", "legacy": [], "domain": "quantity", "action": "evidence_query"},
     {"name": "mo_aggregate_quantity_by_module", "legacy": [], "domain": "quantity", "action": "aggregate_by_module"},
     {"name": "mo_join_by_property", "legacy": [], "domain": "node", "action": "join_by_property"},
@@ -128,6 +164,8 @@ TOOL_MANIFEST = [
 
 TOOL_NAMES = [tool["name"] for tool in TOOL_MANIFEST]
 LEGACY_TOOL_NAMES = list(TOOL_ALIASES)
+_CLOUD_CHUNK_ROW_CACHE: dict[str, dict[str, object]] = {}
+_DRAWING_ENTITY_SEARCH_CACHE: dict[str, dict[str, object]] = {}
 
 
 def _split_csv(value: str) -> list[str]:
@@ -577,6 +615,10 @@ def _match_one(value: object, operator: str, expected: object, *, exists: bool) 
         return not any(_loose_equal(value, item) for item in _normalize_tool_list(expected if isinstance(expected, Sequence) and not isinstance(expected, str) else [expected]))
     if operator == "contains":
         return str(expected).casefold() in str(value).casefold()
+    if operator == "startswith":
+        return str(value).casefold().startswith(str(expected).casefold())
+    if operator == "endswith":
+        return str(value).casefold().endswith(str(expected).casefold())
     if operator == "regex":
         try:
             return bool(re.search(str(expected), str(value)))
@@ -844,6 +886,1435 @@ def _module_candidates_from_nodes(
     return modules
 
 
+_WHERE_OPERATORS = {
+    "eq",
+    "ne",
+    "contains",
+    "startswith",
+    "endswith",
+    "in",
+    "not_in",
+    "regex",
+    "gt",
+    "gte",
+    "lt",
+    "lte",
+    "exists",
+    "wildcard",
+}
+_MEASURE_DISPLAY_RE = re.compile(r"(-?\d[\d,]*(?:\.\d+)?)\s*([^\d\s]+)?")
+_AREA_TAG_RE = re.compile(
+    r"(?P<label>[\w가-힣\s()/_\-.]{1,60}?)\s*(?P<area>\d+(?:\.\d+)?)\s*(?P<unit>m2|㎡|m\^2|제곱미터|평방미터)",
+    flags=re.I,
+)
+_DIMENSION_VALUE_RE = re.compile(r"(?<![\d.])(\d{2,5}(?:\.\d+)?)(?!\s*(?:m2|㎡|m\^2|%))", flags=re.I)
+
+
+def _read_pack_json_member(pack_id: str, path: str) -> dict:
+    try:
+        pack = find_pack(pack_id)
+    except FileNotFoundError:
+        return {}
+    with zipfile.ZipFile(pack.path) as zf:
+        if path not in zf.namelist():
+            return {}
+        try:
+            return json.loads(zf.read(path).decode("utf-8-sig", errors="replace"))
+        except Exception:
+            return {}
+
+
+def _pack_logical_name(pack_id: str) -> str:
+    pack_json = _read_pack_json_member(pack_id, "pack.json")
+    if pack_json.get("logical_pack"):
+        return str(pack_json.get("logical_pack"))
+    manifest = _read_pack_json_member(pack_id, "manifest.json")
+    source = manifest.get("source") if isinstance(manifest.get("source"), dict) else {}
+    if source.get("derived_file"):
+        return str(source.get("derived_file")).removesuffix(".jsonl")
+    return ""
+
+
+def _iter_pack_jsonl_member(pack_id: str, path: str):
+    pack = find_pack(pack_id)
+    with zipfile.ZipFile(pack.path) as zf:
+        if path not in zf.namelist():
+            return
+        with zf.open(path) as stream:
+            for raw in stream:
+                line = raw.decode("utf-8-sig", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict):
+                    yield value
+
+
+def _resolve_pack_ids(
+    *,
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    project_id: str = "",
+    logical_pack: str = "",
+    include_sibling_shards: bool = True,
+) -> list[str]:
+    projects_by_id = _visible_project_by_id()
+    packs_by_id = _visible_pack_by_id()
+    candidates: list[str] = []
+    if pack_ids:
+        candidates = [str(item) for item in _normalize_tool_list(pack_ids)]
+    elif pack_id:
+        candidates = [str(pack_id)]
+        if include_sibling_shards:
+            logical = logical_pack or _pack_logical_name(str(pack_id))
+            if logical:
+                if project_id and project_id in projects_by_id:
+                    pool = [candidate for candidate in _project_pack_ids(projects_by_id[project_id]) if candidate in packs_by_id]
+                else:
+                    pool = list(packs_by_id)
+                candidates = [candidate for candidate in pool if _pack_logical_name(candidate) == logical]
+    elif project_id:
+        if project_id not in projects_by_id:
+            return []
+        candidates = [candidate for candidate in _project_pack_ids(projects_by_id[project_id]) if candidate in packs_by_id]
+    else:
+        candidates = list(packs_by_id)
+
+    resolved: list[str] = []
+    for candidate in candidates:
+        if candidate not in packs_by_id or not _pack_is_visible(candidate):
+            continue
+        if logical_pack and _pack_logical_name(candidate) != logical_pack:
+            continue
+        if candidate not in resolved:
+            resolved.append(candidate)
+    return resolved
+
+
+def _chunk_row_from_chunk(pack_id: str, chunk: dict) -> dict:
+    metadata = chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else {}
+    join_keys = metadata.get("join_keys") if isinstance(metadata.get("join_keys"), dict) else {}
+    compact_row = metadata.get("compact_row") if isinstance(metadata.get("compact_row"), dict) else {}
+    source_refs = metadata.get("source_refs") if isinstance(metadata.get("source_refs"), list) else []
+    row: dict[str, object] = {
+        "pack_id": pack_id,
+        "chunk_id": chunk.get("chunk_id"),
+        "document_id": chunk.get("document_id"),
+        "text": chunk.get("text"),
+        "metadata": metadata,
+        "source_refs": source_refs,
+        "derived_file": metadata.get("derived_file"),
+        "row_id": metadata.get("row_id"),
+        "category": metadata.get("category"),
+        "compact_row": compact_row,
+    }
+    row.update(join_keys)
+    if "parameter" not in row and row.get("parameter_name") is not None:
+        row["parameter"] = row.get("parameter_name")
+    if "display" not in row and row.get("parameter_display") is not None:
+        row["display"] = row.get("parameter_display")
+    value, unit = _measurement_value_unit(row)
+    row.setdefault("value", value)
+    row.setdefault("unit", unit)
+    row.setdefault("source_pack_id", pack_id)
+    row.setdefault("source_chunk_id", chunk.get("chunk_id"))
+    return row
+
+
+def _measurement_value_unit(row: dict) -> tuple[float | None, str | None]:
+    area = _to_number(row.get("area_m2"))
+    if area is not None:
+        return area, "m2"
+    volume = _to_number(row.get("volume_m3"))
+    if volume is not None:
+        return volume, "m3"
+    length = _to_number(row.get("length_m"))
+    if length is not None:
+        return length, "m"
+    display = row.get("parameter_display") or row.get("display")
+    if display is not None:
+        match = _MEASURE_DISPLAY_RE.search(str(display).replace(",", ""))
+        if match:
+            try:
+                return float(match.group(1)), match.group(2)
+            except ValueError:
+                pass
+    return None, None
+
+
+def _row_get(row: dict, field: str) -> object:
+    aliases = {
+        "parameter": "parameter_name",
+        "display": "parameter_display",
+        "sheet_no": "sheet_number",
+        "sheet": "sheet_number",
+        "text_type": "evidence_type",
+        "source_chunk_id": "chunk_id",
+        "source_pack_id": "pack_id",
+    }
+    candidates = [field]
+    if field == "category":
+        candidates.extend(["quantity_category", "category_name", "element_category", "evidence_type"])
+    if field in aliases:
+        candidates.append(aliases[field])
+    for candidate in candidates:
+        current: object = row
+        found = True
+        for part in str(candidate).split("."):
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+            else:
+                found = False
+                break
+        if found:
+            return current
+    compact_row = row.get("compact_row")
+    if isinstance(compact_row, dict) and field in compact_row:
+        return compact_row[field]
+    return _MISSING
+
+
+def _split_where_key(field: str) -> tuple[str, str | None]:
+    if "__" not in field:
+        return field, None
+    base, operator = field.rsplit("__", 1)
+    if operator in _WHERE_OPERATORS:
+        return base, operator
+    return field, None
+
+
+def _row_matches_where(row: dict, where: dict | None) -> bool:
+    for raw_field, condition in _normalize_tool_dict(where).items():
+        field, suffix_operator = _split_where_key(str(raw_field))
+        value = _row_get(row, field)
+        exists = value is not _MISSING
+        if suffix_operator:
+            if not _match_one(value, suffix_operator, condition, exists=exists):
+                return False
+            continue
+        if isinstance(condition, dict):
+            if not all(_match_one(value, str(operator), expected, exists=exists) for operator, expected in condition.items()):
+                return False
+        elif not _match_one(value, "eq", condition, exists=exists):
+            return False
+    return True
+
+
+def _project_row(row: dict, fields: Sequence | None = None) -> dict:
+    requested = _normalize_tool_list(fields)
+    if not requested:
+        requested = [
+            "pack_id",
+            "chunk_id",
+            "text",
+            "workset_name",
+            "element_id",
+            "element_name",
+            "family_name",
+            "family_and_type",
+            "type_name",
+            "parameter",
+            "display",
+            "value",
+            "unit",
+            "area_m2",
+            "volume_m3",
+            "sheet_number",
+            "view_name",
+            "evidence_type",
+            "source_refs",
+        ]
+    projected = {}
+    for field in requested:
+        key = str(field)
+        value = _row_get(row, key)
+        if value is not _MISSING:
+            projected[key.split(".", 1)[-1]] = value
+    return projected
+
+
+def _sort_chunk_rows(rows: list[dict], order_by: Sequence | None) -> list[dict]:
+    specs = _normalize_tool_list(order_by)
+    if not specs:
+        return rows
+    ordered = list(rows)
+    for raw_spec in reversed(specs):
+        spec = {"field": raw_spec} if isinstance(raw_spec, str) else raw_spec if isinstance(raw_spec, dict) else {}
+        field = str(spec.get("field") or "")
+        if not field:
+            continue
+        reverse = str(spec.get("direction", "asc")).lower() == "desc"
+        natural = bool(spec.get("natural", False))
+        ordered.sort(
+            key=lambda row: _natural_key(_row_get(row, field)) if natural else _sort_value_key(_row_get(row, field)),
+            reverse=reverse,
+        )
+    return ordered
+
+
+def _iter_cloud_chunk_rows(pack_id: str):
+    try:
+        pack = find_pack(pack_id)
+        path = Path(pack.path)
+        stat = path.stat()
+    except (FileNotFoundError, OSError):
+        for chunk in _iter_pack_jsonl_member(pack_id, "cloud/chunks.jsonl"):
+            yield _chunk_row_from_chunk(pack_id, chunk)
+        return
+    cached = _CLOUD_CHUNK_ROW_CACHE.get(pack_id)
+    if (
+        cached
+        and cached.get("mtime_ns") == stat.st_mtime_ns
+        and cached.get("size") == stat.st_size
+        and isinstance(cached.get("rows"), list)
+    ):
+        yield from cached["rows"]
+        return
+    rows = [_chunk_row_from_chunk(pack_id, chunk) for chunk in _iter_pack_jsonl_member(pack_id, "cloud/chunks.jsonl")]
+    _CLOUD_CHUNK_ROW_CACHE[pack_id] = {
+        "mtime_ns": stat.st_mtime_ns,
+        "size": stat.st_size,
+        "rows": rows,
+    }
+    yield from rows
+
+
+def _pack_source_derived_dir(pack_id: str) -> Path | None:
+    candidates = [_read_pack_json_member(pack_id, "manifest.json"), _read_pack_json_member(pack_id, "pack.json")]
+    for candidate in candidates:
+        source = candidate.get("source") if isinstance(candidate.get("source"), dict) else {}
+        cloud_pack = candidate.get("cloud_pack") if isinstance(candidate.get("cloud_pack"), dict) else {}
+        if not source and isinstance(cloud_pack.get("source"), dict):
+            source = cloud_pack["source"]
+        derived_dir = source.get("derived_dir")
+        if not derived_dir:
+            continue
+        path = Path(str(derived_dir))
+        if path.exists():
+            return path
+    return None
+
+
+def _export_roots_for_packs(pack_ids: Sequence[str]) -> list[Path]:
+    roots: list[Path] = []
+    for pack_id in pack_ids:
+        derived_dir = _pack_source_derived_dir(str(pack_id))
+        if not derived_dir:
+            continue
+        root = derived_dir.parent
+        if root.exists() and root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _iter_export_jsonl(root: Path, filename: str):
+    path = root / filename
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8-sig", errors="replace") as stream:
+        for raw in stream:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                yield value
+
+
+def _iter_drawing_entity_search_rows(root: Path):
+    path = root / "drawing_entities.jsonl"
+    if not path.exists():
+        return
+    try:
+        stat = path.stat()
+    except OSError:
+        return
+    cache_key = str(path)
+    cached = _DRAWING_ENTITY_SEARCH_CACHE.get(cache_key)
+    if (
+        cached
+        and cached.get("mtime_ns") == stat.st_mtime_ns
+        and cached.get("size") == stat.st_size
+        and isinstance(cached.get("rows"), list)
+    ):
+        yield from cached["rows"]
+        return
+    searchable_types = {"TEXT", "MTEXT", "DIMENSION", "LAYER"}
+    rows: list[dict] = []
+    for row in _iter_export_jsonl(root, "drawing_entities.jsonl"):
+        entity_type = str(row.get("entity_type") or row.get("record_type") or "").upper()
+        if entity_type in searchable_types:
+            rows.append(row)
+    _DRAWING_ENTITY_SEARCH_CACHE[cache_key] = {
+        "mtime_ns": stat.st_mtime_ns,
+        "size": stat.st_size,
+        "rows": rows,
+    }
+    yield from rows
+
+
+def _iter_drawing_entity_rows(root: Path):
+    yield from _iter_export_jsonl(root, "drawing_entities.jsonl")
+
+
+def _drawing_entity_context(row: dict) -> dict:
+    return row.get("source_context") if isinstance(row.get("source_context"), dict) else {}
+
+
+def _drawing_entity_geometry(row: dict) -> dict:
+    return row.get("geometry") if isinstance(row.get("geometry"), dict) else {}
+
+
+def _dxf_source_file(row: dict) -> str | None:
+    value = row.get("dxf_file_name")
+    if value:
+        return str(value)
+    path = row.get("dxf_path")
+    if path:
+        return Path(str(path)).name
+    return None
+
+
+def _drawing_entity_text(row: dict) -> str:
+    geometry = _drawing_entity_geometry(row)
+    entity_type = str(row.get("entity_type") or "")
+    if entity_type == "DIMENSION":
+        measurement = _to_number(geometry.get("measurement"))
+        if measurement is not None:
+            return f"{measurement:g}"
+    for field in ("decoded_text", "plain_text", "text", "measurement_text"):
+        value = geometry.get(field)
+        if value is not None:
+            return str(value)
+    for field in ("text", "plain_text", "mtext", "dimension_text"):
+        value = row.get(field)
+        if value is not None:
+            return str(value)
+    return ""
+
+
+def _point_xy(point: object) -> list[float] | None:
+    if not isinstance(point, dict):
+        return None
+    try:
+        return [float(point["x"]), float(point["y"])]
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _bbox_from_entity_row(row: dict) -> list[float] | None:
+    bbox = row.get("bbox") or row.get("bounding_box")
+    if isinstance(bbox, dict):
+        minimum = bbox.get("min") if isinstance(bbox.get("min"), dict) else {}
+        maximum = bbox.get("max") if isinstance(bbox.get("max"), dict) else {}
+        try:
+            return [float(minimum["x"]), float(minimum["y"]), float(maximum["x"]), float(maximum["y"])]
+        except (KeyError, TypeError, ValueError):
+            pass
+    geometry = _drawing_entity_geometry(row)
+    for key in ("insert_point", "text_middle_point", "definition_point"):
+        point = _point_xy(geometry.get(key))
+        if point:
+            return [point[0], point[1], point[0], point[1]]
+    return None
+
+
+def _drawing_entity_line(row: dict) -> dict | None:
+    geometry = _drawing_entity_geometry(row)
+    start = _point_xy(geometry.get("first_point") or geometry.get("start_point") or geometry.get("start"))
+    end = _point_xy(geometry.get("second_point") or geometry.get("end_point") or geometry.get("end"))
+    if start and end:
+        return {"start": start, "end": end}
+    return None
+
+
+def _drawing_entity_orientation(row: dict) -> str | None:
+    line = _drawing_entity_line(row)
+    if line:
+        dx = abs(line["end"][0] - line["start"][0])
+        dy = abs(line["end"][1] - line["start"][1])
+        if dx >= dy * 1.5:
+            return "horizontal"
+        if dy >= dx * 1.5:
+            return "vertical"
+    return _bbox_orientation(_bbox_from_entity_row(row))
+
+
+def _classify_drawing_entity_type(row: dict) -> str:
+    entity_type = str(row.get("entity_type") or "").upper()
+    text = _drawing_entity_text(row)
+    if entity_type == "DIMENSION":
+        return "dimension"
+    if entity_type in {"TEXT", "MTEXT"}:
+        if _AREA_TAG_RE.search(text):
+            return "room_tag"
+        return "annotation"
+    if entity_type == "INSERT":
+        return "symbol"
+    if entity_type == "HATCH":
+        return "hatch"
+    if entity_type in {"LINE", "LWPOLYLINE", "POLYLINE", "ARC", "CIRCLE", "ELLIPSE", "SPLINE"}:
+        return "graphic"
+    if entity_type == "LAYER":
+        return "layer"
+    return "drawing_entity"
+
+
+def _drawing_entity_payload(row: dict, root: Path, source_pack_id: str, score: float = 1.0) -> dict:
+    context = _drawing_entity_context(row)
+    entity_key = row.get("entity_key") or row.get("record_key")
+    entity_type = str(row.get("entity_type") or row.get("record_type") or "")
+    geometry = _drawing_entity_geometry(row)
+    line = _drawing_entity_line(row)
+    insert_point = _point_xy(geometry.get("insert_point") or geometry.get("insertion_point"))
+    payload = {
+        "sheet_no": context.get("sheet_number"),
+        "sheet_name": context.get("sheet_name"),
+        "view_name": context.get("view_name"),
+        "text": _drawing_entity_text(row),
+        "text_type": _classify_drawing_entity_type(row),
+        "evidence_type": entity_type,
+        "entity_type": entity_type,
+        "layer": row.get("layer"),
+        "bbox": _bbox_from_entity_row(row),
+        "line": line,
+        "start_point": line.get("start") if line else None,
+        "end_point": line.get("end") if line else None,
+        "insert": insert_point,
+        "insert_point": insert_point,
+        "handle": row.get("handle"),
+        "space": row.get("space"),
+        "block_name": row.get("block_name"),
+        "block_path": row.get("block_path"),
+        "source_file": _dxf_source_file(row),
+        "source_path": row.get("dxf_path"),
+        "source_kind": row.get("source_kind"),
+        "source_jsonl": str(root / "drawing_entities.jsonl"),
+        "source_pack_id": source_pack_id,
+        "source_chunk_id": f"drawing_entity:{entity_key}" if entity_key else None,
+        "source_entity_key": entity_key,
+        "confidence": 0.82 if entity_type in {"TEXT", "MTEXT", "DIMENSION"} else 0.65,
+        "score": round(score, 3),
+    }
+    if entity_type == "DIMENSION":
+        measurement = _to_number(geometry.get("measurement"))
+        if measurement is not None:
+            payload["value_mm"] = measurement
+            payload["value"] = measurement
+            payload["unit"] = "mm"
+            payload["orientation"] = _drawing_entity_orientation(row) or "unknown"
+    return payload
+
+
+def _read_drawing_entity_payload(pack_id: str, chunk_id: str) -> dict | None:
+    requested = str(chunk_id)
+    requested_key = requested.removeprefix("drawing_entity:")
+    roots = _export_roots_for_packs([pack_id])
+    for root in roots:
+        for row in _iter_drawing_entity_search_rows(root):
+            entity_key = str(row.get("entity_key") or row.get("record_key") or "")
+            if not entity_key or entity_key != requested_key:
+                continue
+            payload = _drawing_entity_payload(row, root, pack_id)
+            return {
+                "pack_id": pack_id,
+                "chunk_id": requested,
+                "text": payload.get("text"),
+                "metadata": {
+                    "source_file": "drawing_entities.jsonl",
+                    "entity_key": entity_key,
+                    "entity_type": row.get("entity_type"),
+                    "layer": row.get("layer"),
+                    "source_context": _drawing_entity_context(row),
+                    "bbox": payload.get("bbox"),
+                    "line": payload.get("line"),
+                    "geometry": _drawing_entity_geometry(row),
+                },
+                "source_refs": [],
+            }
+        for row in _iter_drawing_entity_rows(root):
+            entity_key = str(row.get("entity_key") or row.get("record_key") or "")
+            if not entity_key or entity_key != requested_key:
+                continue
+            payload = _drawing_entity_payload(row, root, pack_id)
+            return {
+                "pack_id": pack_id,
+                "chunk_id": requested,
+                "text": payload.get("text"),
+                "metadata": {
+                    "source_file": "drawing_entities.jsonl",
+                    "dxf_file_name": payload.get("source_file"),
+                    "entity_key": entity_key,
+                    "entity_type": row.get("entity_type"),
+                    "layer": row.get("layer"),
+                    "source_context": _drawing_entity_context(row),
+                    "bbox": payload.get("bbox"),
+                    "line": payload.get("line"),
+                    "geometry": _drawing_entity_geometry(row),
+                },
+                "source_refs": [],
+            }
+    return None
+
+
+def _read_chunk_payload(pack_id: str, chunk_id: str) -> dict:
+    for chunk in _iter_pack_jsonl_member(pack_id, "cloud/chunks.jsonl"):
+        if str(chunk.get("chunk_id")) == str(chunk_id):
+            metadata = chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else {}
+            return {
+                "pack_id": pack_id,
+                "chunk_id": chunk.get("chunk_id"),
+                "document_id": chunk.get("document_id"),
+                "text": chunk.get("text"),
+                "metadata": metadata,
+                "source_refs": metadata.get("source_refs", []),
+            }
+    entity_payload = _read_drawing_entity_payload(pack_id, chunk_id)
+    if entity_payload:
+        return entity_payload
+    return {"error": "not_found", "pack_id": pack_id, "chunk_id": chunk_id}
+
+
+def _dxf_request_roots(
+    *,
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+) -> list[tuple[Path, str]]:
+    active_pack_ids = _resolve_pack_ids(
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        project_id=project_id,
+        logical_pack="drawing_evidence",
+    )
+    roots: list[tuple[Path, str]] = []
+    seen: set[Path] = set()
+    for active_pack_id in active_pack_ids:
+        derived_dir = _pack_source_derived_dir(active_pack_id)
+        if not derived_dir:
+            continue
+        root = derived_dir.parent
+        if root.exists() and root not in seen:
+            roots.append((root, active_pack_id))
+            seen.add(root)
+    return roots
+
+
+def _entity_type_filter(entity_type: Sequence[str] | str | None) -> set[str]:
+    return {str(item).upper() for item in _normalize_tool_list(entity_type)}
+
+
+def _source_file_matches(row: dict, expected: str) -> bool:
+    if not expected:
+        return True
+    source_file = str(_dxf_source_file(row) or "").casefold()
+    source_path = str(row.get("dxf_path") or "").casefold()
+    needle = str(expected).casefold()
+    return needle in source_file or needle in source_path
+
+
+def _dxf_entity_default_fields() -> list[str]:
+    return [
+        "source_file",
+        "sheet_no",
+        "sheet_name",
+        "view_name",
+        "entity_type",
+        "layer",
+        "text",
+        "value_mm",
+        "unit",
+        "bbox",
+        "start_point",
+        "end_point",
+        "insert",
+        "handle",
+        "source_chunk_id",
+        "source_entity_key",
+    ]
+
+
+def _project_payload(payload: dict, fields: Sequence | None = None) -> dict:
+    requested = _normalize_tool_list(fields)
+    if not requested:
+        return {key: value for key, value in payload.items() if value is not None}
+    aliases = {
+        "sheet_number": "sheet_no",
+        "file": "source_file",
+        "dxf_file_name": "source_file",
+        "insert_point": "insert",
+        "insertion_point": "insert",
+        "value": "value_mm",
+        "measurement": "value_mm",
+    }
+    projected = {}
+    for raw_field in requested:
+        field = str(raw_field)
+        key = aliases.get(field, field)
+        if key in payload and payload[key] is not None:
+            projected[field] = payload[key]
+    return projected
+
+
+def _dxf_payload_for_match(row: dict, root: Path, source_pack_id: str, score: float = 1.0) -> dict:
+    payload = _drawing_entity_payload(row, root, source_pack_id, score=score)
+    geometry = _drawing_entity_geometry(row)
+    if "value_mm" not in payload:
+        measurement = _to_number(geometry.get("measurement"))
+        if measurement is not None:
+            payload["value_mm"] = measurement
+            payload["value"] = measurement
+            payload["unit"] = "mm"
+    payload["record_type"] = row.get("record_type")
+    payload["geometry_kind"] = geometry.get("kind")
+    return payload
+
+
+def _dxf_row_matches_basic_filters(
+    row: dict,
+    *,
+    query: str = "",
+    terms: list[str] | None = None,
+    sheet_no: str = "",
+    source_file: str = "",
+    entity_types: set[str] | None = None,
+    layer: str = "",
+) -> tuple[bool, float]:
+    context = _drawing_entity_context(row)
+    entity_type = str(row.get("entity_type") or row.get("record_type") or "").upper()
+    if entity_types and entity_type not in entity_types:
+        return False, 0.0
+    if sheet_no and str(context.get("sheet_number") or "").casefold() != str(sheet_no).casefold():
+        return False, 0.0
+    if source_file and not _source_file_matches(row, source_file):
+        return False, 0.0
+    if layer and str(layer).casefold() not in str(row.get("layer") or "").casefold():
+        return False, 0.0
+    active_terms = terms if terms is not None else query_terms(query)
+    if not active_terms:
+        return True, 1.0
+    text = _drawing_entity_text(row)
+    haystack = (
+        text
+        + " "
+        + str(_dxf_source_file(row) or "")
+        + " "
+        + str(context.get("sheet_number") or "")
+        + " "
+        + str(context.get("sheet_name") or "")
+        + " "
+        + str(context.get("view_name") or "")
+        + " "
+        + str(row.get("layer") or "")
+        + " "
+        + entity_type
+    ).casefold()
+    score = score_terms(haystack, active_terms)
+    if score <= 0:
+        return False, 0.0
+    query_lower = str(query).casefold()
+    text_lower = text.casefold()
+    if query_lower and text_lower == query_lower:
+        score += 10.0
+    elif query_lower and query_lower in text_lower:
+        score += 5.0
+    return True, score
+
+
+def _dxf_entity_search_payload(
+    *,
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    query: str = "",
+    sheet_no: str = "",
+    source_file: str = "",
+    entity_type: Sequence[str] | str | None = None,
+    layer: str = "",
+    where: dict | None = None,
+    fields: Sequence[str] | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    roots = _dxf_request_roots(project_id=project_id, pack_id=pack_id, pack_ids=pack_ids)
+    entity_types = _entity_type_filter(entity_type)
+    terms = query_terms(query)
+    scored_rows: list[tuple[float, dict]] = []
+    total = 0
+    select_fields = fields or _dxf_entity_default_fields()
+    for root, source_pack_id in roots:
+        for row in _iter_drawing_entity_rows(root):
+            matched, score = _dxf_row_matches_basic_filters(
+                row,
+                query=query,
+                terms=terms,
+                sheet_no=sheet_no,
+                source_file=source_file,
+                entity_types=entity_types,
+                layer=layer,
+            )
+            if not matched:
+                continue
+            payload = _dxf_payload_for_match(row, root, source_pack_id, score=score)
+            if where and not _row_matches_where(payload, where):
+                continue
+            total += 1
+            scored_rows.append((score, _project_payload(payload, select_fields)))
+    if terms:
+        scored_rows.sort(key=lambda item: item[0], reverse=True)
+    start = max(0, offset)
+    end = start + max(0, limit)
+    return {
+        "project_id": project_id or None,
+        "pack_id": pack_id or None,
+        "pack_ids": [source_pack_id for _, source_pack_id in roots],
+        "query": query,
+        "sheet_no": sheet_no or None,
+        "source_file": source_file or None,
+        "entity_type": sorted(entity_types) if entity_types else None,
+        "layer": layer or None,
+        "where": _normalize_tool_dict(where),
+        "count": total,
+        "offset": start,
+        "limit": max(0, limit),
+        "rows": [row for _, row in scored_rows[start:end]],
+        "truncated": total > end,
+    }
+
+
+def _dxf_entity_summary_payload(
+    *,
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    sheet_no: str = "",
+    source_file: str = "",
+    limit_layers: int = 50,
+) -> dict:
+    roots = _dxf_request_roots(project_id=project_id, pack_id=pack_id, pack_ids=pack_ids)
+    entity_counts: Counter[str] = Counter()
+    layer_counts: Counter[str] = Counter()
+    file_counts: Counter[str] = Counter()
+    sheet_counts: Counter[str] = Counter()
+    total = 0
+    for root, _source_pack_id in roots:
+        for row in _iter_drawing_entity_rows(root):
+            context = _drawing_entity_context(row)
+            if sheet_no and str(context.get("sheet_number") or "").casefold() != str(sheet_no).casefold():
+                continue
+            if source_file and not _source_file_matches(row, source_file):
+                continue
+            total += 1
+            entity_counts[str(row.get("entity_type") or row.get("record_type") or "UNKNOWN")] += 1
+            layer_counts[str(row.get("layer") or "<none>")] += 1
+            file_counts[str(_dxf_source_file(row) or "<unknown>")] += 1
+            sheet_counts[str(context.get("sheet_number") or "<none>")] += 1
+    return {
+        "project_id": project_id or None,
+        "pack_id": pack_id or None,
+        "pack_ids": [source_pack_id for _, source_pack_id in roots],
+        "sheet_no": sheet_no or None,
+        "source_file": source_file or None,
+        "total_entities": total,
+        "entity_counts": dict(entity_counts.most_common()),
+        "layers": [{"layer": key, "count": value} for key, value in layer_counts.most_common(max(0, limit_layers))],
+        "source_files": [{"source_file": key, "count": value} for key, value in file_counts.most_common(20)],
+        "sheets": [{"sheet_no": key, "count": value} for key, value in sheet_counts.most_common(20)],
+    }
+
+
+def _dxf_layer_summary_payload(
+    *,
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    sheet_no: str = "",
+    source_file: str = "",
+    limit: int = 100,
+) -> dict:
+    roots = _dxf_request_roots(project_id=project_id, pack_id=pack_id, pack_ids=pack_ids)
+    layer_entity_counts: dict[str, Counter[str]] = {}
+    for root, _source_pack_id in roots:
+        for row in _iter_drawing_entity_rows(root):
+            context = _drawing_entity_context(row)
+            if sheet_no and str(context.get("sheet_number") or "").casefold() != str(sheet_no).casefold():
+                continue
+            if source_file and not _source_file_matches(row, source_file):
+                continue
+            layer_name = str(row.get("layer") or "<none>")
+            entity_name = str(row.get("entity_type") or row.get("record_type") or "UNKNOWN")
+            layer_entity_counts.setdefault(layer_name, Counter())[entity_name] += 1
+    layers = []
+    for layer_name, counts in layer_entity_counts.items():
+        layers.append({"layer": layer_name, "total": sum(counts.values()), "entity_counts": dict(counts.most_common())})
+    layers.sort(key=lambda item: int(item["total"]), reverse=True)
+    max_limit = max(0, limit)
+    return {
+        "project_id": project_id or None,
+        "pack_id": pack_id or None,
+        "sheet_no": sheet_no or None,
+        "source_file": source_file or None,
+        "layer_count": len(layers),
+        "layers": layers[:max_limit],
+        "truncated": len(layers) > max_limit,
+    }
+
+
+def _bbox_relation(candidate: list[float] | None, target: Sequence[float], mode: str) -> bool:
+    if not candidate or len(candidate) < 4 or len(target) < 4:
+        return False
+    ax1, ay1, ax2, ay2 = [float(value) for value in candidate[:4]]
+    bx1, by1, bx2, by2 = [float(value) for value in target[:4]]
+    aminx, amaxx = sorted([ax1, ax2])
+    aminy, amaxy = sorted([ay1, ay2])
+    bminx, bmaxx = sorted([bx1, bx2])
+    bminy, bmaxy = sorted([by1, by2])
+    if mode == "within":
+        return aminx >= bminx and amaxx <= bmaxx and aminy >= bminy and amaxy <= bmaxy
+    if mode == "contains":
+        return aminx <= bminx and amaxx >= bmaxx and aminy <= bminy and amaxy >= bmaxy
+    return not (amaxx < bminx or aminx > bmaxx or amaxy < bminy or aminy > bmaxy)
+
+
+def _dxf_bbox_query_payload(
+    *,
+    bbox: Sequence[float],
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    sheet_no: str = "",
+    source_file: str = "",
+    entity_type: Sequence[str] | str | None = None,
+    layer: str = "",
+    mode: str = "intersects",
+    fields: Sequence[str] | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict:
+    roots = _dxf_request_roots(project_id=project_id, pack_id=pack_id, pack_ids=pack_ids)
+    entity_types = _entity_type_filter(entity_type)
+    rows: list[dict] = []
+    total = 0
+    select_fields = fields or _dxf_entity_default_fields()
+    for root, source_pack_id in roots:
+        for row in _iter_drawing_entity_rows(root):
+            matched, score = _dxf_row_matches_basic_filters(
+                row,
+                sheet_no=sheet_no,
+                source_file=source_file,
+                entity_types=entity_types,
+                layer=layer,
+            )
+            if not matched:
+                continue
+            payload = _dxf_payload_for_match(row, root, source_pack_id, score=score)
+            if not _bbox_relation(payload.get("bbox"), bbox, mode):
+                continue
+            total += 1
+            rows.append(_project_payload(payload, select_fields))
+    start = max(0, offset)
+    end = start + max(0, limit)
+    return {
+        "project_id": project_id or None,
+        "pack_id": pack_id or None,
+        "sheet_no": sheet_no or None,
+        "source_file": source_file or None,
+        "entity_type": sorted(entity_types) if entity_types else None,
+        "bbox": list(bbox),
+        "mode": mode,
+        "count": total,
+        "offset": start,
+        "limit": max(0, limit),
+        "rows": rows[start:end],
+        "truncated": total > end,
+    }
+
+
+def _query_chunk_rows_payload(
+    *,
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    project_id: str = "",
+    logical_pack: str,
+    where: dict | None = None,
+    select: Sequence | None = None,
+    order_by: Sequence | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    include_sibling_shards: bool = True,
+) -> dict:
+    active_pack_ids = _resolve_pack_ids(
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        project_id=project_id,
+        logical_pack=logical_pack,
+        include_sibling_shards=include_sibling_shards,
+    )
+    rows: list[dict] = []
+    for active_pack_id in active_pack_ids:
+        for row in _iter_cloud_chunk_rows(active_pack_id):
+            if _row_matches_where(row, where):
+                rows.append(row)
+    ordered = _sort_chunk_rows(rows, order_by)
+    start = max(0, offset)
+    end = start + max(0, limit)
+    return {
+        "project_id": project_id or None,
+        "pack_ids": active_pack_ids,
+        "logical_pack": logical_pack,
+        "where": _normalize_tool_dict(where),
+        "count": len(ordered),
+        "offset": start,
+        "limit": max(0, limit),
+        "rows": [_project_row(row, select) for row in ordered[start:end]],
+        "truncated": len(ordered) > end,
+    }
+
+
+def _bbox_from_row(row: dict) -> list[float] | None:
+    compact = row.get("compact_row") if isinstance(row.get("compact_row"), dict) else {}
+    drawing_ref = compact.get("drawing_ref") if isinstance(compact.get("drawing_ref"), dict) else {}
+    candidates = [
+        compact.get("bbox"),
+        compact.get("bounding_box"),
+        drawing_ref.get("sheet_paper_bbox"),
+        drawing_ref.get("sheet_model_bbox"),
+        drawing_ref.get("view_model_bbox"),
+    ]
+    for bbox in candidates:
+        if isinstance(bbox, list) and len(bbox) >= 4:
+            try:
+                return [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
+            except (TypeError, ValueError):
+                continue
+        if isinstance(bbox, dict):
+            minimum = bbox.get("min") if isinstance(bbox.get("min"), dict) else {}
+            maximum = bbox.get("max") if isinstance(bbox.get("max"), dict) else {}
+            try:
+                return [float(minimum["x"]), float(minimum["y"]), float(maximum["x"]), float(maximum["y"])]
+            except (KeyError, TypeError, ValueError):
+                continue
+    return None
+
+
+def _classify_drawing_text_type(row: dict) -> str:
+    evidence_type = str(_row_get(row, "evidence_type") or "")
+    text = str(row.get("text") or "")
+    if "dimension" in evidence_type:
+        return "dimension"
+    if "schedule" in evidence_type or evidence_type in {"data_row", "column_header", "schedule_title"}:
+        return "schedule_cell"
+    if "annotation" in evidence_type:
+        if _AREA_TAG_RE.search(text):
+            return "room_tag"
+        return "annotation"
+    if evidence_type in {"view_context", "sheet_pdf", "sheet_dxf", "view_dxf"}:
+        return evidence_type
+    if _AREA_TAG_RE.search(text):
+        return "room_tag"
+    return "drawing_evidence"
+
+
+def _drawing_text_search_payload(
+    *,
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    query: str = "",
+    sheet_no: str = "",
+    view_name: str = "",
+    text_type: Sequence[str] | str | None = None,
+    limit: int = 50,
+) -> dict:
+    active_pack_ids = _resolve_pack_ids(
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        project_id=project_id,
+        logical_pack="drawing_evidence",
+    )
+    type_filter = {str(item).casefold() for item in _normalize_tool_list(text_type)}
+    terms = query_terms(query)
+    scored: list[tuple[float, dict]] = []
+    for active_pack_id in active_pack_ids:
+        for row in _iter_cloud_chunk_rows(active_pack_id):
+            candidate_type = _classify_drawing_text_type(row)
+            if type_filter and candidate_type.casefold() not in type_filter and str(_row_get(row, "evidence_type")).casefold() not in type_filter:
+                continue
+            if sheet_no and str(_row_get(row, "sheet_number") or "").casefold() != str(sheet_no).casefold():
+                continue
+            if view_name and str(view_name).casefold() not in str(_row_get(row, "view_name") or "").casefold():
+                continue
+            haystack = (
+                str(row.get("text") or "")
+                + " "
+                + str(_row_get(row, "sheet_number") or "")
+                + " "
+                + str(_row_get(row, "view_name") or "")
+                + " "
+                + str(_row_get(row, "category_name") or "")
+            ).casefold()
+            score = score_terms(haystack, terms) if terms else 1.0
+            if terms and score <= 0:
+                continue
+            scored.append(
+                (
+                    score,
+                    {
+                        "sheet_no": _row_get(row, "sheet_number") if _row_get(row, "sheet_number") is not _MISSING else None,
+                        "sheet_name": _row_get(row, "sheet_name") if _row_get(row, "sheet_name") is not _MISSING else None,
+                        "view_name": _row_get(row, "view_name") if _row_get(row, "view_name") is not _MISSING else None,
+                        "text": row.get("text"),
+                        "text_type": candidate_type,
+                        "evidence_type": _row_get(row, "evidence_type") if _row_get(row, "evidence_type") is not _MISSING else None,
+                        "bbox": _bbox_from_row(row),
+                        "source_pack_id": active_pack_id,
+                        "source_chunk_id": row.get("chunk_id"),
+                        "confidence": _row_get(row, "confidence") if _row_get(row, "confidence") is not _MISSING else None,
+                        "score": round(score, 3),
+                    },
+                )
+            )
+    root_pack_ids: dict[Path, str] = {}
+    for active_pack_id in active_pack_ids:
+        derived_dir = _pack_source_derived_dir(active_pack_id)
+        if not derived_dir:
+            continue
+        root = derived_dir.parent
+        if root.exists() and root not in root_pack_ids:
+            root_pack_ids[root] = active_pack_id
+    for root, source_pack_id in root_pack_ids.items():
+        for row in _iter_drawing_entity_search_rows(root):
+            candidate_type = _classify_drawing_entity_type(row)
+            entity_type = str(row.get("entity_type") or row.get("record_type") or "")
+            if type_filter and candidate_type.casefold() not in type_filter and entity_type.casefold() not in type_filter:
+                continue
+            context = _drawing_entity_context(row)
+            if sheet_no and str(context.get("sheet_number") or "").casefold() != str(sheet_no).casefold():
+                continue
+            if view_name and str(view_name).casefold() not in str(context.get("view_name") or "").casefold():
+                continue
+            text = _drawing_entity_text(row)
+            haystack = (
+                text
+                + " "
+                + str(context.get("sheet_number") or "")
+                + " "
+                + str(context.get("sheet_name") or "")
+                + " "
+                + str(context.get("view_name") or "")
+                + " "
+                + str(row.get("layer") or "")
+                + " "
+                + entity_type
+            ).casefold()
+            score = score_terms(haystack, terms) if terms else 1.0
+            if terms and score <= 0:
+                continue
+            if terms:
+                query_lower = str(query).casefold()
+                text_lower = text.casefold()
+                if query_lower and text_lower == query_lower:
+                    score += 10.0
+                elif query_lower and query_lower in text_lower:
+                    score += 5.0
+            if candidate_type in {"annotation", "room_tag", "dimension"}:
+                score += 2.0
+            scored.append((score, _drawing_entity_payload(row, root, source_pack_id, score=score)))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    max_limit = max(0, limit)
+    return {
+        "project_id": project_id or None,
+        "pack_ids": active_pack_ids,
+        "query": query,
+        "count": len(scored),
+        "matches": [item[1] for item in scored[:max_limit]],
+        "truncated": len(scored) > max_limit,
+    }
+
+
+def _dimension_value_mm(text: str) -> float | None:
+    values = []
+    for match in _DIMENSION_VALUE_RE.finditer(text.replace(",", "")):
+        try:
+            value = float(match.group(1))
+        except ValueError:
+            continue
+        if 50 <= value <= 20000:
+            values.append(value)
+    return values[0] if values else None
+
+
+def _bbox_orientation(bbox: list[float] | None) -> str | None:
+    if not bbox or len(bbox) < 4:
+        return None
+    width = abs(float(bbox[2]) - float(bbox[0]))
+    height = abs(float(bbox[3]) - float(bbox[1]))
+    if width <= 0 and height <= 0:
+        return None
+    if width >= height * 1.5:
+        return "horizontal"
+    if height >= width * 1.5:
+        return "vertical"
+    return "unknown"
+
+
+def _dimensions_extract_payload(
+    *,
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    sheet_no: str = "",
+    view_name: str = "",
+    target_label: str = "",
+    limit: int = 100,
+) -> dict:
+    label_search = (
+        _drawing_text_search_payload(
+            project_id=project_id,
+            pack_id=pack_id,
+            pack_ids=pack_ids,
+            query=target_label,
+            sheet_no=sheet_no,
+            view_name=view_name,
+            text_type=["room_tag", "annotation", "drawing_evidence"],
+            limit=25,
+        )
+        if target_label
+        else {"matches": []}
+    )
+    nearby_label_texts = [
+        str(match.get("text") or "")
+        for match in label_search.get("matches", [])
+        if str(match.get("text") or "").strip()
+    ]
+    search = _drawing_text_search_payload(
+        project_id=project_id,
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        query="",
+        sheet_no=sheet_no,
+        view_name=view_name,
+        text_type=["dimension"],
+        limit=max(500, limit * 6),
+    )
+    dimensions = []
+    for match in search.get("matches", []):
+        text = str(match.get("text") or "")
+        value_mm = _to_number(match.get("value_mm"))
+        if value_mm is None:
+            value_mm = _dimension_value_mm(text)
+        if value_mm is None:
+            continue
+        bbox = match.get("bbox")
+        dimensions.append(
+            {
+                "text": text,
+                "value_mm": value_mm,
+                "unit": "mm",
+                "orientation": match.get("orientation") or _bbox_orientation(bbox) or "unknown",
+                "bbox": bbox,
+                "line": match.get("line"),
+                "nearby_labels": nearby_label_texts[:5],
+                "source_pack_id": match.get("source_pack_id"),
+                "source_chunk_id": match.get("source_chunk_id"),
+                "confidence": match.get("confidence") or 0.55,
+            }
+        )
+        if len(dimensions) >= max(0, limit):
+            break
+    return {
+        "project_id": project_id or None,
+        "sheet_no": sheet_no or None,
+        "view_name": view_name or None,
+        "target_label": target_label or None,
+        "dimension_count": len(dimensions),
+        "dimensions": dimensions,
+        "truncated": len(dimensions) >= max(0, limit),
+    }
+
+
+def _calculate_area_from_dimensions_payload(
+    *,
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    sheet_no: str = "",
+    view_name: str = "",
+    target_label: str = "",
+    method: str = "rectangular_area",
+) -> dict:
+    extracted = _dimensions_extract_payload(
+        project_id=project_id,
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        sheet_no=sheet_no,
+        view_name=view_name,
+        target_label=target_label,
+        limit=50,
+    )
+    dimensions = extracted.get("dimensions", [])
+    if len(dimensions) < 2:
+        return {
+            "target": target_label,
+            "method": method,
+            "status": "insufficient_dimension_evidence",
+            "reason": "At least two usable dimension values are required for rectangular area calculation.",
+            "dimensions": dimensions,
+        }
+    horizontal = [dim for dim in dimensions if dim.get("orientation") == "horizontal"]
+    vertical = [dim for dim in dimensions if dim.get("orientation") == "vertical"]
+    if horizontal and vertical:
+        width = float(horizontal[0]["value_mm"])
+        depth = float(vertical[0]["value_mm"])
+        evidence = [horizontal[0], vertical[0]]
+    else:
+        ordered = sorted(dimensions, key=lambda dim: float(dim.get("confidence") or 0), reverse=True)
+        width = float(ordered[0]["value_mm"])
+        depth = float(ordered[1]["value_mm"])
+        evidence = ordered[:2]
+    area_m2 = width * depth / 1_000_000.0
+    return {
+        "target": target_label,
+        "method": "dimension_line_rectangular_area",
+        "width_mm": width,
+        "depth_mm": depth,
+        "area_m2": round(area_m2, 6),
+        "formula": f"{width:g} mm × {depth:g} mm / 1,000,000 = {area_m2:.3f} m²",
+        "basis": "dimension_text_heuristic",
+        "confidence": min(float(item.get("confidence") or 0.55) for item in evidence),
+        "evidence": evidence,
+        "warning": "Dimension pairing is heuristic until DXF dimension geometry and room boundary topology are fully indexed.",
+    }
+
+
+def _room_area_tags_payload(
+    *,
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    floor: str = "",
+    room_name: str = "",
+    sheet_no: str = "",
+    limit: int = 50,
+) -> dict:
+    query = room_name or "㎡"
+    search = _drawing_text_search_payload(
+        project_id=project_id,
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        query=query,
+        sheet_no=sheet_no,
+        text_type=["room_tag", "annotation", "schedule_cell", "drawing_evidence"],
+        limit=max(200, limit * 4),
+    )
+    rooms = []
+    for match in search.get("matches", []):
+        text = str(match.get("text") or "")
+        tag_match = _AREA_TAG_RE.search(text)
+        if not tag_match:
+            continue
+        label = tag_match.group("label").strip(" -_|")
+        if room_name and room_name.casefold() not in label.casefold() and room_name.casefold() not in text.casefold():
+            continue
+        try:
+            area_m2 = float(tag_match.group("area"))
+        except ValueError:
+            continue
+        rooms.append(
+            {
+                "room_name": room_name or label,
+                "floor": floor or None,
+                "module_id": None,
+                "area_m2": area_m2,
+                "raw_text": text,
+                "source": {
+                    "sheet_no": match.get("sheet_no"),
+                    "sheet_name": match.get("sheet_name"),
+                    "view_name": match.get("view_name"),
+                    "bbox": match.get("bbox"),
+                    "pack_id": match.get("source_pack_id"),
+                    "chunk_id": match.get("source_chunk_id"),
+                },
+                "confidence": match.get("confidence") or 0.72,
+            }
+        )
+        if len(rooms) >= max(0, limit):
+            break
+    return {
+        "project_id": project_id or None,
+        "room_name": room_name or None,
+        "floor": floor or None,
+        "sheet_no": sheet_no or None,
+        "count": len(rooms),
+        "rooms": rooms,
+        "truncated": len(rooms) >= max(0, limit),
+        "note": "This extracts explicit room-area text such as '화장실 3.42㎡'; adjacent tag pairing is a later geometry step.",
+    }
+
+
+def _schedule_table_payload(
+    *,
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    project_id: str = "",
+    schedule_name: str = "",
+    limit: int = 5000,
+) -> dict:
+    active_pack_ids = _resolve_pack_ids(
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        project_id=project_id,
+        logical_pack="schedule_rows",
+    )
+    rows = []
+    for active_pack_id in active_pack_ids:
+        for row in _iter_cloud_chunk_rows(active_pack_id):
+            if schedule_name and schedule_name.casefold() not in str(_row_get(row, "schedule_name") or "").casefold():
+                continue
+            rows.append(row)
+    rows = _sort_chunk_rows(rows, [{"field": "schedule_name"}, {"field": "row"}])
+    columns: list[str] = []
+    data_rows = []
+    for row in rows:
+        compact = row.get("compact_row") if isinstance(row.get("compact_row"), dict) else {}
+        values = compact.get("values") if isinstance(compact.get("values"), list) else []
+        texts = [str(item.get("text") or "") for item in values if isinstance(item, dict)]
+        role = str(compact.get("row_role") or _row_get(row, "row_role") or "")
+        if role == "column_header" and texts:
+            columns = [text for text in texts if text]
+            continue
+        if role == "data_row" and texts:
+            if columns and len(columns) == len(texts):
+                data = {column: value for column, value in zip(columns, texts)}
+            else:
+                data = {f"column_{index}": value for index, value in enumerate(texts)}
+            data_rows.append(
+                {
+                    **data,
+                    "_row": compact.get("row"),
+                    "_text": row.get("text"),
+                    "_source_pack_id": active_pack_id,
+                    "_source_chunk_id": row.get("chunk_id"),
+                }
+            )
+    max_limit = max(0, limit)
+    return {
+        "project_id": project_id or None,
+        "pack_ids": active_pack_ids,
+        "schedule_name": schedule_name or (str(_row_get(rows[0], "schedule_name")) if rows else None),
+        "columns": columns,
+        "row_count": len(data_rows),
+        "rows": data_rows[:max_limit],
+        "truncated": len(data_rows) > max_limit,
+    }
+
+
 def _tool_payload_error(message: str, **extra: object) -> str:
     return _json({"error": "invalid_request", "detail": message, **extra}, pretty=False)
 
@@ -1091,6 +2562,344 @@ def read_pack_document(pack_id: str, path: str, max_chars: int = 12000) -> str:
     if not _pack_is_visible(pack_id):
         return _forbidden_pack(pack_id)
     return _json(read_document(pack_id=pack_id, path=path, max_chars=max_chars))
+
+
+@mcp.tool()
+def read_chunk_by_id(pack_id: str, chunk_id: str) -> str:
+    """Read one cloud/chunks.jsonl evidence chunk by chunk_id without returning the whole chunks file."""
+
+    if not _pack_is_visible(pack_id):
+        return _forbidden_pack(pack_id)
+    return _json(_read_chunk_payload(pack_id=pack_id, chunk_id=chunk_id))
+
+
+@mcp.tool()
+def query_quantity_facts(
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    project_id: str = "",
+    where: dict | None = None,
+    select: Sequence[str] | None = None,
+    order_by: Sequence | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    include_sibling_shards: bool = True,
+) -> str:
+    """Query BIM/Revit quantity_facts chunks with where/select/order_by support."""
+
+    return _json(
+        _query_chunk_rows_payload(
+            pack_id=pack_id,
+            pack_ids=pack_ids,
+            project_id=project_id,
+            logical_pack="quantity_facts",
+            where=where,
+            select=select,
+            order_by=order_by,
+            limit=limit,
+            offset=offset,
+            include_sibling_shards=include_sibling_shards,
+        )
+    )
+
+
+@mcp.tool()
+def search_drawing_text(
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    query: str = "",
+    sheet_no: str = "",
+    view_name: str = "",
+    text_type: Sequence[str] | str | None = None,
+    limit: int = 50,
+) -> str:
+    """Search drawing_evidence chunks for sheet/view text, annotations, dimensions, and room-tag-like text."""
+
+    return _json(
+        _drawing_text_search_payload(
+            project_id=project_id,
+            pack_id=pack_id,
+            pack_ids=pack_ids,
+            query=query,
+            sheet_no=sheet_no,
+            view_name=view_name,
+            text_type=text_type,
+            limit=limit,
+        )
+    )
+
+
+@mcp.tool()
+def extract_room_area_tags(
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    floor: str = "",
+    room_name: str = "",
+    sheet_no: str = "",
+    limit: int = 50,
+) -> str:
+    """Extract explicit room area text such as '화장실 3.42㎡' from drawing evidence chunks."""
+
+    return _json(
+        _room_area_tags_payload(
+            project_id=project_id,
+            pack_id=pack_id,
+            pack_ids=pack_ids,
+            floor=floor,
+            room_name=room_name,
+            sheet_no=sheet_no,
+            limit=limit,
+        )
+    )
+
+
+@mcp.tool()
+def extract_dimensions_from_view(
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    sheet_no: str = "",
+    view_name: str = "",
+    target_label: str = "",
+    limit: int = 100,
+) -> str:
+    """Extract usable dimension text values from drawing evidence for a sheet/view/target label."""
+
+    return _json(
+        _dimensions_extract_payload(
+            project_id=project_id,
+            pack_id=pack_id,
+            pack_ids=pack_ids,
+            sheet_no=sheet_no,
+            view_name=view_name,
+            target_label=target_label,
+            limit=limit,
+        )
+    )
+
+
+@mcp.tool()
+def calculate_area_from_dimensions(
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    sheet_no: str = "",
+    view_name: str = "",
+    target_label: str = "",
+    method: str = "rectangular_area",
+) -> str:
+    """Calculate rectangular area from two extracted dimension values when enough evidence exists."""
+
+    return _json(
+        _calculate_area_from_dimensions_payload(
+            project_id=project_id,
+            pack_id=pack_id,
+            pack_ids=pack_ids,
+            sheet_no=sheet_no,
+            view_name=view_name,
+            target_label=target_label,
+            method=method,
+        )
+    )
+
+
+@mcp.tool()
+def extract_schedule_table(
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    project_id: str = "",
+    schedule_name: str = "",
+    limit: int = 5000,
+) -> str:
+    """Reconstruct a schedule table from schedule_rows chunks."""
+
+    return _json(
+        _schedule_table_payload(
+            pack_id=pack_id,
+            pack_ids=pack_ids,
+            project_id=project_id,
+            schedule_name=schedule_name,
+            limit=limit,
+        )
+    )
+
+
+@mcp.tool()
+def dxf_entity_summary(
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    sheet_no: str = "",
+    source_file: str = "",
+    limit_layers: int = 50,
+) -> str:
+    """Summarize parsed DXF entity counts and layers, optionally filtered by sheet or DXF file."""
+
+    return _json(
+        _dxf_entity_summary_payload(
+            project_id=project_id,
+            pack_id=pack_id,
+            pack_ids=pack_ids,
+            sheet_no=sheet_no,
+            source_file=source_file,
+            limit_layers=limit_layers,
+        )
+    )
+
+
+@mcp.tool()
+def dxf_entity_search(
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    query: str = "",
+    sheet_no: str = "",
+    source_file: str = "",
+    entity_type: Sequence[str] | str | None = None,
+    layer: str = "",
+    where: dict | None = None,
+    fields: Sequence[str] | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> str:
+    """Search raw parsed DXF entities such as LINE, LWPOLYLINE, TEXT, MTEXT, DIMENSION, INSERT, and HATCH."""
+
+    return _json(
+        _dxf_entity_search_payload(
+            project_id=project_id,
+            pack_id=pack_id,
+            pack_ids=pack_ids,
+            query=query,
+            sheet_no=sheet_no,
+            source_file=source_file,
+            entity_type=entity_type,
+            layer=layer,
+            where=where,
+            fields=fields,
+            limit=limit,
+            offset=offset,
+        )
+    )
+
+
+@mcp.tool()
+def dxf_text_search(
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    query: str = "",
+    sheet_no: str = "",
+    source_file: str = "",
+    layer: str = "",
+    fields: Sequence[str] | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> str:
+    """Search raw DXF TEXT and MTEXT entities."""
+
+    return dxf_entity_search(
+        project_id=project_id,
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        query=query,
+        sheet_no=sheet_no,
+        source_file=source_file,
+        entity_type=["TEXT", "MTEXT"],
+        layer=layer,
+        fields=fields,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@mcp.tool()
+def dxf_dimension_search(
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    sheet_no: str = "",
+    source_file: str = "",
+    layer: str = "",
+    where: dict | None = None,
+    fields: Sequence[str] | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> str:
+    """Search raw DXF DIMENSION entities, including measurement value in millimeters when available."""
+
+    return dxf_entity_search(
+        project_id=project_id,
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        sheet_no=sheet_no,
+        source_file=source_file,
+        entity_type=["DIMENSION"],
+        layer=layer,
+        where=where,
+        fields=fields,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@mcp.tool()
+def dxf_layer_summary(
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    sheet_no: str = "",
+    source_file: str = "",
+    limit: int = 100,
+) -> str:
+    """Summarize DXF layers with entity counts."""
+
+    return _json(
+        _dxf_layer_summary_payload(
+            project_id=project_id,
+            pack_id=pack_id,
+            pack_ids=pack_ids,
+            sheet_no=sheet_no,
+            source_file=source_file,
+            limit=limit,
+        )
+    )
+
+
+@mcp.tool()
+def dxf_bbox_query(
+    bbox: Sequence[float],
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    sheet_no: str = "",
+    source_file: str = "",
+    entity_type: Sequence[str] | str | None = None,
+    layer: str = "",
+    mode: str = "intersects",
+    fields: Sequence[str] | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> str:
+    """Find DXF entities whose bounding boxes intersect, contain, or fall within a target bbox."""
+
+    return _json(
+        _dxf_bbox_query_payload(
+            bbox=bbox,
+            project_id=project_id,
+            pack_id=pack_id,
+            pack_ids=pack_ids,
+            sheet_no=sheet_no,
+            source_file=source_file,
+            entity_type=entity_type,
+            layer=layer,
+            mode=mode,
+            fields=fields,
+            limit=limit,
+            offset=offset,
+        )
+    )
 
 
 @mcp.tool()
@@ -1998,6 +3807,13 @@ def mo_document_read(pack_id: str, path: str, max_chars: int = 12000) -> str:
 
 
 @mcp.tool()
+def mo_chunk_read(pack_id: str, chunk_id: str) -> str:
+    """Read one cloud/chunks.jsonl evidence chunk by chunk_id."""
+
+    return read_chunk_by_id(pack_id=pack_id, chunk_id=chunk_id)
+
+
+@mcp.tool()
 def mo_evidence_search(pack_id: str, search_text: str, limit: int = 8) -> str:
     """Search pack evidence documents for a natural language query."""
 
@@ -2017,6 +3833,312 @@ def mo_evidence_trace(pack_id: str, search_text: str, limit: int = 5, include_an
             limit=limit,
             include_answer=include_answer,
         )
+    )
+
+
+@mcp.tool()
+def mo_drawing_text_search(
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    query: str = "",
+    sheet_no: str = "",
+    view_name: str = "",
+    text_type: Sequence[str] | str | None = None,
+    limit: int = 50,
+) -> str:
+    """Search drawing_evidence chunks for sheet/view text, annotations, dimensions, and room-tag-like text."""
+
+    return search_drawing_text(
+        project_id=project_id,
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        query=query,
+        sheet_no=sheet_no,
+        view_name=view_name,
+        text_type=text_type,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+def mo_room_area_tag_extract(
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    floor: str = "",
+    room_name: str = "",
+    sheet_no: str = "",
+    limit: int = 50,
+) -> str:
+    """Extract explicit room area text such as '화장실 3.42㎡' from drawing evidence chunks."""
+
+    return extract_room_area_tags(
+        project_id=project_id,
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        floor=floor,
+        room_name=room_name,
+        sheet_no=sheet_no,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+def mo_dimensions_extract(
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    sheet_no: str = "",
+    view_name: str = "",
+    target_label: str = "",
+    limit: int = 100,
+) -> str:
+    """Extract usable dimension text values from drawing evidence for a sheet/view/target label."""
+
+    return extract_dimensions_from_view(
+        project_id=project_id,
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        sheet_no=sheet_no,
+        view_name=view_name,
+        target_label=target_label,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+def mo_area_from_dimensions_calculate(
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    sheet_no: str = "",
+    view_name: str = "",
+    target_label: str = "",
+    method: str = "rectangular_area",
+) -> str:
+    """Calculate rectangular area from two extracted dimension values when enough evidence exists."""
+
+    return calculate_area_from_dimensions(
+        project_id=project_id,
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        sheet_no=sheet_no,
+        view_name=view_name,
+        target_label=target_label,
+        method=method,
+    )
+
+
+@mcp.tool()
+def mo_schedule_table_extract(
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    project_id: str = "",
+    schedule_name: str = "",
+    limit: int = 5000,
+) -> str:
+    """Reconstruct a schedule table from schedule_rows chunks."""
+
+    return extract_schedule_table(
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        project_id=project_id,
+        schedule_name=schedule_name,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+def mo_dxf_entity_summary(
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    sheet_no: str = "",
+    source_file: str = "",
+    limit_layers: int = 50,
+) -> str:
+    """Summarize parsed DXF entity counts and layers."""
+
+    return dxf_entity_summary(
+        project_id=project_id,
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        sheet_no=sheet_no,
+        source_file=source_file,
+        limit_layers=limit_layers,
+    )
+
+
+@mcp.tool()
+def mo_dxf_entity_search(
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    query: str = "",
+    sheet_no: str = "",
+    source_file: str = "",
+    entity_type: Sequence[str] | str | None = None,
+    layer: str = "",
+    where: dict | None = None,
+    fields: Sequence[str] | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> str:
+    """Search raw parsed DXF entities."""
+
+    return dxf_entity_search(
+        project_id=project_id,
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        query=query,
+        sheet_no=sheet_no,
+        source_file=source_file,
+        entity_type=entity_type,
+        layer=layer,
+        where=where,
+        fields=fields,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@mcp.tool()
+def mo_dxf_text_search(
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    query: str = "",
+    sheet_no: str = "",
+    source_file: str = "",
+    layer: str = "",
+    fields: Sequence[str] | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> str:
+    """Search raw DXF TEXT and MTEXT entities."""
+
+    return dxf_text_search(
+        project_id=project_id,
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        query=query,
+        sheet_no=sheet_no,
+        source_file=source_file,
+        layer=layer,
+        fields=fields,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@mcp.tool()
+def mo_dxf_dimension_search(
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    sheet_no: str = "",
+    source_file: str = "",
+    layer: str = "",
+    where: dict | None = None,
+    fields: Sequence[str] | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> str:
+    """Search raw DXF DIMENSION entities."""
+
+    return dxf_dimension_search(
+        project_id=project_id,
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        sheet_no=sheet_no,
+        source_file=source_file,
+        layer=layer,
+        where=where,
+        fields=fields,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@mcp.tool()
+def mo_dxf_layer_summary(
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    sheet_no: str = "",
+    source_file: str = "",
+    limit: int = 100,
+) -> str:
+    """Summarize DXF layers with entity counts."""
+
+    return dxf_layer_summary(
+        project_id=project_id,
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        sheet_no=sheet_no,
+        source_file=source_file,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+def mo_dxf_bbox_query(
+    bbox: Sequence[float],
+    project_id: str = "",
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    sheet_no: str = "",
+    source_file: str = "",
+    entity_type: Sequence[str] | str | None = None,
+    layer: str = "",
+    mode: str = "intersects",
+    fields: Sequence[str] | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> str:
+    """Find DXF entities by bounding-box relation."""
+
+    return dxf_bbox_query(
+        bbox=bbox,
+        project_id=project_id,
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        sheet_no=sheet_no,
+        source_file=source_file,
+        entity_type=entity_type,
+        layer=layer,
+        mode=mode,
+        fields=fields,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@mcp.tool()
+def mo_quantity_facts_query(
+    pack_id: str = "",
+    pack_ids: Sequence[str] | None = None,
+    project_id: str = "",
+    where: dict | None = None,
+    select: Sequence[str] | None = None,
+    order_by: Sequence | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    include_sibling_shards: bool = True,
+) -> str:
+    """Query BIM/Revit quantity_facts chunks with where/select/order_by support."""
+
+    return query_quantity_facts(
+        pack_id=pack_id,
+        pack_ids=pack_ids,
+        project_id=project_id,
+        where=where,
+        select=select,
+        order_by=order_by,
+        limit=limit,
+        offset=offset,
+        include_sibling_shards=include_sibling_shards,
     )
 
 
