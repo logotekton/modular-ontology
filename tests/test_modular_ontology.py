@@ -704,7 +704,7 @@ def test_admin_create_project_survives_drive_folder_failure(monkeypatch, tmp_pat
         json={"email": "ythong@kumkangkind.com", "password": TEST_ADMIN_PASSWORD},
     )
     monkeypatch.setenv("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "root")
-    monkeypatch.setattr(app_module, "run_google_drive_sync", lambda *args, **kwargs: {"status": "synced"})
+    monkeypatch.setattr(app_module, "run_google_drive_registry_sync", lambda *args, **kwargs: {"enabled": True, "status": "synced"})
     monkeypatch.setattr(app_module, "run_google_drive_write_back", lambda *args, **kwargs: {"enabled": True, "status": "written"})
 
     def fail_drive_folders(_project_id):
@@ -729,6 +729,45 @@ def test_admin_create_project_survives_drive_folder_failure(monkeypatch, tmp_pat
     assert created.json()["project"]["id"] == "folder-failure-project"
     assert created.json()["driveFolders"]["status"] == "error"
     assert any(project["id"] == "folder-failure-project" for project in created.json()["projects"])
+
+
+def test_admin_create_project_uses_registry_sync_not_full_storage_sync(monkeypatch, tmp_path) -> None:
+    from modular_ontology import app as app_module
+    from modular_ontology import project_store
+
+    users_file = tmp_path / "users.json"
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE", str(users_file))
+    monkeypatch.setattr(project_store, "DB_PATH", tmp_path / "projects.sqlite3")
+    monkeypatch.setenv("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "root")
+    monkeypatch.setattr(app_module, "run_google_drive_registry_sync", lambda *args, **kwargs: {"enabled": True, "status": "synced"})
+
+    def fail_full_storage_sync(*_args, **_kwargs):
+        raise AssertionError("Project creation should not run full Google Drive storage sync")
+
+    monkeypatch.setattr(app_module, "run_google_drive_sync", fail_full_storage_sync)
+    monkeypatch.setattr(app_module, "run_google_drive_write_back", lambda *args, **kwargs: {"enabled": True, "status": "written"})
+    monkeypatch.setattr(app_module, "ensure_project_drive_folders", lambda project_id: {"status": "ensured", "projectId": project_id})
+
+    admin = client.post(
+        "/api/auth/login",
+        json={"email": "ythong@kumkangkind.com", "password": TEST_ADMIN_PASSWORD},
+    )
+    created = client.post(
+        "/api/admin/projects",
+        headers={"Authorization": f"Bearer {admin.json()['token']}"},
+        json={
+            "name": "Registry Only Project",
+            "company": "Client Co",
+            "manager": "Site Manager",
+            "discipline": "BIM",
+            "description": "Project creation should avoid full storage sync",
+            "pack_ids": [],
+        },
+    )
+
+    assert created.status_code == 200
+    assert created.json()["project"]["id"] == "registry-only-project"
+    assert created.json()["driveFolders"]["status"] == "ensured"
 
 
 def test_drive_project_pack_links_are_authoritative(monkeypatch, tmp_path) -> None:

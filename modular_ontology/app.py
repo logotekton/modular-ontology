@@ -1024,7 +1024,7 @@ def project_suggestions(authorization: str | None = Header(default=None)) -> dic
 @app.post("/api/admin/projects")
 def admin_create_project(request: ProjectRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_admin(authorization)
-    require_google_drive_sync(run_google_drive_sync(force=True))
+    require_google_drive_sync(run_google_drive_registry_sync(force=True))
     valid_pack_ids = {pack["id"] for pack in list_packs()}
     invalid_pack_ids = [pack_id for pack_id in request.pack_ids if pack_id not in valid_pack_ids]
     if invalid_pack_ids:
@@ -1040,13 +1040,13 @@ def admin_create_project(request: ProjectRequest, authorization: str | None = He
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    write_back = require_google_drive_write_back(run_google_drive_write_back("database"))
     drive_folders: dict[str, Any] | None = None
     if google_drive_sync_enabled():
         try:
             drive_folders = ensure_project_drive_folders(project["id"])
         except Exception as exc:
             drive_folders = {"status": "error", "error": str(exc)}
+    write_back = require_google_drive_write_back(run_google_drive_write_back("database"))
     return {"project": project, "projects": list_projects(), "driveFolders": drive_folders, "writeBack": write_back}
 
 
@@ -1057,7 +1057,7 @@ def admin_update_project(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_admin(authorization)
-    require_google_drive_sync(run_google_drive_sync(force=True))
+    require_google_drive_sync(run_google_drive_registry_sync(force=True))
     try:
         update_project(
             project_id,
@@ -1083,7 +1083,7 @@ def admin_update_project(
 @app.delete("/api/admin/projects/{project_id}")
 def admin_delete_project(project_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_admin(authorization)
-    require_google_drive_sync(run_google_drive_sync(force=True))
+    require_google_drive_sync(run_google_drive_registry_sync(force=True))
     try:
         delete_stored_project(project_id)
     except KeyError as exc:
@@ -1099,7 +1099,7 @@ def admin_set_project_pack_links(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_admin(authorization)
-    require_google_drive_sync(run_google_drive_sync(force=True))
+    require_google_drive_sync(run_google_drive_registry_sync(force=True))
     valid_pack_ids = {pack["id"] for pack in list_packs()}
     invalid_pack_ids = [pack_id for pack_id in request.pack_ids if pack_id not in valid_pack_ids]
     if invalid_pack_ids:
