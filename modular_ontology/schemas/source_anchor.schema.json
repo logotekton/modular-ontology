@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://modular-ontology.local/schemas/source-anchor.schema.json",
+  "title": "Modular Ontology Source Anchor",
+  "description": "Source-native anchor contract for returning from ontology evidence to the original project source such as Revit, BOQ, DXF, or PDF.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "anchor_type",
+    "source_kind",
+    "ids",
+    "confidence",
+    "open_hint"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "anchor/0.1"
+    },
+    "anchor_type": {
+      "type": "string",
+      "enum": [
+        "revit_element",
+        "revit_sheet",
+        "revit_view",
+        "revit_schedule_row",
+        "boq_sheet_row",
+        "dxf_entity",
+        "pdf_page",
+        "unknown"
+      ]
+    },
+    "source_kind": {
+      "type": "string",
+      "enum": [
+        "revit_model",
+        "boq",
+        "dxf",
+        "pdf",
+        "unknown"
+      ]
+    },
+    "document_key": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "ids": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "confidence": {
+      "type": "string",
+      "enum": [
+        "exact",
+        "partial",
+        "unresolvable"
+      ]
+    },
+    "open_hint": {
+      "type": "string"
+    },
+    "raw": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}
