@@ -60,7 +60,6 @@ from .google_drive_sync import (
     write_back_pack_file,
     write_back_users_file,
 )
-from .drive_xkt_worker import convert_missing_drive_xkts
 from .mcp_server import TOOL_NAMES, configure_server as configure_mcp_server, mcp as remote_mcp
 from .mcp_tokens import build_user_mcp_urls, ensure_mcp_token_for_user, regenerate_mcp_token_for_user
 from .pack_index import PackFile, build_graph, build_multi_pack_graph, list_packs, list_projects, save_uploaded_pack, unique_pack_files
@@ -324,16 +323,6 @@ def run_google_drive_write_back(
         return {"enabled": True, **result}
     except Exception as exc:
         return {"enabled": True, "status": "error", "error": str(exc)}
-
-
-def run_google_drive_xkt_conversion() -> dict[str, Any]:
-    if not google_drive_sync_enabled():
-        return {"enabled": False, "status": "disabled"}
-    try:
-        result = convert_missing_drive_xkts()
-        return {"enabled": True, **result}
-    except Exception as exc:
-        return {"enabled": True, "status": "error", "error": str(exc), "converted": []}
 
 
 def require_google_drive_write_back(result: dict[str, Any]) -> dict[str, Any]:
@@ -1150,9 +1139,7 @@ def admin_sync_google_drive_storage(authorization: str | None = Header(default=N
     require_admin(authorization)
     if not google_drive_sync_enabled():
         raise HTTPException(status_code=400, detail="MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set.")
-    conversion = run_google_drive_xkt_conversion()
     result = run_google_drive_sync(force=True)
-    result["xktConversion"] = conversion
     if result.get("status") == "synced":
         index_result = index_all_packs()
         result["reindexed"] = index_result.get("stats", {})
@@ -1163,17 +1150,6 @@ def admin_sync_google_drive_storage(authorization: str | None = Header(default=N
         if result["driveProjects"].get("accessRenamed") or result["driveProjects"].get("accessRemoved"):
             result["usersWriteBack"] = require_google_drive_write_back(run_google_drive_write_back("users"))
     return {"enabled": True, **result}
-
-
-@app.post("/api/admin/storage/google-drive/convert-xkt")
-def admin_convert_google_drive_xkt(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    require_admin(authorization)
-    if not google_drive_sync_enabled():
-        raise HTTPException(status_code=400, detail="MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set.")
-    result = run_google_drive_xkt_conversion()
-    if result.get("status") == "error":
-        raise HTTPException(status_code=502, detail=f"Google Drive XKT conversion failed: {result.get('error') or result.get('errors')}")
-    return result
 
 
 @app.post("/api/admin/storage/google-drive/write-back")
@@ -1358,7 +1334,6 @@ def reindex(full: bool = False, authorization: str | None = Header(default=None)
         result.update({
             "status": "registry-synced",
             "registry": registry,
-            "xktConversion": {"status": "skipped", "reason": "fast registry sync"},
             "driveProjects": drive_projects,
             "projectPackLinks": links,
             "projects": list_projects(),
@@ -1368,10 +1343,8 @@ def reindex(full: bool = False, authorization: str | None = Header(default=None)
             if drive_projects.get("accessRenamed") or drive_projects.get("accessRemoved"):
                 result["usersWriteBack"] = require_google_drive_write_back(run_google_drive_write_back("users"))
         return result
-    conversion = run_google_drive_xkt_conversion()
     require_google_drive_sync(run_google_drive_sync(force=True))
     result = index_all_packs()
-    result["xktConversion"] = conversion
     result["driveProjects"] = _apply_drive_project_folders()
     result["projectPackLinks"] = _apply_drive_project_pack_links()
     result["projects"] = list_projects()
