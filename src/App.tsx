@@ -1110,7 +1110,7 @@ function App() {
       setUploadStatus("관리자 세션이 필요합니다");
       return;
     }
-    setUploadStatus("Drive 동기화 및 XKT 변환 중");
+    setUploadStatus("Drive 변경 파일 동기화 중");
     const res = await fetch("/api/admin/storage/google-drive/sync", {
       method: "POST",
       headers: { Authorization: `Bearer ${authToken}` },
@@ -1123,22 +1123,23 @@ function App() {
     const payload = (await res.json()) as {
       stats?: IndexStats;
       reindexed?: IndexStats;
-      xktConversion?: { status?: string; converted?: unknown[]; errors?: unknown[]; reason?: string };
+      downloaded?: unknown[];
+      skipped?: unknown[];
     };
     const nextStats = payload.reindexed ?? payload.stats;
     if (nextStats) setIndexStats(nextStats);
     await refreshData(undefined, authToken);
     await refreshPublicStatus(authToken);
-    const convertedCount = payload.xktConversion?.converted?.length ?? 0;
-    const errorCount = payload.xktConversion?.errors?.length ?? 0;
-    if (convertedCount > 0) {
-      setUploadStatus(`Drive 동기화 완료 · XKT ${convertedCount}개 자동 변환`);
-    } else if (errorCount > 0) {
-      setUploadStatus(`Drive 동기화 완료 · XKT 변환 오류 ${errorCount}개`);
-    } else if (payload.xktConversion?.status === "skipped") {
-      setUploadStatus(`Drive 동기화 완료 · XKT 변환 건너뜀: ${payload.xktConversion.reason ?? "설정 없음"}`);
+    const changedCount = payload.downloaded?.length ?? 0;
+    const skippedCount = payload.skipped?.length ?? 0;
+    if (changedCount > 0 && skippedCount > 0) {
+      setUploadStatus(`Drive 동기화 완료 · 변경 ${changedCount}개 반영 · 기존 ${skippedCount}개 유지`);
+    } else if (changedCount > 0) {
+      setUploadStatus(`Drive 동기화 완료 · 변경 ${changedCount}개 반영`);
+    } else if (skippedCount > 0) {
+      setUploadStatus(`Drive 동기화 완료 · 새 변경 없음 · 기존 ${skippedCount}개 유지`);
     } else {
-      setUploadStatus("Drive 동기화 완료 · 변환할 IFC 없음");
+      setUploadStatus("Drive 동기화 완료 · 변경 파일 없음");
     }
   }
 
@@ -2414,7 +2415,7 @@ function SyncView({
         <div className="panel-header slim">
           <div>
             <h2>Drive 동기화</h2>
-            <span>{isAdmin ? "Google Drive에 올린 모델과 팩을 앱에 등록합니다" : "관리자 세션이 필요합니다"}</span>
+            <span>{isAdmin ? "Google Drive에 올린 IFC/XKT와 팩을 변경분만 등록합니다" : "관리자 세션이 필요합니다"}</span>
           </div>
           <RefreshCw size={19} />
         </div>
@@ -2442,7 +2443,7 @@ function SyncView({
               <span>{model.projectName || model.projectId || "미연결"}</span>
               <span>{model.storage || "local"}</span>
               <span>{model.sizeBytes ? fileSizeLabel(model.sizeBytes) : "-"}</span>
-              <em>{model.viewerStatus === "ready" ? "뷰어 준비" : "등록됨"}</em>
+              <em>{model.viewerStatus === "ready" ? "뷰어 준비" : "XKT 대기"}</em>
             </div>
           )) : (
             <p className="empty-list-note">동기화된 IFC 모델이 없습니다.</p>
