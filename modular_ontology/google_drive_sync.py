@@ -742,7 +742,10 @@ def sync_google_drive_registry_files(
 
     projects = root.get(PROJECTS_FOLDER)
     if projects and projects.is_folder:
+        _write_project_folders(data_dir, _project_folder_records(client, projects.id, warnings=warnings))
         downloaded.extend(_download_project_ifc_metadata_files(client, projects.id, data_dir, warnings=warnings))
+    else:
+        _write_project_folders(data_dir, [])
 
     result = {
         "status": "synced",
@@ -755,6 +758,30 @@ def sync_google_drive_registry_files(
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
+
+
+def _project_folder_records(
+    client: GoogleDriveClient,
+    projects_folder_id: str,
+    *,
+    warnings: list[str] | None = None,
+) -> list[dict[str, str]]:
+    project_folders: list[dict[str, str]] = []
+    for project in client.list_children(projects_folder_id):
+        if not project.is_folder:
+            continue
+        project_id = _safe_drive_filename_or_none(project.name, warnings, f"{PROJECTS_FOLDER} project folder")
+        if not project_id or project_id == COMMON_PROJECT_ID:
+            continue
+        project_folders.append(
+            {
+                "folderId": project.id,
+                "projectId": project_id,
+                "name": project.name,
+                "modifiedTime": project.modified_time,
+            }
+        )
+    return project_folders
 
 
 def _download_project_ifc_metadata_files(

@@ -946,6 +946,37 @@ def test_drive_project_folder_delete_removes_project_and_company_access(monkeypa
     assert get_company_project_access("Client Co") == ["active-project"]
 
 
+def test_admin_fast_reindex_applies_drive_project_folder_deletions(monkeypatch, tmp_path) -> None:
+    from modular_ontology import app as app_module
+    from modular_ontology import project_store
+
+    monkeypatch.setenv("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "root")
+    monkeypatch.setattr(app_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(project_store, "DB_PATH", tmp_path / "projects.sqlite3")
+    monkeypatch.setattr(app_module, "require_admin", lambda authorization: None)
+    monkeypatch.setattr(app_module, "run_google_drive_registry_sync", lambda *args, **kwargs: {"enabled": True, "status": "synced"})
+    monkeypatch.setattr(app_module, "run_google_drive_write_back", lambda *args, **kwargs: {"enabled": True, "status": "written"})
+
+    project_store.sync_projects_from_drive_folders(
+        [
+            {"folderId": "drive-folder-1", "projectId": "active-project", "name": "Active Project"},
+            {"folderId": "drive-folder-2", "projectId": "deleted-project", "name": "Deleted Project"},
+        ]
+    )
+    marker = tmp_path / "02_Projects" / ".drive-project-folders.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        json.dumps([{"folderId": "drive-folder-1", "projectId": "active-project", "name": "Active Project"}]),
+        encoding="utf-8",
+    )
+
+    response = app_module.reindex(authorization="Bearer test-token")
+
+    assert response["driveProjects"]["deleted"] == ["deleted-project"]
+    assert response["writeBack"]["status"] == "written"
+    assert [project["id"] for project in project_store.list_projects([])] == ["active-project"]
+
+
 def test_query_api_returns_evidence(monkeypatch) -> None:
     from modular_ontology import app as app_module
 
@@ -2460,10 +2491,19 @@ def test_google_drive_registry_sync_registers_project_scoped_ifc_metadata(tmp_pa
 
     metadata_path = tmp_path / "03_IFC_Models" / "yeoju-modular-dormitory" / "metadata" / "yeoju.metadata.json"
     pack_path = tmp_path / "04_Ontology_Packs" / "indexed" / "project-pack.zip"
+    folders_path = tmp_path / "02_Projects" / ".drive-project-folders.json"
 
     assert result["status"] == "synced"
     assert str(metadata_path) in result["downloaded"]
     assert not pack_path.exists()
+    assert json.loads(folders_path.read_text(encoding="utf-8")) == [
+        {
+            "folderId": "project",
+            "projectId": "yeoju-modular-dormitory",
+            "name": "yeoju-modular-dormitory",
+            "modifiedTime": "",
+        }
+    ]
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert metadata["filename"] == "yeoju.ifc"

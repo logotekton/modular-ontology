@@ -2120,6 +2120,21 @@ dd {
   gap: 6px;
 }
 
+.project-header-actions .danger-action-button {
+  border-color: #fecaca;
+  background: #fff1f2;
+  color: #b91c1c;
+}
+
+.project-header-actions .danger-action-button:not(:disabled):focus-visible {
+  box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.14);
+}
+
+.project-header-actions .danger-action-button.is-confirming:not(:disabled) {
+  border-color: #f87171;
+  box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.12);
+}
+
 .action-feedback-button {
   position: relative;
   overflow: hidden;

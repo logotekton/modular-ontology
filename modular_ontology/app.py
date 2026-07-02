@@ -279,6 +279,9 @@ def ensure_runtime_registry() -> dict[str, Any]:
     result = run_google_drive_registry_sync()
     if result.get("status") in {"synced", "cached"}:
         try:
+            drive_projects = _apply_drive_project_folders()
+            if any(drive_projects.get(key) for key in ("created", "updated", "renamed", "deleted", "conflicts")):
+                result["driveProjects"] = drive_projects
             links = _apply_drive_project_pack_links()
             if links:
                 result["projectPackLinks"] = links
@@ -1350,15 +1353,20 @@ def reindex(full: bool = False, authorization: str | None = Header(default=None)
     if not full:
         registry = require_google_drive_sync(run_google_drive_registry_sync(force=True))
         result = index_all_packs()
+        drive_projects = _apply_drive_project_folders()
         links = _apply_drive_project_pack_links()
         result.update({
             "status": "registry-synced",
             "registry": registry,
             "xktConversion": {"status": "skipped", "reason": "fast registry sync"},
-            "driveProjects": {"created": [], "updated": [], "renamed": [], "conflicts": []},
+            "driveProjects": drive_projects,
             "projectPackLinks": links,
             "projects": list_projects(),
         })
+        if any(drive_projects.get(key) for key in ("created", "updated", "renamed", "deleted", "conflicts")):
+            result["writeBack"] = require_google_drive_write_back(run_google_drive_write_back("database"))
+            if drive_projects.get("accessRenamed") or drive_projects.get("accessRemoved"):
+                result["usersWriteBack"] = require_google_drive_write_back(run_google_drive_write_back("users"))
         return result
     conversion = run_google_drive_xkt_conversion()
     require_google_drive_sync(run_google_drive_sync(force=True))

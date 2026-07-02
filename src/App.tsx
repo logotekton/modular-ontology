@@ -21,6 +21,7 @@ import {
   SendHorizontal,
   ServerCog,
   ShieldCheck,
+  Trash2,
   Users,
   Waypoints,
 } from "lucide-react";
@@ -1316,6 +1317,8 @@ function App() {
             packs={packs}
             projects={projects}
             selectedPackId={selectedPackId}
+            onConfirm={confirmAction}
+            onDeleteProject={deleteProject}
             onSaveProject={saveProject}
           />
         )}
@@ -1829,6 +1832,8 @@ function ProjectsView({
   ifcModels,
   packs,
   projects,
+  onConfirm,
+  onDeleteProject,
   onSaveProject,
 }: {
   currentUser: CurrentUser | null;
@@ -1836,6 +1841,8 @@ function ProjectsView({
   packs: Pack[];
   projects: Project[];
   selectedPackId: string;
+  onConfirm: (options: ConfirmDialogOptions) => void;
+  onDeleteProject: (projectId: string) => void;
   onSaveProject: (form: ProjectForm) => Promise<Project | null | void> | Project | null | void;
 }) {
   const isAdmin = currentUser?.role === "admin";
@@ -1920,6 +1927,18 @@ function ProjectsView({
     setDialogMode(null);
   }
 
+  function confirmDeleteProject() {
+    if (!selectedProject) return;
+    onConfirm({
+      title: "프로젝트 삭제",
+      message: `${selectedProject.name} 프로젝트를 사이트 목록에서 삭제합니다. Google Drive 파일은 삭제하지 않습니다. Drive에 같은 폴더가 남아 있으면 다음 동기화 때 다시 표시될 수 있습니다.`,
+      confirmLabel: "삭제",
+      cancelLabel: "취소",
+      tone: "danger",
+      onConfirm: () => onDeleteProject(selectedProject.id),
+    });
+  }
+
   return (
     <>
     <section className="project-management-grid">
@@ -1946,6 +1965,17 @@ function ProjectsView({
                 onClick={() => runProjectAction("project-edit", openEditDialog)}
               >
                 편집
+              </button>
+              <button
+                aria-label="선택한 프로젝트 삭제"
+                className={actionButtonClass("project-delete", "danger-action-button")}
+                disabled={!selectedProject}
+                title="선택한 프로젝트 삭제"
+                type="button"
+                onClick={() => runProjectAction("project-delete", confirmDeleteProject)}
+              >
+                <Trash2 size={14} />
+                삭제
               </button>
             </div>
           )}
