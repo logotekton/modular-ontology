@@ -1528,6 +1528,14 @@ def test_mcp_tools_return_json_payloads() -> None:
     project_overview = json.loads(mcp_server.mo_project_overview("samcheok-building-b", 80, 160))
     project_search = json.loads(mcp_server.mo_project_search("samcheok-building-b", "Beam", 2))
     evidence_trace = json.loads(mcp_server.mo_evidence_trace("advance-steel-samcheok-bldg-b-bm25-evidence-pack", "Beam", 2))
+    anchor_coverage = json.loads(mcp_server.mo_anchor_coverage("revit-yeoju-ar-ifc-workset-module-localcrab-pack", 2, True))
+    anchor_coverage_min_limit = json.loads(mcp_server.mo_anchor_coverage("revit-yeoju-ar-ifc-workset-module-localcrab-pack", 0, False))
+    anchor_resolve = json.loads(
+        mcp_server.mo_anchor_resolve(
+            "revit-yeoju-ar-ifc-workset-module-localcrab-pack",
+            anchor_coverage["chunks"][0]["chunkId"],
+        )
+    )
     graph = json.loads(mcp_server.get_graph("revit-yeoju-ar-ifc-workset-module-localcrab-pack", 20, 40))
     evidence = json.loads(mcp_server.search_pack("advance-steel-samcheok-bldg-b-bm25-evidence-pack", "Beam", 2))
     answer = json.loads(mcp_server.ask_pack_question("advance-steel-samcheok-bldg-b-bm25-evidence-pack", "Beam", 2))
@@ -1550,6 +1558,8 @@ def test_mcp_tools_return_json_payloads() -> None:
     assert "mo_relation_type_list" in manifest["canonicalTools"]
     assert "mo_project_overview" in manifest["canonicalTools"]
     assert "mo_evidence_trace" in manifest["canonicalTools"]
+    assert "mo_anchor_resolve" in manifest["canonicalTools"]
+    assert "mo_anchor_coverage" in manifest["canonicalTools"]
     assert "mo_distinct_property_values" in manifest["canonicalTools"]
     assert "mo_filtered_search_nodes" in manifest["canonicalTools"]
     assert "mo_aggregate_nodes" in manifest["canonicalTools"]
@@ -1570,6 +1580,15 @@ def test_mcp_tools_return_json_payloads() -> None:
     assert project_search["matchCount"] > 0
     assert evidence_trace["evidence"]
     assert evidence_trace["nodes"]["nodes"]
+    assert anchor_coverage["chunksScanned"] == 2
+    assert anchor_coverage["scan"]["member"] == "cloud/chunks.jsonl"
+    assert anchor_coverage["coverage"]["total"] >= 2
+    assert anchor_coverage["coverage"]["unresolvable"] >= 1
+    assert anchor_coverage["chunks"]
+    assert anchor_coverage_min_limit["limit"] == 1
+    assert anchor_coverage_min_limit["chunksScanned"] == 1
+    assert anchor_resolve["anchorCount"] >= 1
+    assert anchor_resolve["anchors"][0]["schema_version"] == "anchor/0.1"
     assert graph["nodes"]
     assert isinstance(evidence, list)
     assert evidence
