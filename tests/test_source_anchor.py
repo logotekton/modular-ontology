@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 import pytest
-from jsonschema import validate
 
 from modular_ontology.source_anchor import (
     SCHEMA_VERSION,
@@ -178,6 +177,44 @@ def test_schedule_row_anchor_and_pdf_extension_guard() -> None:
     assert not_pdf[0].anchor_type == "unknown"
 
 
+def test_schedule_row_anchor_preserves_zero_row_and_column() -> None:
+    schedule = anchors_from_node_properties(
+        {
+            "schedule_unique_id": "schedule-unique",
+            "schedule_name": "창호 일람표",
+            "section": "Header",
+            "row_index": 0,
+            "column_index": 0,
+        }
+    )[0]
+
+    assert schedule.anchor_type == "revit_schedule_row"
+    assert schedule.confidence == "exact"
+    assert schedule.ids["section"] == "Header"
+    assert schedule.ids["row"] == 0
+    assert schedule.ids["cell"] == 0
+    assert "Header > row 0, cell 0" in open_hint(schedule)
+
+
+def test_dxf_fallback_anchor_prefers_real_dxf_file_and_entity_key() -> None:
+    dxf = anchors_from_node_properties(
+        {
+            "source_file": "drawing_entities.jsonl",
+            "dxf_file_name": "A-711_창호일람표-1.dxf",
+            "entity_key": "A-711:2AF",
+            "entity_type": "TEXT",
+            "layer": "A-ANNO-TEXT",
+        }
+    )[0]
+
+    assert dxf.anchor_type == "dxf_entity"
+    assert dxf.confidence == "exact"
+    assert dxf.document_key == "A-711_창호일람표-1.dxf"
+    assert dxf.ids["source_file"] == "A-711_창호일람표-1.dxf"
+    assert dxf.ids["entity_key"] == "A-711:2AF"
+    assert "A-711_창호일람표-1.dxf > entity A-711:2AF" in open_hint(dxf)
+
+
 def test_coverage_counts_resolvable_exact_partial_and_type() -> None:
     anchors = [
         anchors_from_node_properties({"unique_id": "u1", "element_id": 1})[0],
@@ -198,6 +235,7 @@ def test_coverage_counts_resolvable_exact_partial_and_type() -> None:
 
 
 def test_schema_file_declares_same_anchor_version_and_types() -> None:
+    jsonschema = pytest.importorskip("jsonschema")
     schema_path = Path(__file__).parents[1] / "modular_ontology" / "schemas" / "source_anchor.schema.json"
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
 
@@ -206,7 +244,7 @@ def test_schema_file_declares_same_anchor_version_and_types() -> None:
     assert "boq_sheet_row" in schema["properties"]["anchor_type"]["enum"]
 
     anchor = anchors_from_node_properties({"unique_id": "u1", "element_id": 1})[0]
-    validate(anchor.to_dict(), schema)
+    jsonschema.validate(anchor.to_dict(), schema)
 
 
 def test_source_kind_is_validated() -> None:

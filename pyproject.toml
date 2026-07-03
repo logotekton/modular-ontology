@@ -19,5 +19,11 @@ dependencies = [
     "mcp>=1.9.0",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "jsonschema>=4.0.0",
+]
+
 [tool.setuptools.packages.find]
 include = ["manus_harness*", "modular_ontology*"]

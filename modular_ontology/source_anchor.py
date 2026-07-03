@@ -119,9 +119,12 @@ def open_hint(anchor: SourceAnchor | Mapping[str, Any]) -> str:
         schedule_name = _first_text(ids.get("schedule_name"))
         row = _first_text(ids.get("row"))
         cell = _first_text(ids.get("cell"))
+        section = _first_text(ids.get("section"))
         location = f"row {row}" if row else "행 미상"
         if cell:
             location = f"{location}, cell {cell}"
+        if section:
+            location = f"{section} > {location}"
         return f"Revit > 일람표 확인: {schedule_name or document_key or '일람표 미상'} > {location}"
     if anchor_type == "boq_sheet_row":
         sheet = _first_text(ids.get("source_sheet"))
@@ -129,7 +132,7 @@ def open_hint(anchor: SourceAnchor | Mapping[str, Any]) -> str:
         return f"BOQ/산출근거 > {sheet or document_key or '시트 미상'} > row {row or '미상'}"
     if anchor_type == "dxf_entity":
         source_file = _first_text(ids.get("source_file"))
-        handle = _first_text(ids.get("handle") or ids.get("entity_id"))
+        handle = _first_text(_first_present(ids.get("handle"), ids.get("entity_key"), ids.get("entity_id")))
         layer = _first_text(ids.get("layer"))
         suffix = f" > entity {handle}" if handle else ""
         if layer:
@@ -319,15 +322,16 @@ def _revit_view_anchors(props: Mapping[str, Any]) -> list[SourceAnchor]:
 
 def _revit_schedule_row_anchors(props: Mapping[str, Any]) -> list[SourceAnchor]:
     schedule_unique_id = _first_text(props.get("schedule_unique_id"))
-    schedule_id = _first_int(props.get("schedule_id") or props.get("source_schedule_id"))
-    row = _first_int(props.get("row") or props.get("row_index") or props.get("source_row_index"))
-    cell = _first_int(props.get("column") or props.get("column_index") or props.get("cell_index"))
+    schedule_id = _first_int(_first_present(props.get("schedule_id"), props.get("source_schedule_id")))
+    row = _first_int(_first_present(props.get("row"), props.get("row_index"), props.get("source_row_index")))
+    cell = _first_int(_first_present(props.get("column"), props.get("column_index"), props.get("cell_index")))
     if not schedule_unique_id and schedule_id is None and row is None:
         return []
     ids = {
         "schedule_id": schedule_id,
         "schedule_unique_id": schedule_unique_id,
         "schedule_name": _first_text(props.get("schedule_name") or props.get("name")),
+        "section": _first_text(props.get("section") or props.get("schedule_section")),
         "row": row,
         "cell": cell,
     }
@@ -344,26 +348,31 @@ def _revit_schedule_row_anchors(props: Mapping[str, Any]) -> list[SourceAnchor]:
 
 
 def _dxf_entity_anchors(props: Mapping[str, Any]) -> list[SourceAnchor]:
-    source_file = _first_text(props.get("source_file") or props.get("dxf_file"))
+    source_file = _first_text(_first_present(props.get("dxf_file_name"), props.get("dxf_file"), props.get("source_file")))
     entity_type = _first_text(props.get("entity_type"))
     ai_category = _first_text(props.get("ai_category") or props.get("evidence_type"))
-    handle = _first_text(props.get("handle") or props.get("entity_handle") or props.get("entity_id"))
-    if not handle and ai_category != "dxf_entity" and entity_type not in {"LINE", "LWPOLYLINE", "TEXT", "MTEXT", "DIMENSION"}:
+    handle = _first_text(_first_present(props.get("handle"), props.get("entity_handle"), props.get("entity_id")))
+    entity_key = _first_text(_first_present(props.get("entity_key"), props.get("source_entity_key")))
+    locator = handle or entity_key
+    if not locator and ai_category != "dxf_entity" and entity_type not in {"LINE", "LWPOLYLINE", "TEXT", "MTEXT", "DIMENSION"}:
         return []
     ids = {
         "source_file": source_file,
+        "source_jsonl": _first_text(props.get("source_jsonl")),
         "sheet_no": _first_text(props.get("sheet_no") or props.get("sheet_number")),
         "entity_type": entity_type,
         "handle": handle,
+        "entity_key": entity_key,
         "layer": _first_text(props.get("layer")),
     }
+    exact_source = bool(source_file and source_file.lower().endswith(".dxf"))
     return [
         SourceAnchor(
             anchor_type="dxf_entity",
             source_kind="dxf",
             document_key=source_file or _document_key(props),
             ids=_drop_empty(ids),
-            confidence="exact" if source_file and handle else "partial",
+            confidence="exact" if exact_source and locator else "partial",
             raw=_raw_excerpt(props),
         )
     ]
@@ -529,6 +538,14 @@ def _first_text(value: Any) -> str | None:
     return None
 
 
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is None or value == "":
+            continue
+        return value
+    return None
+
+
 def _first_int(value: Any) -> int | None:
     if value is None or isinstance(value, bool):
         return None
@@ -565,6 +582,10 @@ def _raw_excerpt(props: Mapping[str, Any]) -> dict[str, Any]:
         "source_refs",
         "source_node_id",
         "raw_record_hash",
+        "dxf_file_name",
+        "entity_key",
+        "source_entity_key",
+        "source_jsonl",
     ):
         if key in props:
             excerpt[key] = props[key]
