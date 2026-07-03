@@ -36,6 +36,7 @@ from .pack_index import (
     score_terms,
 )
 from .qa import answer_pack_question
+from .source_anchor import anchors_from_chunk, coverage as source_anchor_coverage
 from .store import connect as connect_index_db, init_db as init_index_db
 
 
@@ -116,6 +117,8 @@ TOOL_MANIFEST = [
     {"name": "mo_chunk_read", "legacy": ["read_chunk_by_id"], "domain": "chunk", "action": "read"},
     {"name": "mo_evidence_search", "legacy": ["search_pack", "search_documents"], "domain": "evidence", "action": "search"},
     {"name": "mo_evidence_trace", "legacy": [], "domain": "evidence", "action": "trace"},
+    {"name": "mo_anchor_resolve", "legacy": [], "domain": "anchor", "action": "resolve"},
+    {"name": "mo_anchor_coverage", "legacy": [], "domain": "anchor", "action": "coverage"},
     {"name": "mo_drawing_text_search", "legacy": ["search_drawing_text"], "domain": "drawing_text", "action": "search"},
     {"name": "mo_room_area_tag_extract", "legacy": ["extract_room_area_tags"], "domain": "room_area_tag", "action": "extract"},
     {"name": "mo_dimensions_extract", "legacy": ["extract_dimensions_from_view"], "domain": "dimension", "action": "extract"},
@@ -1498,9 +1501,13 @@ def _read_drawing_entity_payload(pack_id: str, chunk_id: str) -> dict | None:
                 "chunk_id": requested,
                 "text": payload.get("text"),
                 "metadata": {
-                    "source_file": "drawing_entities.jsonl",
+                    "source_file": payload.get("source_file") or "drawing_entities.jsonl",
+                    "dxf_file_name": payload.get("source_file"),
+                    "source_jsonl": payload.get("source_jsonl") or str(root / "drawing_entities.jsonl"),
                     "entity_key": entity_key,
+                    "source_entity_key": entity_key,
                     "entity_type": row.get("entity_type"),
+                    "handle": payload.get("handle") or row.get("handle"),
                     "layer": row.get("layer"),
                     "source_context": _drawing_entity_context(row),
                     "bbox": payload.get("bbox"),
@@ -1519,10 +1526,13 @@ def _read_drawing_entity_payload(pack_id: str, chunk_id: str) -> dict | None:
                 "chunk_id": requested,
                 "text": payload.get("text"),
                 "metadata": {
-                    "source_file": "drawing_entities.jsonl",
+                    "source_file": payload.get("source_file") or "drawing_entities.jsonl",
                     "dxf_file_name": payload.get("source_file"),
+                    "source_jsonl": payload.get("source_jsonl") or str(root / "drawing_entities.jsonl"),
                     "entity_key": entity_key,
+                    "source_entity_key": entity_key,
                     "entity_type": row.get("entity_type"),
+                    "handle": payload.get("handle") or row.get("handle"),
                     "layer": row.get("layer"),
                     "source_context": _drawing_entity_context(row),
                     "bbox": payload.get("bbox"),
@@ -1550,6 +1560,71 @@ def _read_chunk_payload(pack_id: str, chunk_id: str) -> dict:
     if entity_payload:
         return entity_payload
     return {"error": "not_found", "pack_id": pack_id, "chunk_id": chunk_id}
+
+
+def _anchor_resolve_payload(pack_id: str, chunk_id: str) -> dict:
+    chunk = _read_chunk_payload(pack_id=pack_id, chunk_id=chunk_id)
+    if chunk.get("error"):
+        return chunk
+    anchors = anchors_from_chunk(chunk)
+    anchor_payloads = [anchor.to_dict() for anchor in anchors]
+    return {
+        "packId": pack_id,
+        "chunkId": chunk.get("chunk_id") or chunk_id,
+        "documentId": chunk.get("document_id"),
+        "anchorCount": len(anchor_payloads),
+        "coverage": source_anchor_coverage(anchors),
+        "anchors": anchor_payloads,
+        "chunk": {
+            "text": chunk.get("text"),
+            "metadata": chunk.get("metadata") or {},
+            "source_refs": chunk.get("source_refs") or [],
+        },
+    }
+
+
+def _anchor_coverage_payload(pack_id: str, limit: int = 200, include_chunks: bool = False) -> dict:
+    max_chunks = max(1, min(int(limit), 5000))
+    all_anchors = []
+    chunk_rows = []
+    chunks_scanned = 0
+    for chunk in _iter_pack_jsonl_member(pack_id, "cloud/chunks.jsonl"):
+        if max_chunks and chunks_scanned >= max_chunks:
+            break
+        chunks_scanned += 1
+        chunk_payload = {
+            "pack_id": pack_id,
+            "chunk_id": chunk.get("chunk_id"),
+            "document_id": chunk.get("document_id"),
+            "text": chunk.get("text"),
+            "metadata": chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else {},
+            "source_refs": (
+                chunk.get("metadata", {}).get("source_refs", [])
+                if isinstance(chunk.get("metadata"), dict)
+                else []
+            ),
+        }
+        anchors = anchors_from_chunk(chunk_payload)
+        all_anchors.extend(anchors)
+        if include_chunks:
+            chunk_rows.append(
+                {
+                    "chunkId": chunk_payload["chunk_id"],
+                    "documentId": chunk_payload["document_id"],
+                    "anchorCount": len(anchors),
+                    "coverage": source_anchor_coverage(anchors),
+                    "anchors": [anchor.to_dict() for anchor in anchors],
+                }
+            )
+
+    return {
+        "packId": pack_id,
+        "limit": max_chunks,
+        "scan": {"member": "cloud/chunks.jsonl"},
+        "chunksScanned": chunks_scanned,
+        "coverage": source_anchor_coverage(all_anchors),
+        "chunks": chunk_rows if include_chunks else [],
+    }
 
 
 def _dxf_request_roots(
@@ -3983,6 +4058,24 @@ def mo_evidence_trace(pack_id: str, search_text: str, limit: int = 5, include_an
             include_answer=include_answer,
         )
     )
+
+
+@mcp.tool()
+def mo_anchor_resolve(pack_id: str, chunk_id: str) -> str:
+    """Resolve source-native anchors for one evidence chunk so users can reopen the original source."""
+
+    if not _pack_is_visible(pack_id):
+        return _forbidden_pack(pack_id)
+    return _json(_anchor_resolve_payload(pack_id=pack_id, chunk_id=chunk_id))
+
+
+@mcp.tool()
+def mo_anchor_coverage(pack_id: str, limit: int = 200, include_chunks: bool = False) -> str:
+    """Summarize source-native anchor coverage across evidence chunks in a pack."""
+
+    if not _pack_is_visible(pack_id):
+        return _forbidden_pack(pack_id)
+    return _json(_anchor_coverage_payload(pack_id=pack_id, limit=limit, include_chunks=include_chunks))
 
 
 @mcp.tool()
