@@ -118,7 +118,23 @@ def as_int(value: Any) -> int | None:
         return None
 
 
+def first_present(*values: Any) -> Any:
+    for value in values:
+        if value is None or value == "":
+            continue
+        return value
+    return None
+
+
+def drop_empty(values: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in values.items() if value not in (None, "", [], {})}
+
+
 def source_ref(source_file: str, row: dict[str, Any]) -> dict[str, Any]:
+    element = row.get("element") if isinstance(row.get("element"), dict) else {}
+    sheet = row.get("sheet") if isinstance(row.get("sheet"), dict) else {}
+    view = row.get("view") if isinstance(row.get("view"), dict) else {}
+    drawing_ref = row.get("drawing_ref") if isinstance(row.get("drawing_ref"), dict) else {}
     source_id = (
         row.get("node_id")
         or row.get("index_key")
@@ -137,12 +153,106 @@ def source_ref(source_file: str, row: dict[str, Any]) -> dict[str, Any]:
         or row.get("handle")
         or compact_hash(row)
     )
-    return {
+    ref = {
         "source_file": source_file,
         "source_id": source_id,
         "source_node_id": row.get("node_id"),
         "raw_record_hash": stable_hash(row),
     }
+    record_type = str(row.get("record_type") or "")
+    is_element_ref = bool(
+        source_file in {"elements.jsonl", "quantities.jsonl"}
+        or record_type in {"bim_object", "quantity_fact"}
+        or row.get("source_element_id") is not None
+        or row.get("element_id") is not None
+        or element.get("element_id") is not None
+        or row.get("element_unique_id") is not None
+        or element.get("unique_id") is not None
+    )
+    is_sheet_ref = bool(
+        source_file == "sheets.jsonl"
+        or record_type == "drawing_document"
+        or row.get("sheet_id") is not None
+        or row.get("source_sheet_id") is not None
+        or row.get("sheet_number") is not None
+        or sheet.get("sheet_number") is not None
+    )
+    is_view_ref = bool(
+        source_file == "views.jsonl"
+        or row.get("view_id") is not None
+        or row.get("view_name") is not None
+        or view.get("element_id") is not None
+    )
+    is_schedule_ref = bool(
+        source_file in {"schedules.jsonl", "schedule_cells.jsonl"}
+        or record_type == "schedule_row"
+        or row.get("schedule_id") is not None
+        or row.get("source_schedule_id") is not None
+        or row.get("schedule_name") is not None
+    )
+    sheet_row_unique_id = row.get("unique_id") if source_file == "sheets.jsonl" or record_type == "drawing_document" else None
+    view_row_unique_id = row.get("unique_id") if source_file == "views.jsonl" else None
+    schedule_row_unique_id = (
+        row.get("unique_id") if source_file in {"schedules.jsonl", "schedule_cells.jsonl"} or record_type == "schedule_row" else None
+    )
+    ref.update(
+        drop_empty(
+            {
+                "record_type": row.get("record_type"),
+                "element_id": (
+                    first_present(row.get("source_element_id"), row.get("element_id"), element.get("element_id"))
+                    if is_element_ref
+                    else None
+                ),
+                "unique_id": (
+                    first_present(row.get("unique_id"), row.get("element_unique_id"), element.get("unique_id"))
+                    if is_element_ref
+                    else None
+                ),
+                "ifc_guid": first_present(row.get("ifc_guid"), element.get("ifc_guid")) if is_element_ref else None,
+                "sheet_id": (
+                    first_present(row.get("source_sheet_id"), row.get("sheet_id"), sheet.get("element_id"))
+                    if is_sheet_ref
+                    else None
+                ),
+                "sheet_number": first_present(row.get("sheet_number"), sheet.get("sheet_number")) if is_sheet_ref else None,
+                "sheet_name": (
+                    first_present(row.get("sheet_name"), sheet.get("name"), sheet.get("sheet_name"))
+                    if is_sheet_ref
+                    else None
+                ),
+                "sheet_unique_id": (
+                    first_present(row.get("sheet_unique_id"), sheet.get("unique_id"), sheet_row_unique_id)
+                    if is_sheet_ref
+                    else None
+                ),
+                "view_id": first_present(row.get("view_id"), view.get("element_id")) if is_view_ref else None,
+                "view_name": first_present(row.get("view_name"), view.get("name")) if is_view_ref else None,
+                "view_unique_id": (
+                    first_present(row.get("view_unique_id"), view.get("unique_id"), view_row_unique_id)
+                    if is_view_ref
+                    else None
+                ),
+                "schedule_id": (
+                    first_present(row.get("schedule_id"), row.get("source_schedule_id")) if is_schedule_ref else None
+                ),
+                "schedule_unique_id": (
+                    first_present(row.get("schedule_unique_id"), schedule_row_unique_id) if is_schedule_ref else None
+                ),
+                "schedule_name": first_present(row.get("schedule_name"), row.get("name")) if is_schedule_ref else None,
+                "section": row.get("section") if is_schedule_ref else None,
+                "row": row.get("row") if is_schedule_ref else None,
+                "column": row.get("column") if is_schedule_ref else None,
+                "page": first_present(row.get("page"), row.get("page_number")),
+                "dxf_file_name": first_present(row.get("dxf_file_name"), drawing_ref.get("dxf_file_name")),
+                "entity_key": row.get("entity_key"),
+                "source_entity_key": row.get("source_entity_key"),
+                "handle": row.get("handle"),
+                "entity_type": first_present(row.get("entity_type"), drawing_ref.get("entity_type")),
+            }
+        )
+    )
+    return ref
 
 
 def source_key(source_file: str, row: dict[str, Any]) -> str:

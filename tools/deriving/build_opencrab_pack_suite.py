@@ -68,6 +68,36 @@ SOURCE_TO_DERIVED = {
 
 FT2_TO_M2 = 0.09290304
 
+SOURCE_REF_FIELDS = (
+    "source_file",
+    "source_id",
+    "source_node_id",
+    "raw_record_hash",
+    "record_type",
+    "element_id",
+    "unique_id",
+    "ifc_guid",
+    "sheet_id",
+    "sheet_number",
+    "sheet_name",
+    "sheet_unique_id",
+    "view_id",
+    "view_name",
+    "view_unique_id",
+    "schedule_id",
+    "schedule_unique_id",
+    "schedule_name",
+    "section",
+    "row",
+    "column",
+    "page",
+    "dxf_file_name",
+    "entity_key",
+    "source_entity_key",
+    "handle",
+    "entity_type",
+)
+
 
 @dataclass(frozen=True)
 class PackSpec:
@@ -194,12 +224,7 @@ def compact_source_refs(row: dict[str, Any]) -> list[dict[str, Any]]:
     compact: list[dict[str, Any]] = []
     for ref in source_refs(row):
         compact.append(
-            {
-                "source_file": ref.get("source_file"),
-                "source_id": ref.get("source_id"),
-                "source_node_id": ref.get("source_node_id"),
-                "raw_record_hash": ref.get("raw_record_hash"),
-            }
+            {key: ref.get(key) for key in SOURCE_REF_FIELDS if ref.get(key) not in (None, "", [], {})}
         )
     return compact
 

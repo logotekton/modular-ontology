@@ -71,6 +71,8 @@ def anchors_from_chunk(chunk: Mapping[str, Any]) -> list[SourceAnchor]:
         candidates.extend(_anchors_from_source_refs(_list_of_mappings(metadata.get("source_refs"))))
 
     candidates.extend(_anchors_from_source_refs(_list_of_mappings(chunk.get("source_refs"))))
+    if not candidates:
+        candidates.extend(_legacy_revit_element_anchors_from_text(chunk))
     return _dedupe_or_unknown(candidates, chunk)
 
 
@@ -401,6 +403,13 @@ def _pdf_page_anchors(props: Mapping[str, Any]) -> list[SourceAnchor]:
 def _anchors_from_source_refs(refs: list[Mapping[str, Any]]) -> list[SourceAnchor]:
     anchors: list[SourceAnchor] = []
     for ref in refs:
+        ref_props = dict(ref)
+        ref_props.pop("source_refs", None)
+        delegated = anchors_from_node_properties(ref_props, include_unknown=False)
+        if delegated:
+            anchors.extend(delegated)
+            continue
+
         source_file = _first_text(ref.get("source_file"))
         source_node_id = _first_text(ref.get("source_node_id"))
         element_id = _first_int(_match_group(_REVIT_ELEMENT_NODE_RE, source_node_id, "element_id"))
@@ -468,6 +477,66 @@ def _anchors_from_source_refs(refs: list[Mapping[str, Any]]) -> list[SourceAncho
     return anchors
 
 
+def _legacy_revit_element_anchors_from_text(chunk: Mapping[str, Any], limit: int = 20) -> list[SourceAnchor]:
+    text = _first_text(chunk.get("text"))
+    if not text or "|" not in text:
+        return []
+    metadata = _mapping(chunk.get("metadata"))
+    document_key = _first_text(metadata.get("source_path") or chunk.get("path") or chunk.get("document_id"))
+    headers: list[str] = []
+    anchors: list[SourceAnchor] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("|") or line.count("|") < 2:
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        lowered = [cell.lower() for cell in cells]
+        if any("elementid" in cell.replace(" ", "") or "element id" in cell for cell in lowered):
+            headers = cells
+            continue
+        if not headers or all(set(cell) <= {"-", " "} for cell in cells):
+            continue
+        if len(cells) != len(headers):
+            continue
+        if not any(_first_int(cell) is not None for cell in cells):
+            headers = []
+            continue
+        element_col = _header_index(headers, "revit elementid", "revit element id", "elementid", "element id")
+        if element_col is None or element_col >= len(cells):
+            continue
+        element_id = _first_int(cells[element_col])
+        if element_id is None:
+            continue
+        guid_col = _header_index(headers, "ifc guid", "ifc_guid", "guid")
+        ifc_guid = _first_text(cells[guid_col]) if guid_col is not None and guid_col < len(cells) else None
+        anchors.append(
+            SourceAnchor(
+                anchor_type="revit_element",
+                source_kind="revit_model",
+                document_key=document_key,
+                ids=_drop_empty(
+                    {
+                        "element_id": element_id,
+                        "ifc_guid": ifc_guid,
+                        "source_path": document_key,
+                        "text_fallback": "markdown_table",
+                    }
+                ),
+                confidence="partial",
+                raw=_raw_excerpt(
+                    {
+                        **dict(chunk),
+                        "anchor_origin": "legacy_markdown_table",
+                        "source_path": document_key,
+                    }
+                ),
+            )
+        )
+        if len(anchors) >= limit:
+            break
+    return anchors
+
+
 def _dedupe_or_unknown(anchors: list[SourceAnchor], raw: Mapping[str, Any] | None) -> list[SourceAnchor]:
     deduped = _dedupe(anchors)
     return deduped if deduped else _unknown_list(raw)
@@ -524,6 +593,8 @@ def _document_key(props: Mapping[str, Any]) -> str | None:
         or props.get("project_key")
         or props.get("source_document")
         or props.get("source_file")
+        or props.get("source_path")
+        or props.get("path")
     )
 
 
@@ -567,6 +638,18 @@ def _match_group(pattern: re.Pattern[str], value: str | None, group: str) -> str
     return match.group(group) if match else None
 
 
+def _header_index(headers: list[str], *candidates: str) -> int | None:
+    normalized = [header.lower().replace("_", " ").replace("-", " ").strip() for header in headers]
+    compact = [header.replace(" ", "") for header in normalized]
+    for candidate in candidates:
+        needle = candidate.lower().replace("_", " ").replace("-", " ").strip()
+        needle_compact = needle.replace(" ", "")
+        for index, header in enumerate(normalized):
+            if header == needle or compact[index] == needle_compact:
+                return index
+    return None
+
+
 def _drop_empty(values: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in values.items() if value not in (None, "", [], {})}
 
@@ -581,7 +664,9 @@ def _raw_excerpt(props: Mapping[str, Any]) -> dict[str, Any]:
         "row_id",
         "source_refs",
         "source_node_id",
+        "source_path",
         "raw_record_hash",
+        "anchor_origin",
         "dxf_file_name",
         "entity_key",
         "source_entity_key",

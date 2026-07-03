@@ -1544,18 +1544,28 @@ def _read_drawing_entity_payload(pack_id: str, chunk_id: str) -> dict | None:
     return None
 
 
+def _cloud_chunk_payload(pack_id: str, chunk: dict) -> dict:
+    metadata = chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else {}
+    chunk_source_refs = []
+    if isinstance(metadata.get("source_refs"), list):
+        chunk_source_refs.extend(metadata.get("source_refs") or [])
+    if isinstance(chunk.get("source_refs"), list):
+        chunk_source_refs.extend(chunk.get("source_refs") or [])
+    return {
+        "pack_id": pack_id,
+        "chunk_id": chunk.get("chunk_id"),
+        "document_id": chunk.get("document_id"),
+        "text": chunk.get("text"),
+        "path": chunk.get("path"),
+        "metadata": metadata,
+        "source_refs": chunk_source_refs,
+    }
+
+
 def _read_chunk_payload(pack_id: str, chunk_id: str) -> dict:
     for chunk in _iter_pack_jsonl_member(pack_id, "cloud/chunks.jsonl"):
         if str(chunk.get("chunk_id")) == str(chunk_id):
-            metadata = chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else {}
-            return {
-                "pack_id": pack_id,
-                "chunk_id": chunk.get("chunk_id"),
-                "document_id": chunk.get("document_id"),
-                "text": chunk.get("text"),
-                "metadata": metadata,
-                "source_refs": metadata.get("source_refs", []),
-            }
+            return _cloud_chunk_payload(pack_id, chunk)
     entity_payload = _read_drawing_entity_payload(pack_id, chunk_id)
     if entity_payload:
         return entity_payload
@@ -1587,24 +1597,37 @@ def _anchor_coverage_payload(pack_id: str, limit: int = 200, include_chunks: boo
     max_chunks = max(1, min(int(limit), 5000))
     all_anchors = []
     chunk_rows = []
+    chunk_status_counts: Counter[str] = Counter()
+    by_document: dict[str, dict[str, object]] = {}
     chunks_scanned = 0
+    truncated = False
     for chunk in _iter_pack_jsonl_member(pack_id, "cloud/chunks.jsonl"):
         if max_chunks and chunks_scanned >= max_chunks:
+            truncated = True
             break
         chunks_scanned += 1
-        chunk_payload = {
-            "pack_id": pack_id,
-            "chunk_id": chunk.get("chunk_id"),
-            "document_id": chunk.get("document_id"),
-            "text": chunk.get("text"),
-            "metadata": chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else {},
-            "source_refs": (
-                chunk.get("metadata", {}).get("source_refs", [])
-                if isinstance(chunk.get("metadata"), dict)
-                else []
-            ),
-        }
+        chunk_payload = _cloud_chunk_payload(pack_id, chunk)
         anchors = anchors_from_chunk(chunk_payload)
+        chunk_coverage = source_anchor_coverage(anchors)
+        if chunk_coverage["exact"]:
+            chunk_status = "exact"
+        elif chunk_coverage["resolvable"]:
+            chunk_status = "partial"
+        else:
+            chunk_status = "unknown"
+        chunk_status_counts[chunk_status] += 1
+        document_id = str(chunk_payload.get("document_id") or "<none>")
+        document_row = by_document.setdefault(
+            document_id,
+            {"documentId": document_id, "chunksScanned": 0, "resolvableChunks": 0, "exactChunks": 0, "unknownChunks": 0},
+        )
+        document_row["chunksScanned"] = int(document_row["chunksScanned"]) + 1
+        if chunk_status != "unknown":
+            document_row["resolvableChunks"] = int(document_row["resolvableChunks"]) + 1
+        if chunk_status == "exact":
+            document_row["exactChunks"] = int(document_row["exactChunks"]) + 1
+        if chunk_status == "unknown":
+            document_row["unknownChunks"] = int(document_row["unknownChunks"]) + 1
         all_anchors.extend(anchors)
         if include_chunks:
             chunk_rows.append(
@@ -1612,17 +1635,46 @@ def _anchor_coverage_payload(pack_id: str, limit: int = 200, include_chunks: boo
                     "chunkId": chunk_payload["chunk_id"],
                     "documentId": chunk_payload["document_id"],
                     "anchorCount": len(anchors),
-                    "coverage": source_anchor_coverage(anchors),
+                    "anchorStatus": chunk_status,
+                    "coverage": chunk_coverage,
                     "anchors": [anchor.to_dict() for anchor in anchors],
                 }
             )
 
+    resolvable_chunks = int(chunk_status_counts["exact"] + chunk_status_counts["partial"])
+    exact_chunks = int(chunk_status_counts["exact"])
+    unknown_chunks = int(chunk_status_counts["unknown"])
+    chunk_resolvable_rate = round(resolvable_chunks / chunks_scanned, 4) if chunks_scanned else 0.0
+    chunk_exact_rate = round(exact_chunks / chunks_scanned, 4) if chunks_scanned else 0.0
+    chunk_unknown_rate = round(unknown_chunks / chunks_scanned, 4) if chunks_scanned else 0.0
+    quality_status = "pass" if chunk_resolvable_rate >= 0.8 else "warn" if chunk_resolvable_rate > 0 else "fail"
+
     return {
         "packId": pack_id,
         "limit": max_chunks,
-        "scan": {"member": "cloud/chunks.jsonl"},
+        "scan": {"member": "cloud/chunks.jsonl", "truncated": truncated},
         "chunksScanned": chunks_scanned,
         "coverage": source_anchor_coverage(all_anchors),
+        "chunkCoverage": {
+            "total": chunks_scanned,
+            "resolvable": resolvable_chunks,
+            "unknown": unknown_chunks,
+            "exact": exact_chunks,
+            "partial": int(chunk_status_counts["partial"]),
+            "resolvable_rate": chunk_resolvable_rate,
+            "exact_rate": chunk_exact_rate,
+            "unknown_rate": chunk_unknown_rate,
+            "by_status": dict(chunk_status_counts),
+            "by_document": list(by_document.values()),
+        },
+        "quality": {
+            "metric": "anchor_chunk_coverage",
+            "status": quality_status,
+            "promotion_status": "draft" if quality_status != "fail" else "blocked",
+            "sampled": truncated,
+            "resolvable_rate": chunk_resolvable_rate,
+            "unknown_rate": chunk_unknown_rate,
+        },
         "chunks": chunk_rows if include_chunks else [],
     }
 
@@ -2559,6 +2611,8 @@ def _pack_overview_payload(pack_id: str, schema_node_limit: int = 300, schema_ed
         "mo_relation_type_list",
         "mo_evidence_search",
         "mo_evidence_trace",
+        "mo_anchor_coverage",
+        "mo_anchor_resolve",
         "mo_question_answer",
         "mo_graph_get",
         "mo_node_search",
