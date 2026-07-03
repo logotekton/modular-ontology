@@ -50,6 +50,7 @@ from .google_drive_sync import (
     google_drive_sync_status,
     restore_ifc_files_from_drive,
     sync_google_drive_registry_files,
+    sync_google_drive_project_storage,
     sync_google_drive_storage,
     sync_google_drive_mcp_tokens_file,
     sync_google_drive_users_file,
@@ -154,15 +155,24 @@ def _file_mtime_ns(path: Path) -> int | None:
         return None
 
 
-def run_google_drive_sync(force: bool = False) -> dict[str, Any]:
+def run_google_drive_sync(force: bool = False, *, include_shared_packs: bool = True) -> dict[str, Any]:
     try:
         with _GOOGLE_DRIVE_SYNC_LOCK:
-            result = sync_google_drive_storage(force=force)
+            result = sync_google_drive_storage(force=force, include_shared_packs=include_shared_packs)
         if result.get("status") == "synced":
             invalidate_users_cache()
         return result
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
+
+
+def run_google_drive_project_sync(project_id: str, force: bool = False) -> dict[str, Any]:
+    try:
+        with _GOOGLE_DRIVE_SYNC_LOCK:
+            result = sync_google_drive_project_storage(project_id, force=force)
+        return result
+    except Exception as exc:
+        return {"status": "error", "scope": "project", "projectId": project_id, "error": str(exc)}
 
 
 def run_google_drive_registry_sync(force: bool = False) -> dict[str, Any]:
@@ -1139,7 +1149,7 @@ def admin_sync_google_drive_storage(authorization: str | None = Header(default=N
     require_admin(authorization)
     if not google_drive_sync_enabled():
         raise HTTPException(status_code=400, detail="MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set.")
-    result = run_google_drive_sync(force=True)
+    result = run_google_drive_sync(force=True, include_shared_packs=False)
     if result.get("status") == "synced":
         index_result = index_all_packs()
         result["reindexed"] = index_result.get("stats", {})
@@ -1149,6 +1159,27 @@ def admin_sync_google_drive_storage(authorization: str | None = Header(default=N
         result["writeBack"] = require_google_drive_write_back(run_google_drive_write_back("database"))
         if result["driveProjects"].get("accessRenamed") or result["driveProjects"].get("accessRemoved"):
             result["usersWriteBack"] = require_google_drive_write_back(run_google_drive_write_back("users"))
+    return {"enabled": True, **result}
+
+
+@app.post("/api/admin/storage/google-drive/projects/{project_id}/sync")
+def admin_sync_google_drive_project(project_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_admin(authorization)
+    if not google_drive_sync_enabled():
+        raise HTTPException(status_code=400, detail="MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set.")
+    if not any(str(project["id"]) == project_id for project in list_projects()):
+        raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
+    result = run_google_drive_project_sync(project_id, force=True)
+    if result.get("status") == "missing":
+        raise HTTPException(status_code=404, detail=f"Google Drive project folder not found: {project_id}")
+    if result.get("status") == "error":
+        raise HTTPException(status_code=502, detail=f"Google Drive project sync failed: {result.get('error')}")
+    if result.get("status") == "synced":
+        index_result = index_all_packs()
+        result["reindexed"] = index_result.get("stats", {})
+        result["projectPackLinks"] = _apply_drive_project_pack_links()
+        result["projects"] = list_projects()
+        result["writeBack"] = require_google_drive_write_back(run_google_drive_write_back("database"))
     return {"enabled": True, **result}
 
 
