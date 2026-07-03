@@ -49,6 +49,7 @@ COMMON_PROJECT_PACK_LINKS_KEY = "__common__"
 PROJECT_PACK_LINKS_FILENAME = ".drive-project-pack-links.json"
 PROJECT_FOLDERS_FILENAME = ".drive-project-folders.json"
 DRIVE_FILE_CACHE_FILENAME = ".google-drive-file-cache.json"
+PROJECT_SYNC_MARKER_FOLDER = ".google-drive-project-sync"
 _DB_SYNC_LOCK = threading.Lock()
 
 
@@ -324,6 +325,7 @@ def sync_google_drive_storage(
     root_folder_id: str | None = None,
     data_dir: Path = DATA_DIR,
     force: bool = False,
+    include_shared_packs: bool = True,
 ) -> dict[str, Any]:
     root_folder_id = root_folder_id or str(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "")).strip()
     if not root_folder_id:
@@ -388,6 +390,7 @@ def sync_google_drive_storage(
             warnings=warnings,
             file_cache=file_cache,
             skipped=skipped,
+            include_common_packs=include_shared_packs,
         )
         downloaded.extend(project_downloads)
         _write_project_pack_links(data_dir, project_pack_links)
@@ -396,11 +399,15 @@ def sync_google_drive_storage(
         _write_project_folders(data_dir, [])
         missing.append(PROJECTS_FOLDER)
 
-    pack_roots = [
-        item
-        for item in (root.get(ONTOLOGY_PACKS_FOLDER), root.get(LEGACY_ONTOLOGY_PACKS_FOLDER))
-        if item and item.is_folder
-    ]
+    pack_roots = (
+        [
+            item
+            for item in (root.get(ONTOLOGY_PACKS_FOLDER), root.get(LEGACY_ONTOLOGY_PACKS_FOLDER))
+            if item and item.is_folder
+        ]
+        if include_shared_packs
+        else []
+    )
     if pack_roots:
         for packs in pack_roots:
             pack_folders = _children_by_name(client, packs.id)
@@ -444,6 +451,97 @@ def sync_google_drive_storage(
         "skipped": skipped,
         "missing": missing,
         "warnings": warnings,
+        "sharedPacksIncluded": include_shared_packs,
+    }
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
+
+
+def sync_google_drive_project_storage(
+    project_id: str,
+    *,
+    client: GoogleDriveClient | None = None,
+    root_folder_id: str | None = None,
+    data_dir: Path = DATA_DIR,
+    force: bool = False,
+) -> dict[str, Any]:
+    root_folder_id = root_folder_id or str(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "")).strip()
+    if not root_folder_id:
+        return {"status": "skipped", "reason": "MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set.", "scope": "project"}
+
+    safe_project_id = _safe_drive_filename(project_id.strip())
+    ttl = int(str(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_PROJECT_SYNC_TTL_SECONDS", str(DEFAULT_TTL_SECONDS))))
+    marker = _project_sync_marker(data_dir, safe_project_id)
+    if not force and ttl > 0 and marker.exists():
+        try:
+            previous = json.loads(marker.read_text(encoding="utf-8"))
+            if time.time() - float(previous.get("synced_at", 0)) < ttl:
+                return {"status": "cached", **previous}
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+
+    client = client or GoogleDriveClient.from_env()
+    root = _children_by_name(client, root_folder_id)
+    projects = root.get(PROJECTS_FOLDER)
+    if not projects or not projects.is_folder:
+        return {
+            "status": "missing",
+            "scope": "project",
+            "projectId": safe_project_id,
+            "downloaded": [],
+            "skipped": [],
+            "missing": [PROJECTS_FOLDER],
+            "warnings": [],
+        }
+
+    warnings: list[str] = []
+    project_item: DriveItem | None = None
+    for item in client.list_children(projects.id):
+        if not item.is_folder:
+            continue
+        item_project_id = _safe_drive_filename_or_none(item.name, warnings, f"{PROJECTS_FOLDER} project folder")
+        if item_project_id == safe_project_id:
+            project_item = item
+            break
+
+    if project_item is None:
+        return {
+            "status": "missing",
+            "scope": "project",
+            "projectId": safe_project_id,
+            "downloaded": [],
+            "skipped": [],
+            "missing": [f"{PROJECTS_FOLDER}/{safe_project_id}"],
+            "warnings": warnings,
+        }
+
+    skipped: list[str] = []
+    file_cache = _load_drive_file_cache(data_dir)
+    downloaded, pack_ids, _packs_folder_found = _download_single_project_assets(
+        client,
+        project_item,
+        safe_project_id,
+        data_dir,
+        warnings=warnings,
+        file_cache=file_cache,
+        skipped=skipped,
+    )
+    _merge_project_pack_links(data_dir, {safe_project_id: pack_ids})
+    _write_drive_file_cache(data_dir, file_cache)
+
+    result = {
+        "status": "synced",
+        "scope": "project",
+        "projectId": safe_project_id,
+        "projectFolderId": project_item.id,
+        "projectName": project_item.name,
+        "synced_at": time.time(),
+        "downloaded": downloaded,
+        "skipped": skipped,
+        "missing": [],
+        "warnings": warnings,
+        "packIds": pack_ids,
     }
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -738,6 +836,10 @@ def _sync_marker(data_dir: Path) -> Path:
 
 def _registry_sync_marker(data_dir: Path) -> Path:
     return data_dir / ".google-drive-registry-sync.json"
+
+
+def _project_sync_marker(data_dir: Path, project_id: str) -> Path:
+    return data_dir / PROJECT_SYNC_MARKER_FOLDER / f"{project_id}.json"
 
 
 def _drive_file_cache_path(data_dir: Path) -> Path:
@@ -1135,6 +1237,7 @@ def _download_project_assets(
     warnings: list[str] | None = None,
     file_cache: dict[str, dict[str, Any]] | None = None,
     skipped: list[str] | None = None,
+    include_common_packs: bool = True,
 ) -> tuple[list[str], dict[str, list[str]]]:
     downloaded: list[str] = []
     project_pack_links: dict[str, list[str]] = {}
@@ -1149,6 +1252,8 @@ def _download_project_assets(
         project_children = _children_by_name(client, project.id)
         if project_id == COMMON_PROJECT_ID:
             common_folder_found = True
+            if not include_common_packs:
+                continue
             common_downloads, common_active_paths = _download_common_zip_files(
                 client,
                 project.id,
@@ -1170,67 +1275,97 @@ def _download_project_assets(
                 "modifiedTime": project.modified_time,
             }
         )
-        metadata_folder = project_children.get("metadata")
-        existing_metadata_names: set[str] = set()
-        target_metadata_dir = data_dir / IFC_MODELS_FOLDER / project_id / "metadata"
-        if metadata_folder and metadata_folder.is_folder:
-            for item in client.list_children(metadata_folder.id):
-                if item.is_folder or not item.name.endswith(".metadata.json"):
-                    continue
-                metadata_name = _safe_drive_filename_or_none(item.name, warnings, f"{PROJECTS_FOLDER}/{project.name}/metadata")
-                if not metadata_name:
-                    continue
-                target = target_metadata_dir / metadata_name
-                if _download_file_if_changed(
-                    client,
-                    item,
-                    target,
-                    data_dir=data_dir,
-                    file_cache=file_cache,
-                    skipped=skipped,
-                ):
-                    downloaded.append(str(target))
-                existing_metadata_names.add(metadata_name)
-
-        ifc_folder = project_children.get(PROJECT_IFC_FOLDER)
-        if ifc_folder and ifc_folder.is_folder:
-            active_metadata_names: set[str] = set()
-            downloaded.extend(
-                _register_ifc_files_from_drive_folder(
-                    client,
-                    ifc_folder.id,
-                    data_dir / IFC_MODELS_FOLDER,
-                    project_id,
-                    project.name,
-                    f"{PROJECTS_FOLDER}/{project.name}/{PROJECT_IFC_FOLDER}",
-                    existing_metadata_names=existing_metadata_names,
-                    active_metadata_names=active_metadata_names,
-                    source_is_project=True,
-                    warnings=warnings,
-                )
-            )
-            _prune_project_metadata(target_metadata_dir, active_metadata_names)
-
-        packs_folder = project_children.get(PROJECT_PACKS_FOLDER)
-        if packs_folder and packs_folder.is_folder:
-            pack_downloads, pack_active_paths = _download_project_grouped_zip_files(
-                client,
-                packs_folder.id,
-                data_dir / ONTOLOGY_PACKS_FOLDER / "indexed",
-                project_id,
-                warnings=warnings,
-                data_dir=data_dir,
-                file_cache=file_cache,
-                skipped=skipped,
-            )
-            downloaded.extend(pack_downloads)
-            project_pack_links[project_id] = [_pack_id_from_zip(Path(path)) for path in pack_active_paths]
+        project_downloads, pack_ids, packs_folder_found = _download_single_project_assets(
+            client,
+            project,
+            project_id,
+            data_dir,
+            project_children=project_children,
+            warnings=warnings,
+            file_cache=file_cache,
+            skipped=skipped,
+        )
+        downloaded.extend(project_downloads)
+        if packs_folder_found:
+            project_pack_links[project_id] = pack_ids
     _write_project_folders(data_dir, project_folders)
     active_project_ids = {item["projectId"] for item in project_folders}
     if common_folder_found:
         active_project_ids.add(COMMON_PROJECT_ID)
     _prune_removed_project_assets(data_dir, active_project_ids)
     return downloaded, project_pack_links
+
+
+def _download_single_project_assets(
+    client: GoogleDriveClient,
+    project: DriveItem,
+    project_id: str,
+    data_dir: Path,
+    *,
+    project_children: dict[str, DriveItem] | None = None,
+    warnings: list[str] | None = None,
+    file_cache: dict[str, dict[str, Any]] | None = None,
+    skipped: list[str] | None = None,
+) -> tuple[list[str], list[str], bool]:
+    downloaded: list[str] = []
+    project_children = project_children or _children_by_name(client, project.id)
+    metadata_folder = project_children.get("metadata")
+    existing_metadata_names: set[str] = set()
+    target_metadata_dir = data_dir / IFC_MODELS_FOLDER / project_id / "metadata"
+    if metadata_folder and metadata_folder.is_folder:
+        for item in client.list_children(metadata_folder.id):
+            if item.is_folder or not item.name.endswith(".metadata.json"):
+                continue
+            metadata_name = _safe_drive_filename_or_none(item.name, warnings, f"{PROJECTS_FOLDER}/{project.name}/metadata")
+            if not metadata_name:
+                continue
+            target = target_metadata_dir / metadata_name
+            if _download_file_if_changed(
+                client,
+                item,
+                target,
+                data_dir=data_dir,
+                file_cache=file_cache,
+                skipped=skipped,
+            ):
+                downloaded.append(str(target))
+            existing_metadata_names.add(metadata_name)
+
+    ifc_folder = project_children.get(PROJECT_IFC_FOLDER)
+    if ifc_folder and ifc_folder.is_folder:
+        active_metadata_names: set[str] = set()
+        downloaded.extend(
+            _register_ifc_files_from_drive_folder(
+                client,
+                ifc_folder.id,
+                data_dir / IFC_MODELS_FOLDER,
+                project_id,
+                project.name,
+                f"{PROJECTS_FOLDER}/{project.name}/{PROJECT_IFC_FOLDER}",
+                existing_metadata_names=existing_metadata_names,
+                active_metadata_names=active_metadata_names,
+                source_is_project=True,
+                warnings=warnings,
+            )
+        )
+        _prune_project_metadata(target_metadata_dir, active_metadata_names)
+
+    packs_folder = project_children.get(PROJECT_PACKS_FOLDER)
+    if not packs_folder or not packs_folder.is_folder:
+        return downloaded, [], False
+
+    pack_downloads, pack_active_paths = _download_project_grouped_zip_files(
+        client,
+        packs_folder.id,
+        data_dir / ONTOLOGY_PACKS_FOLDER / "indexed",
+        project_id,
+        warnings=warnings,
+        data_dir=data_dir,
+        file_cache=file_cache,
+        skipped=skipped,
+    )
+    downloaded.extend(pack_downloads)
+    return downloaded, [_pack_id_from_zip(Path(path)) for path in pack_active_paths], True
 
 
 def _download_common_zip_files(
@@ -1479,6 +1614,38 @@ def _write_project_pack_links(data_dir: Path, project_pack_links: dict[str, list
         return
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps(project_pack_links, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _read_project_pack_links(data_dir: Path) -> dict[str, list[str]]:
+    marker = data_dir / PROJECTS_FOLDER / PROJECT_PACK_LINKS_FILENAME
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    links: dict[str, list[str]] = {}
+    for project_id, pack_ids in payload.items():
+        if not isinstance(pack_ids, list):
+            continue
+        clean_project_id = str(project_id).strip()
+        clean_pack_ids = [str(pack_id).strip() for pack_id in pack_ids if str(pack_id).strip()]
+        if clean_project_id:
+            links[clean_project_id] = list(dict.fromkeys(clean_pack_ids))
+    return links
+
+
+def _merge_project_pack_links(data_dir: Path, updates: dict[str, list[str]]) -> None:
+    links = _read_project_pack_links(data_dir)
+    for project_id, pack_ids in updates.items():
+        clean_project_id = str(project_id).strip()
+        if not clean_project_id:
+            continue
+        clean_pack_ids = [str(pack_id).strip() for pack_id in pack_ids if str(pack_id).strip()]
+        links[clean_project_id] = list(dict.fromkeys(clean_pack_ids))
+    marker = data_dir / PROJECTS_FOLDER / PROJECT_PACK_LINKS_FILENAME
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps(links, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _write_project_folders(data_dir: Path, project_folders: list[dict[str, str]]) -> None:
