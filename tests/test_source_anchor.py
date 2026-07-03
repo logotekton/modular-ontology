@@ -97,6 +97,99 @@ def test_chunk_anchor_collects_metadata_compact_row_and_source_refs() -> None:
     assert all(anchor.ids["element_id"] == 2074383 for anchor in anchors)
 
 
+def test_enriched_source_ref_promotes_exact_revit_anchor() -> None:
+    anchors = anchors_from_chunk(
+        {
+            "chunk_id": "chunk-enriched",
+            "metadata": {
+                "source_refs": [
+                    {
+                        "source_file": "elements.jsonl",
+                        "source_id": "revit:project:element:2074383",
+                        "element_id": 2074383,
+                        "unique_id": "8f4a-revit-unique",
+                        "ifc_guid": "2JeAf55EvF2fKbarU8OXp5",
+                    }
+                ]
+            },
+        }
+    )
+
+    assert len(anchors) == 1
+    assert anchors[0].anchor_type == "revit_element"
+    assert anchors[0].confidence == "exact"
+    assert anchors[0].ids["unique_id"] == "8f4a-revit-unique"
+
+
+def test_source_ref_pdf_without_page_stays_partial() -> None:
+    anchors = anchors_from_chunk(
+        {
+            "chunk_id": "chunk-pdf",
+            "metadata": {"source_refs": [{"source_file": "A-711.pdf", "source_id": "sheet-a711"}]},
+        }
+    )
+
+    assert len(anchors) == 1
+    assert anchors[0].anchor_type == "pdf_page"
+    assert anchors[0].confidence == "partial"
+
+
+def test_legacy_markdown_table_fallback_extracts_limited_revit_element_anchors() -> None:
+    anchors = anchors_from_chunk(
+        {
+            "chunk_id": "chunk-table",
+            "document_id": "doc-beams",
+            "text": "\n".join(
+                [
+                    "| 모듈 | Revit ElementId | IFC GUID |",
+                    "| --- | --- | --- |",
+                    "| 1-01-M | 2163483 | 2JeAf55EvF2fKbarU8OXp5 |",
+                    "| 1-01-M | 2163484 | 2JeAf55EvF2fKbarU8OXp2 |",
+                ]
+            ),
+            "metadata": {"source_path": "documents/categories/beams.md"},
+        }
+    )
+
+    assert [anchor.anchor_type for anchor in anchors] == ["revit_element", "revit_element"]
+    assert {anchor.confidence for anchor in anchors} == {"partial"}
+    assert {anchor.ids["element_id"] for anchor in anchors} == {2163483, 2163484}
+    assert all(anchor.raw["anchor_origin"] == "legacy_markdown_table" for anchor in anchors)
+
+
+def test_legacy_markdown_table_fallback_requires_element_header() -> None:
+    anchors = anchors_from_chunk(
+        {
+            "chunk_id": "chunk-table",
+            "text": "\n".join(["| 모듈 | 수량 |", "| --- | --- |", "| 1-01-M | 2163483 |"]),
+        }
+    )
+
+    assert len(anchors) == 1
+    assert anchors[0].anchor_type == "unknown"
+
+
+def test_legacy_markdown_table_fallback_does_not_reuse_stale_header() -> None:
+    anchors = anchors_from_chunk(
+        {
+            "chunk_id": "chunk-table",
+            "text": "\n".join(
+                [
+                    "| 모듈 | Revit ElementId | IFC GUID |",
+                    "| --- | --- | --- |",
+                    "| 1-01-M | 2163483 | 2JeAf55EvF2fKbarU8OXp5 |",
+                    "| 모듈 | 수량 | 비고 |",
+                    "| --- | --- | --- |",
+                    "| 1-02-A | 9999999 | summary row |",
+                ]
+            ),
+        }
+    )
+
+    assert len(anchors) == 1
+    assert anchors[0].ids["element_id"] == 2163483
+
+
 def test_dxf_pdf_and_unknown_anchors() -> None:
     dxf = anchors_from_node_properties(
         {

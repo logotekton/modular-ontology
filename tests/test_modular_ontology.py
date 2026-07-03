@@ -1575,6 +1575,7 @@ def test_mcp_tools_return_json_payloads() -> None:
     assert relation_types["queryableEdgeFields"]
     assert pack_overview["pack"]["id"] == "advance-steel-samcheok-bldg-b-bm25-evidence-pack"
     assert "mo_ontology_manifest" in pack_overview["recommendedTools"]
+    assert "mo_anchor_coverage" in pack_overview["recommendedTools"]
     assert project_overview["projects"][0]["project"]["id"] == "samcheok-building-b"
     assert project_overview["projects"][0]["packs"]
     assert project_search["matchCount"] > 0
@@ -1582,8 +1583,13 @@ def test_mcp_tools_return_json_payloads() -> None:
     assert evidence_trace["nodes"]["nodes"]
     assert anchor_coverage["chunksScanned"] == 2
     assert anchor_coverage["scan"]["member"] == "cloud/chunks.jsonl"
+    assert "truncated" in anchor_coverage["scan"]
     assert anchor_coverage["coverage"]["total"] >= 2
     assert anchor_coverage["coverage"]["unresolvable"] >= 1
+    assert anchor_coverage["chunkCoverage"]["total"] == 2
+    assert anchor_coverage["chunkCoverage"]["unknown"] >= 1
+    assert anchor_coverage["quality"]["metric"] == "anchor_chunk_coverage"
+    assert anchor_coverage["quality"]["status"] in {"pass", "warn", "fail"}
     assert anchor_coverage["chunks"]
     assert anchor_coverage_min_limit["limit"] == 1
     assert anchor_coverage_min_limit["chunksScanned"] == 1
@@ -1597,6 +1603,38 @@ def test_mcp_tools_return_json_payloads() -> None:
     assert answer["evidence"]
     assert modules["module_count"] == 24
     assert fasteners["bolt_quantity"] == 1011
+
+
+def test_anchor_resolve_and_coverage_share_cloud_chunk_payload(monkeypatch) -> None:
+    chunk = {
+        "chunk_id": "chunk:top-level-ref",
+        "document_id": "doc:sample",
+        "text": "sample",
+        "source_refs": [
+            {
+                "source_file": "elements.jsonl",
+                "source_id": "revit:sample:element:12",
+                "element_id": 12,
+                "unique_id": "element-unique",
+            }
+        ],
+    }
+
+    def fake_iter_pack_jsonl_member(pack_id: str, member: str):
+        assert pack_id == "sample-pack"
+        assert member == "cloud/chunks.jsonl"
+        yield chunk
+
+    monkeypatch.setattr(mcp_server, "_iter_pack_jsonl_member", fake_iter_pack_jsonl_member)
+    monkeypatch.setattr(mcp_server, "_read_drawing_entity_payload", lambda pack_id, chunk_id: None)
+
+    resolved = mcp_server._anchor_resolve_payload("sample-pack", "chunk:top-level-ref")
+    coverage = mcp_server._anchor_coverage_payload("sample-pack", 10, True)
+
+    assert resolved["anchors"][0]["anchor_type"] == "revit_element"
+    assert resolved["anchors"][0]["confidence"] == "exact"
+    assert coverage["chunks"][0]["anchorStatus"] == "exact"
+    assert coverage["chunkCoverage"]["exact"] == 1
 
 
 def test_mcp_query_tools_filter_project_and_aggregate_nodes() -> None:
