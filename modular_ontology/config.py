@@ -43,7 +43,10 @@ def _env_candidates(name: str) -> list[str]:
 
 
 ROOT = Path(env("MODULAR_ONTOLOGY_ROOT", Path(__file__).resolve().parents[1])).resolve()
-DEFAULT_DATA_DIR = Path("/tmp/modular-ontology") if os.environ.get("VERCEL") else ROOT / "data"
+# Vercel 서버리스에서는 /tmp만 쓰기 가능하고 콜드 스타트마다 초기화된다 —
+# 동기화 상태(파일 캐시/팩/SQLite)가 영속되지 않으므로 동기화는 로컬 실행 전용.
+EPHEMERAL_STORAGE = bool(os.environ.get("VERCEL"))
+DEFAULT_DATA_DIR = Path("/tmp/modular-ontology") if EPHEMERAL_STORAGE else ROOT / "data"
 DATA_DIR = Path(env("MODULAR_ONTOLOGY_DATA_DIR", DEFAULT_DATA_DIR)).resolve()
 STRUCTURED_PACKS_DIR = DATA_DIR / ONTOLOGY_PACKS_FOLDER / "indexed"
 LEGACY_STRUCTURED_PACKS_DIR = DATA_DIR / LEGACY_ONTOLOGY_PACKS_FOLDER / "indexed"
