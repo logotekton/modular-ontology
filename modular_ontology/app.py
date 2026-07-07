@@ -39,7 +39,7 @@ from .auth import (
     set_user_company,
     set_user_role,
 )
-from .config import DATA_DIR, IFC_MODELS_FOLDER, MCP_REMOTE_FILE, MCP_TOKENS_FILE, PROJECTS_FOLDER, ROOT, env
+from .config import EPHEMERAL_STORAGE, DATA_DIR, IFC_MODELS_FOLDER, MCP_REMOTE_FILE, MCP_TOKENS_FILE, PROJECTS_FOLDER, ROOT, env
 from .google_drive_sync import (
     COMMON_PROJECT_ID,
     COMMON_PROJECT_PACK_LINKS_KEY,
@@ -1140,8 +1140,8 @@ def index_status(sync: bool = False) -> dict[str, Any]:
 def google_drive_storage_status(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_admin(authorization)
     if not google_drive_sync_enabled():
-        return {"enabled": False, "status": "disabled"}
-    return {"enabled": True, **google_drive_sync_status()}
+        return {"enabled": False, "status": "disabled", "persistentStorage": not EPHEMERAL_STORAGE}
+    return {"enabled": True, "persistentStorage": not EPHEMERAL_STORAGE, **google_drive_sync_status()}
 
 
 def _sync_changed_zip_paths(result: dict[str, Any]) -> list[Path]:
@@ -1169,9 +1169,23 @@ def _reindex_packs_by_path(paths: list[Path]) -> dict[str, Any]:
         conn.close()
 
 
+def _require_persistent_sync_storage() -> None:
+    """Vercel의 /tmp은 콜드 스타트마다 증발 — 매번 제로부터 풀 다운로드가 시작돼
+    함수 시간제한(504)으로 끊기는 루프가 된다. 명확한 안내로 빠르게 실패시킨다."""
+    if EPHEMERAL_STORAGE:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "이 배포 환경(Vercel)은 임시 스토리지라 Drive 동기화 상태가 유지되지 않습니다. "
+                "동기화는 로컬 서버(uvicorn)에서 실행한 뒤 결과를 Drive write-back으로 공유하세요."
+            ),
+        )
+
+
 @app.post("/api/admin/storage/google-drive/sync")
 def admin_sync_google_drive_storage(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_admin(authorization)
+    _require_persistent_sync_storage()
     if not google_drive_sync_enabled():
         raise HTTPException(status_code=400, detail="MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set.")
     result = run_google_drive_sync(force=True, include_shared_packs=False)
@@ -1202,6 +1216,7 @@ def admin_sync_google_drive_storage(authorization: str | None = Header(default=N
 @app.post("/api/admin/storage/google-drive/projects/{project_id}/sync")
 def admin_sync_google_drive_project(project_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_admin(authorization)
+    _require_persistent_sync_storage()
     if not google_drive_sync_enabled():
         raise HTTPException(status_code=400, detail="MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set.")
     if not any(str(project["id"]) == project_id for project in list_projects()):
