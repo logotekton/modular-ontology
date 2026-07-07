@@ -56,7 +56,11 @@ export type OgDetail<N> = {
   groups: OgNeighborGroup[];
 };
 
-export type OgController = { selectById: (id: string | null) => void };
+export type OgController = {
+  selectById: (id: string | null) => void;
+  /** AI 답변 등에서 참조된 노드들을 강조 (null = 해제). 숨겨진 노드도 강제 표시. */
+  setHighlight: (ids: string[] | null) => void;
+};
 
 type EngineApi = {
   setMinDeg: (value: number) => void;
@@ -203,6 +207,8 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
     let vEdges: SimEdge[] = [];
     let selected: SimNode<N> | null = null;
     let hovered: SimNode<N> | null = null;
+    let aiHighlight: Set<string> | null = null; // AI 참조 노드 강조
+
     let alpha = 0;
     let engMinDeg = 0;
     let engHop = 1;
@@ -241,7 +247,11 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
 
     const rebuildVisible = () => {
       const fs = focusSet();
-      vNodes = simNodes.filter((n) => n.degree >= engMinDeg && !typeOff.has(n.type) && (!fs || fs.has(n.id)));
+      vNodes = simNodes.filter(
+        (n) =>
+          (n.degree >= engMinDeg && !typeOff.has(n.type) && (!fs || fs.has(n.id))) ||
+          (aiHighlight !== null && aiHighlight.has(n.id)),
+      );
       const visible = new Set(vNodes.map((n) => n.id));
       vEdges = simEdges.filter((e) => visible.has(e.a) && visible.has(e.b));
       setStats({ shownNodes: vNodes.length, shownEdges: vEdges.length, totalNodes: simNodes.length, totalEdges: simEdges.length });
@@ -422,16 +432,32 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       }
 
       ctx.lineWidth = 1 / cam.k;
-      ctx.strokeStyle = selected ? THEME.edgeDim : THEME.edge;
+      ctx.strokeStyle = selected || aiHighlight ? THEME.edgeDim : THEME.edge;
       ctx.beginPath();
       for (const e of vEdges) {
         if (selected && (e.a === selected.id || e.b === selected.id)) continue;
+        if (aiHighlight && aiHighlight.has(e.a) && aiHighlight.has(e.b)) continue;
         const a = byId.get(e.a)!;
         const b = byId.get(e.b)!;
         ctx.moveTo(a.x, a.y);
         ctx.lineTo(b.x, b.y);
       }
       ctx.stroke();
+      if (aiHighlight) {
+        // AI 참조 노드 사이의 엣지 — 앰버 강조
+        ctx.strokeStyle = "rgba(192, 153, 14, 0.6)";
+        ctx.lineWidth = 1.6 / cam.k;
+        ctx.beginPath();
+        for (const e of vEdges) {
+          if (!aiHighlight.has(e.a) || !aiHighlight.has(e.b)) continue;
+          const a = byId.get(e.a)!;
+          const b = byId.get(e.b)!;
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(b.x, b.y);
+        }
+        ctx.stroke();
+        ctx.lineWidth = 1 / cam.k;
+      }
       if (selected) {
         const lit: SimEdge[] = [];
         ctx.strokeStyle = THEME.sel;
@@ -462,17 +488,28 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
         }
       }
       for (const n of vNodes) {
-        const isHl = highlight.has(n.id);
-        ctx.globalAlpha = selected && !isHl ? 0.18 : 1;
+        const isSelHl = highlight.has(n.id);
+        const isAiHl = aiHighlight !== null && aiHighlight.has(n.id);
+        let nodeAlpha = 1;
+        if (selected) nodeAlpha = isSelHl ? 1 : 0.18;
+        else if (aiHighlight) nodeAlpha = isAiHl ? 1 : 0.15;
+        ctx.globalAlpha = nodeAlpha;
         ctx.fillStyle = n.color;
         ctx.beginPath();
         ctx.arc(n.x, n.y, n.r, 0, 6.2832);
         ctx.fill();
+        if (isAiHl) {
+          ctx.strokeStyle = "#c0990e";
+          ctx.lineWidth = 2.4 / cam.k;
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, n.r + 2.5 / cam.k, 0, 6.2832);
+          ctx.stroke();
+        }
         if (n === selected || n === hovered) {
           ctx.strokeStyle = n === selected ? THEME.text : `${THEME.text}99`;
           ctx.lineWidth = 2 / cam.k;
           ctx.beginPath();
-          ctx.arc(n.x, n.y, n.r + 3 / cam.k, 0, 6.2832);
+          ctx.arc(n.x, n.y, n.r + (isAiHl ? 5.5 : 3) / cam.k, 0, 6.2832);
           ctx.stroke();
         }
         ctx.globalAlpha = 1;
@@ -480,8 +517,9 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       ctx.textAlign = "center";
       ctx.textBaseline = "top";
       let labelBudget = 350;
+      const aiLabelable = aiHighlight !== null && aiHighlight.size <= 60;
       for (const n of vNodes) {
-        const isHl = highlight.has(n.id) || hovered === n;
+        const isHl = highlight.has(n.id) || hovered === n || (aiLabelable && aiHighlight!.has(n.id));
         const show = isHl || (cam.k * n.r > 5 && labelBudget > 0);
         if (!show) continue;
         if (!isHl) labelBudget--;
@@ -489,7 +527,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
         if (isHl) fsScreen = Math.max(fsScreen, 11);
         const fs = fsScreen / cam.k;
         ctx.font = `${fs}px Figtree, "Pretendard Variable", Pretendard, sans-serif`;
-        ctx.globalAlpha = selected && !isHl ? 0.25 : isHl ? 1 : 0.8;
+        ctx.globalAlpha = (selected || aiHighlight) && !isHl ? 0.25 : isHl ? 1 : 0.8;
         const label = n.label.length > 24 ? `${n.label.slice(0, 24)}…` : n.label;
         ctx.strokeStyle = THEME.halo;
         ctx.lineWidth = 3 / cam.k;
@@ -525,10 +563,10 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       }
       return best;
     };
-    const fitView = () => {
-      if (!vNodes.length || !W || !H) return;
+    const fitTo = (ns: SimNode<N>[]) => {
+      if (!ns.length || !W || !H) return;
       let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-      for (const n of vNodes) {
+      for (const n of ns) {
         x0 = Math.min(x0, n.x);
         x1 = Math.max(x1, n.x);
         y0 = Math.min(y0, n.y);
@@ -538,6 +576,12 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       cam.k = Math.min(2.5, Math.min((W - pad * 2) / Math.max(x1 - x0, 10), (H - pad * 2) / Math.max(y1 - y0, 10)));
       cam.x = W / 2 - ((x0 + x1) / 2) * cam.k;
       cam.y = H / 2 - ((y0 + y1) / 2) * cam.k;
+    };
+    const fitView = () => fitTo(vNodes);
+    const applyHighlight = (ids: string[] | null) => {
+      aiHighlight = ids && ids.length ? new Set(ids) : null;
+      rebuildVisible();
+      if (aiHighlight) fitTo(vNodes.filter((n) => aiHighlight!.has(n.id)));
     };
     const centerOn = (n: SimNode<N>) => {
       cam.k = Math.max(cam.k, 1.1);
@@ -707,7 +751,11 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
     setFocusOn(false);
     setPaused(false);
     onDetail?.(null);
-    if (controllerRef) controllerRef.current = { selectById: (id) => engineRef.current?.selectById(id) };
+    if (controllerRef)
+      controllerRef.current = {
+        selectById: (id) => engineRef.current?.selectById(id),
+        setHighlight: (ids) => applyHighlight(ids),
+      };
 
     resize();
     cam.x = W / 2;
@@ -726,6 +774,10 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       stats: () => ({ visible: vNodes.length, edges: vEdges.length, alpha, k: cam.k }),
       select: (id: string | null) => {
         select(id ? byId.get(id) ?? null : null);
+        draw();
+      },
+      highlight: (ids: string[] | null) => {
+        applyHighlight(ids);
         draw();
       },
       firstVisibleId: () => (vNodes.length ? vNodes.reduce((a, b) => (a.degree > b.degree ? a : b)).id : null),

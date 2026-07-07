@@ -4557,3 +4557,32 @@ dd {
   padding: 12px;
   background: #ffffff;
 }
+
+
+/* AI 답변 → 그래프 하이라이트 액션 */
+.ai-highlight-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.ai-highlight-actions button {
+  padding: 4px 10px;
+  border: 1px solid #d4d4d4;
+  border-radius: 9999px;
+  background: #ffffff;
+  color: #171717;
+  font-size: 11.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.ai-highlight-actions button:hover {
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.ai-highlight-actions button:first-child {
+  border-color: #c0990e;
+  color: #745b00;
+  background: #fdf6e3;
+}

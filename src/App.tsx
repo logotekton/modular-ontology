@@ -159,7 +159,28 @@ type AiMessage = {
   role: "user" | "assistant";
   content: string;
   evidence?: QueryEvidence[];
+  /** 답변/근거 텍스트에서 매칭된 그래프 노드 id — 하이라이트용 */
+  refNodeIds?: string[];
 };
+
+/** 답변·근거 텍스트에 라벨이나 id가 등장하는 노드를 찾는다 (AI 참조 하이라이트용) */
+function matchAnswerToNodes(text: string, nodes: GraphNode[]): string[] {
+  if (!text) return [];
+  const ids: string[] = [];
+  for (const node of nodes) {
+    const label = String(node.label ?? "");
+    const idTail = node.id.split(":").slice(-2).join(":");
+    const hit =
+      (label.length >= 3 && text.includes(label)) ||
+      text.includes(node.id) ||
+      (idTail.length >= 6 && text.includes(idTail));
+    if (hit) {
+      ids.push(node.id);
+      if (ids.length >= 300) break;
+    }
+  }
+  return ids;
+}
 
 type McpStatus = {
   status: string;
@@ -1220,6 +1241,13 @@ function App() {
       const content = payload.llmError
         ? `${formatAiQueryWarning(payload.llmError)}\n\nFallback Graph RAG answer:\n${fallbackAnswer}`
         : fallbackAnswer;
+      // 답변+근거 텍스트를 현재 표시 그래프의 노드와 매칭 → 참조 노드 하이라이트
+      const evidenceText = (payload.evidence ?? [])
+        .map((item) => `${item.title ?? ""}\n${item.path ?? ""}\n${item.snippet ?? ""}`)
+        .join("\n");
+      const displayNodes = (localGraph ?? graph)?.nodes ?? [];
+      const refNodeIds = matchAnswerToNodes(`${content}\n${evidenceText}`, displayNodes);
+      if (refNodeIds.length) ogControllerRef.current?.setHighlight(refNodeIds);
       setAiMessages((messages) => [
         ...messages,
         {
@@ -1227,6 +1255,7 @@ function App() {
           role: "assistant",
           content,
           evidence: payload.evidence ?? [],
+          refNodeIds,
         },
       ]);
     } catch (error) {
@@ -1631,6 +1660,7 @@ function App() {
                 question={aiQuestion}
                 onQuestionChange={setAiQuestion}
                 onSubmit={askGraphAi}
+                onHighlight={(ids) => ogControllerRef.current?.setHighlight(ids)}
               />
             ) : graphDetail ? (
               <OgNodeInfo detail={graphDetail} onJump={(id) => ogControllerRef.current?.selectById(id)} />
@@ -3090,6 +3120,7 @@ function AiQueryPanel({
   question,
   onQuestionChange,
   onSubmit,
+  onHighlight,
 }: {
   openAiKeyStatus: AiKeyStatus;
   loading: boolean;
@@ -3097,6 +3128,7 @@ function AiQueryPanel({
   question: string;
   onQuestionChange: (value: string) => void;
   onSubmit: () => void;
+  onHighlight?: (ids: string[] | null) => void;
 }) {
   return (
     <div className="ai-query-panel">
@@ -3113,6 +3145,16 @@ function AiQueryPanel({
                       {item.title || item.path || `근거 ${index + 1}`}
                     </span>
                   ))}
+                </div>
+              ) : null}
+              {message.refNodeIds?.length && onHighlight ? (
+                <div className="ai-highlight-actions">
+                  <button type="button" onClick={() => onHighlight(message.refNodeIds ?? null)}>
+                    🔦 그래프에서 보기 ({message.refNodeIds.length})
+                  </button>
+                  <button type="button" onClick={() => onHighlight(null)}>
+                    해제
+                  </button>
                 </div>
               ) : null}
             </article>
