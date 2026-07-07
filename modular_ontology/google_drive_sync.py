@@ -48,7 +48,38 @@ COMMON_PROJECT_ID = "_Common"
 COMMON_PROJECT_PACK_LINKS_KEY = "__common__"
 PROJECT_PACK_LINKS_FILENAME = ".drive-project-pack-links.json"
 PROJECT_FOLDERS_FILENAME = ".drive-project-folders.json"
+DRIVE_FILE_CACHE_FILENAME = ".google-drive-file-cache.json"
+PROJECT_SYNC_MARKER_FOLDER = ".google-drive-project-sync"
 _DB_SYNC_LOCK = threading.Lock()
+
+# Drive가 지수 백오프 재시도를 요구하는 일시적 오류 (429 rate limit, 5xx)
+_RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
+_RETRY_ATTEMPTS = 4
+
+
+def _urlopen_with_retry(request: urllib.request.Request, *, timeout: float):
+    """일시적 HTTP/네트워크 오류에 지수 백오프로 재시도하는 urlopen.
+
+    308(Resume Incomplete)처럼 호출부가 기대하는 상태 코드는 재시도 대상이
+    아니므로 그대로 전파된다. 대량 순차 호출(list/download 버스트)이 한 번의
+    429/503으로 통째로 실패하던 것을 막는다.
+    """
+    delay = 1.0
+    last_error: Exception | None = None
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            return urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in _RETRYABLE_HTTP_CODES:
+                raise
+            last_error = exc
+        except urllib.error.URLError as exc:
+            last_error = exc
+        if attempt < _RETRY_ATTEMPTS - 1:
+            time.sleep(delay)
+            delay = min(delay * 2.0, 8.0)
+    assert last_error is not None
+    raise last_error
 
 
 @dataclass(frozen=True)
@@ -125,7 +156,7 @@ class GoogleDriveClient:
         url = self._url(f"files/{file_id}", params)
         request = urllib.request.Request(url, headers=self._headers())
         temp = target.with_name(f".{target.name}.tmp")
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with _urlopen_with_retry(request, timeout=60) as response:
             with temp.open("wb") as stream:
                 while True:
                     chunk = response.read(1024 * 1024)
@@ -148,7 +179,7 @@ class GoogleDriveClient:
             headers={**self._headers(), "Content-Type": content_type},
             method="PATCH",
         )
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with _urlopen_with_retry(request, timeout=60) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def create_file(self, parent_id: str, source: Path, name: str | None = None, mime_type: str | None = None) -> dict[str, Any]:
@@ -181,7 +212,7 @@ class GoogleDriveClient:
             headers={**self._headers(), "Content-Type": f"multipart/related; boundary={boundary}"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with _urlopen_with_retry(request, timeout=120) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def _resumable_upload(
@@ -205,7 +236,7 @@ class GoogleDriveClient:
             body = json.dumps(metadata, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json; charset=UTF-8"
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with _urlopen_with_retry(request, timeout=60) as response:
             session_url = response.headers.get("Location")
         if not session_url:
             raise RuntimeError("Google Drive did not return a resumable upload session URL.")
@@ -229,7 +260,7 @@ class GoogleDriveClient:
                     method="PUT",
                 )
                 try:
-                    with urllib.request.urlopen(chunk_request, timeout=300) as response:
+                    with _urlopen_with_retry(chunk_request, timeout=300) as response:
                         return json.loads(response.read().decode("utf-8"))
                 except urllib.error.HTTPError as exc:
                     if exc.code != 308:
@@ -260,7 +291,7 @@ class GoogleDriveClient:
             headers={**self._headers(), "Content-Type": "application/json; charset=UTF-8"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with _urlopen_with_retry(request, timeout=30) as response:
             payload = json.loads(response.read().decode("utf-8"))
         return DriveItem(id=str(payload["id"]), name=str(payload["name"]), mime_type=str(payload["mimeType"]))
 
@@ -285,7 +316,7 @@ class GoogleDriveClient:
     def _request_json(self, path: str, params: dict[str, str]) -> dict[str, Any]:
         url = self._url(path, params)
         request = urllib.request.Request(url, headers=self._headers())
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with _urlopen_with_retry(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def _url(self, path: str, params: dict[str, str]) -> str:
@@ -323,6 +354,7 @@ def sync_google_drive_storage(
     root_folder_id: str | None = None,
     data_dir: Path = DATA_DIR,
     force: bool = False,
+    include_shared_packs: bool = True,
 ) -> dict[str, Any]:
     root_folder_id = root_folder_id or str(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "")).strip()
     if not root_folder_id:
@@ -341,8 +373,10 @@ def sync_google_drive_storage(
     client = client or GoogleDriveClient.from_env()
     root = _children_by_name(client, root_folder_id)
     downloaded: list[str] = []
+    skipped: list[str] = []
     missing: list[str] = []
     warnings: list[str] = []
+    file_cache = _load_drive_file_cache(data_dir)
 
     admin = root.get(ADMIN_FOLDER)
     if admin and admin.is_folder:
@@ -352,6 +386,9 @@ def sync_google_drive_storage(
                 admin.id,
                 data_dir / ADMIN_FOLDER,
                 {"users.json", "mcp_remote.json", "mcp_tokens.json"},
+                data_dir=data_dir,
+                file_cache=file_cache,
+                skipped=skipped,
             )
         )
     else:
@@ -359,14 +396,31 @@ def sync_google_drive_storage(
 
     database = root.get(DATABASE_FOLDER)
     if database and database.is_folder:
-        downloaded.extend(_download_database_file(client, database.id, data_dir / DATABASE_FOLDER))
+        downloaded.extend(
+            _download_database_file(
+                client,
+                database.id,
+                data_dir / DATABASE_FOLDER,
+                data_dir=data_dir,
+                file_cache=file_cache,
+                skipped=skipped,
+            )
+        )
     else:
         missing.append(DATABASE_FOLDER)
 
     projects = root.get(PROJECTS_FOLDER)
     project_root_found = bool(projects and projects.is_folder)
     if projects and projects.is_folder:
-        project_downloads, project_pack_links = _download_project_assets(client, projects.id, data_dir, warnings=warnings)
+        project_downloads, project_pack_links = _download_project_assets(
+            client,
+            projects.id,
+            data_dir,
+            warnings=warnings,
+            file_cache=file_cache,
+            skipped=skipped,
+            include_common_packs=include_shared_packs,
+        )
         downloaded.extend(project_downloads)
         _write_project_pack_links(data_dir, project_pack_links)
     else:
@@ -374,17 +428,31 @@ def sync_google_drive_storage(
         _write_project_folders(data_dir, [])
         missing.append(PROJECTS_FOLDER)
 
-    pack_roots = [
-        item
-        for item in (root.get(ONTOLOGY_PACKS_FOLDER), root.get(LEGACY_ONTOLOGY_PACKS_FOLDER))
-        if item and item.is_folder
-    ]
+    pack_roots = (
+        [
+            item
+            for item in (root.get(ONTOLOGY_PACKS_FOLDER), root.get(LEGACY_ONTOLOGY_PACKS_FOLDER))
+            if item and item.is_folder
+        ]
+        if include_shared_packs
+        else []
+    )
     if pack_roots:
         for packs in pack_roots:
             pack_folders = _children_by_name(client, packs.id)
             indexed = pack_folders.get("indexed")
             if indexed and indexed.is_folder:
-                downloaded.extend(_download_zip_files(client, indexed.id, data_dir / ONTOLOGY_PACKS_FOLDER / "indexed", warnings=warnings))
+                downloaded.extend(
+                    _download_zip_files(
+                        client,
+                        indexed.id,
+                        data_dir / ONTOLOGY_PACKS_FOLDER / "indexed",
+                        warnings=warnings,
+                        data_dir=data_dir,
+                        file_cache=file_cache,
+                        skipped=skipped,
+                    )
+                )
             elif packs.name == ONTOLOGY_PACKS_FOLDER and not project_root_found:
                 missing.append(f"{ONTOLOGY_PACKS_FOLDER}/indexed")
     elif not project_root_found:
@@ -392,9 +460,118 @@ def sync_google_drive_storage(
 
     ifc_models = root.get(IFC_MODELS_FOLDER)
     if ifc_models and ifc_models.is_folder:
-        downloaded.extend(_download_ifc_metadata_files(client, ifc_models.id, data_dir / IFC_MODELS_FOLDER, warnings=warnings))
+        downloaded.extend(
+            _download_ifc_metadata_files(
+                client,
+                ifc_models.id,
+                data_dir / IFC_MODELS_FOLDER,
+                warnings=warnings,
+                data_dir=data_dir,
+                file_cache=file_cache,
+                skipped=skipped,
+            )
+        )
 
-    result = {"status": "synced", "synced_at": time.time(), "downloaded": downloaded, "missing": missing, "warnings": warnings}
+    _write_drive_file_cache(data_dir, file_cache)
+    result = {
+        "status": "synced",
+        "synced_at": time.time(),
+        "downloaded": downloaded,
+        "skipped": skipped,
+        "missing": missing,
+        "warnings": warnings,
+        "sharedPacksIncluded": include_shared_packs,
+    }
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
+
+
+def sync_google_drive_project_storage(
+    project_id: str,
+    *,
+    client: GoogleDriveClient | None = None,
+    root_folder_id: str | None = None,
+    data_dir: Path = DATA_DIR,
+    force: bool = False,
+) -> dict[str, Any]:
+    root_folder_id = root_folder_id or str(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "")).strip()
+    if not root_folder_id:
+        return {"status": "skipped", "reason": "MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set.", "scope": "project"}
+
+    safe_project_id = _safe_drive_filename(project_id.strip())
+    ttl = int(str(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_PROJECT_SYNC_TTL_SECONDS", str(DEFAULT_TTL_SECONDS))))
+    marker = _project_sync_marker(data_dir, safe_project_id)
+    if not force and ttl > 0 and marker.exists():
+        try:
+            previous = json.loads(marker.read_text(encoding="utf-8"))
+            if time.time() - float(previous.get("synced_at", 0)) < ttl:
+                return {"status": "cached", **previous}
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+
+    client = client or GoogleDriveClient.from_env()
+    root = _children_by_name(client, root_folder_id)
+    projects = root.get(PROJECTS_FOLDER)
+    if not projects or not projects.is_folder:
+        return {
+            "status": "missing",
+            "scope": "project",
+            "projectId": safe_project_id,
+            "downloaded": [],
+            "skipped": [],
+            "missing": [PROJECTS_FOLDER],
+            "warnings": [],
+        }
+
+    warnings: list[str] = []
+    project_item: DriveItem | None = None
+    for item in client.list_children(projects.id):
+        if not item.is_folder:
+            continue
+        item_project_id = _safe_drive_filename_or_none(item.name, warnings, f"{PROJECTS_FOLDER} project folder")
+        if item_project_id == safe_project_id:
+            project_item = item
+            break
+
+    if project_item is None:
+        return {
+            "status": "missing",
+            "scope": "project",
+            "projectId": safe_project_id,
+            "downloaded": [],
+            "skipped": [],
+            "missing": [f"{PROJECTS_FOLDER}/{safe_project_id}"],
+            "warnings": warnings,
+        }
+
+    skipped: list[str] = []
+    file_cache = _load_drive_file_cache(data_dir)
+    downloaded, pack_ids, _packs_folder_found = _download_single_project_assets(
+        client,
+        project_item,
+        safe_project_id,
+        data_dir,
+        warnings=warnings,
+        file_cache=file_cache,
+        skipped=skipped,
+    )
+    _merge_project_pack_links(data_dir, {safe_project_id: pack_ids})
+    _write_drive_file_cache(data_dir, file_cache)
+
+    result = {
+        "status": "synced",
+        "scope": "project",
+        "projectId": safe_project_id,
+        "projectFolderId": project_item.id,
+        "projectName": project_item.name,
+        "synced_at": time.time(),
+        "downloaded": downloaded,
+        "skipped": skipped,
+        "missing": [],
+        "warnings": warnings,
+        "packIds": pack_ids,
+    }
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
@@ -690,6 +867,90 @@ def _registry_sync_marker(data_dir: Path) -> Path:
     return data_dir / ".google-drive-registry-sync.json"
 
 
+def _project_sync_marker(data_dir: Path, project_id: str) -> Path:
+    return data_dir / PROJECT_SYNC_MARKER_FOLDER / f"{project_id}.json"
+
+
+def _drive_file_cache_path(data_dir: Path) -> Path:
+    return data_dir / DRIVE_FILE_CACHE_FILENAME
+
+
+def _load_drive_file_cache(data_dir: Path) -> dict[str, dict[str, Any]]:
+    path = _drive_file_cache_path(data_dir)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {str(key): value for key, value in payload.items() if isinstance(value, dict)}
+
+
+def _write_drive_file_cache(data_dir: Path, cache: dict[str, dict[str, Any]]) -> None:
+    path = _drive_file_cache_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _drive_cache_key(data_dir: Path, target: Path) -> str:
+    try:
+        return target.resolve().relative_to(data_dir.resolve()).as_posix()
+    except ValueError:
+        return str(target.resolve())
+
+
+def _drive_item_signature(item: DriveItem) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "name": item.name,
+        "modifiedTime": item.modified_time,
+        "size": item.size,
+    }
+
+
+def _drive_file_is_unchanged(
+    item: DriveItem,
+    target: Path,
+    *,
+    data_dir: Path,
+    file_cache: dict[str, dict[str, Any]],
+) -> bool:
+    if not target.exists():
+        return False
+    return file_cache.get(_drive_cache_key(data_dir, target)) == _drive_item_signature(item)
+
+
+def _remember_drive_file(
+    item: DriveItem,
+    target: Path,
+    *,
+    data_dir: Path,
+    file_cache: dict[str, dict[str, Any]],
+) -> None:
+    file_cache[_drive_cache_key(data_dir, target)] = _drive_item_signature(item)
+
+
+def _download_file_if_changed(
+    client: GoogleDriveClient,
+    item: DriveItem,
+    target: Path,
+    *,
+    data_dir: Path | None = None,
+    file_cache: dict[str, dict[str, Any]] | None = None,
+    skipped: list[str] | None = None,
+) -> bool:
+    if data_dir is not None and file_cache is not None:
+        if _drive_file_is_unchanged(item, target, data_dir=data_dir, file_cache=file_cache):
+            if skipped is not None:
+                skipped.append(str(target))
+            return False
+        client.download_file(item.id, target)
+        _remember_drive_file(item, target, data_dir=data_dir, file_cache=file_cache)
+        return True
+    client.download_file(item.id, target)
+    return True
+
+
 def sync_google_drive_registry_files(
     *,
     client: GoogleDriveClient | None = None,
@@ -714,8 +975,10 @@ def sync_google_drive_registry_files(
     client = client or GoogleDriveClient.from_env()
     root = _children_by_name(client, root_folder_id)
     downloaded: list[str] = []
+    skipped: list[str] = []
     missing: list[str] = []
     warnings: list[str] = []
+    file_cache = _load_drive_file_cache(data_dir)
 
     admin = root.get(ADMIN_FOLDER)
     if admin and admin.is_folder:
@@ -725,6 +988,9 @@ def sync_google_drive_registry_files(
                 admin.id,
                 data_dir / ADMIN_FOLDER,
                 {"users.json", "mcp_remote.json", "mcp_tokens.json"},
+                data_dir=data_dir,
+                file_cache=file_cache,
+                skipped=skipped,
             )
         )
     else:
@@ -732,25 +998,55 @@ def sync_google_drive_registry_files(
 
     database = root.get(DATABASE_FOLDER)
     if database and database.is_folder:
-        downloaded.extend(_download_database_file(client, database.id, data_dir / DATABASE_FOLDER))
+        downloaded.extend(
+            _download_database_file(
+                client,
+                database.id,
+                data_dir / DATABASE_FOLDER,
+                data_dir=data_dir,
+                file_cache=file_cache,
+                skipped=skipped,
+            )
+        )
     else:
         missing.append(DATABASE_FOLDER)
 
     ifc_models = root.get(IFC_MODELS_FOLDER)
     if ifc_models and ifc_models.is_folder:
-        downloaded.extend(_download_ifc_metadata_files(client, ifc_models.id, data_dir / IFC_MODELS_FOLDER, warnings=warnings))
+        downloaded.extend(
+            _download_ifc_metadata_files(
+                client,
+                ifc_models.id,
+                data_dir / IFC_MODELS_FOLDER,
+                warnings=warnings,
+                data_dir=data_dir,
+                file_cache=file_cache,
+                skipped=skipped,
+            )
+        )
 
     projects = root.get(PROJECTS_FOLDER)
     if projects and projects.is_folder:
         _write_project_folders(data_dir, _project_folder_records(client, projects.id, warnings=warnings))
-        downloaded.extend(_download_project_ifc_metadata_files(client, projects.id, data_dir, warnings=warnings))
+        downloaded.extend(
+            _download_project_ifc_metadata_files(
+                client,
+                projects.id,
+                data_dir,
+                warnings=warnings,
+                file_cache=file_cache,
+                skipped=skipped,
+            )
+        )
     else:
         _write_project_folders(data_dir, [])
 
+    _write_drive_file_cache(data_dir, file_cache)
     result = {
         "status": "synced",
         "synced_at": time.time(),
         "downloaded": downloaded,
+        "skipped": skipped,
         "missing": missing,
         "warnings": warnings,
         "scope": "registry",
@@ -790,6 +1086,8 @@ def _download_project_ifc_metadata_files(
     data_dir: Path,
     *,
     warnings: list[str] | None = None,
+    file_cache: dict[str, dict[str, Any]] | None = None,
+    skipped: list[str] | None = None,
 ) -> list[str]:
     downloaded: list[str] = []
     for project in client.list_children(projects_folder_id):
@@ -810,9 +1108,16 @@ def _download_project_ifc_metadata_files(
                 if not metadata_name:
                     continue
                 target = target_metadata_dir / metadata_name
-                client.download_file(item.id, target)
+                if _download_file_if_changed(
+                    client,
+                    item,
+                    target,
+                    data_dir=data_dir,
+                    file_cache=file_cache,
+                    skipped=skipped,
+                ):
+                    downloaded.append(str(target))
                 existing_metadata_names.add(metadata_name)
-                downloaded.append(str(target))
 
         ifc_folder = project_children.get(PROJECT_IFC_FOLDER)
         if ifc_folder and ifc_folder.is_folder:
@@ -835,18 +1140,42 @@ def _download_project_ifc_metadata_files(
     return downloaded
 
 
-def _download_named_files(client: GoogleDriveClient, folder_id: str, target_dir: Path, names: set[str]) -> list[str]:
+def _download_named_files(
+    client: GoogleDriveClient,
+    folder_id: str,
+    target_dir: Path,
+    names: set[str],
+    *,
+    data_dir: Path | None = None,
+    file_cache: dict[str, dict[str, Any]] | None = None,
+    skipped: list[str] | None = None,
+) -> list[str]:
     downloaded: list[str] = []
     for item in client.list_children(folder_id):
         if item.is_folder or item.name not in names:
             continue
         target = target_dir / _safe_drive_filename(item.name)
-        client.download_file(item.id, target)
-        downloaded.append(str(target))
+        if _download_file_if_changed(
+            client,
+            item,
+            target,
+            data_dir=data_dir,
+            file_cache=file_cache,
+            skipped=skipped,
+        ):
+            downloaded.append(str(target))
     return downloaded
 
 
-def _download_database_file(client: GoogleDriveClient, folder_id: str, target_dir: Path) -> list[str]:
+def _download_database_file(
+    client: GoogleDriveClient,
+    folder_id: str,
+    target_dir: Path,
+    *,
+    data_dir: Path | None = None,
+    file_cache: dict[str, dict[str, Any]] | None = None,
+    skipped: list[str] | None = None,
+) -> list[str]:
     children = [item for item in client.list_children(folder_id) if not item.is_folder]
     source = next((item for item in children if item.name == DATABASE_FILENAME), None)
     if not source:
@@ -854,6 +1183,10 @@ def _download_database_file(client: GoogleDriveClient, folder_id: str, target_di
     if not source:
         return []
     target = target_dir / DATABASE_FILENAME
+    if data_dir is not None and file_cache is not None and _drive_file_is_unchanged(source, target, data_dir=data_dir, file_cache=file_cache):
+        if skipped is not None:
+            skipped.append(str(target))
+        return []
     staging = target.with_name(f".{target.name}.download")
     client.download_file(source.id, staging)
     with _DB_SYNC_LOCK:
@@ -861,6 +1194,8 @@ def _download_database_file(client: GoogleDriveClient, folder_id: str, target_di
         target.parent.mkdir(parents=True, exist_ok=True)
         os.replace(staging, target)
         _remove_sqlite_sidecars(target)
+    if data_dir is not None and file_cache is not None:
+        _remember_drive_file(source, target, data_dir=data_dir, file_cache=file_cache)
     return [str(target)]
 
 
@@ -870,6 +1205,9 @@ def _download_ifc_metadata_files(
     target_dir: Path,
     *,
     warnings: list[str] | None = None,
+    data_dir: Path | None = None,
+    file_cache: dict[str, dict[str, Any]] | None = None,
+    skipped: list[str] | None = None,
 ) -> list[str]:
     downloaded: list[str] = []
     for project in client.list_children(ifc_folder_id):
@@ -892,9 +1230,16 @@ def _download_ifc_metadata_files(
                 if _is_project_metadata_file(target):
                     existing_metadata_names.add(metadata_name)
                     continue
-                client.download_file(item.id, target)
+                if _download_file_if_changed(
+                    client,
+                    item,
+                    target,
+                    data_dir=data_dir,
+                    file_cache=file_cache,
+                    skipped=skipped,
+                ):
+                    downloaded.append(str(target))
                 existing_metadata_names.add(metadata_name)
-                downloaded.append(str(target))
 
         files_folder = project_children.get("files")
         if files_folder and files_folder.is_folder:
@@ -919,6 +1264,9 @@ def _download_project_assets(
     data_dir: Path,
     *,
     warnings: list[str] | None = None,
+    file_cache: dict[str, dict[str, Any]] | None = None,
+    skipped: list[str] | None = None,
+    include_common_packs: bool = True,
 ) -> tuple[list[str], dict[str, list[str]]]:
     downloaded: list[str] = []
     project_pack_links: dict[str, list[str]] = {}
@@ -933,15 +1281,20 @@ def _download_project_assets(
         project_children = _children_by_name(client, project.id)
         if project_id == COMMON_PROJECT_ID:
             common_folder_found = True
-            common_downloads = _download_common_zip_files(
+            if not include_common_packs:
+                continue
+            common_downloads, common_active_paths = _download_common_zip_files(
                 client,
                 project.id,
                 project_children,
                 data_dir / ONTOLOGY_PACKS_FOLDER / "indexed",
                 warnings=warnings,
+                data_dir=data_dir,
+                file_cache=file_cache,
+                skipped=skipped,
             )
             downloaded.extend(common_downloads)
-            project_pack_links[COMMON_PROJECT_PACK_LINKS_KEY] = [_pack_id_from_zip(Path(path)) for path in common_downloads]
+            project_pack_links[COMMON_PROJECT_PACK_LINKS_KEY] = [_pack_id_from_zip(Path(path)) for path in common_active_paths]
             continue
         project_folders.append(
             {
@@ -951,57 +1304,97 @@ def _download_project_assets(
                 "modifiedTime": project.modified_time,
             }
         )
-        metadata_folder = project_children.get("metadata")
-        existing_metadata_names: set[str] = set()
-        target_metadata_dir = data_dir / IFC_MODELS_FOLDER / project_id / "metadata"
-        if metadata_folder and metadata_folder.is_folder:
-            for item in client.list_children(metadata_folder.id):
-                if item.is_folder or not item.name.endswith(".metadata.json"):
-                    continue
-                metadata_name = _safe_drive_filename_or_none(item.name, warnings, f"{PROJECTS_FOLDER}/{project.name}/metadata")
-                if not metadata_name:
-                    continue
-                target = target_metadata_dir / metadata_name
-                client.download_file(item.id, target)
-                existing_metadata_names.add(metadata_name)
-                downloaded.append(str(target))
-
-        ifc_folder = project_children.get(PROJECT_IFC_FOLDER)
-        if ifc_folder and ifc_folder.is_folder:
-            active_metadata_names: set[str] = set()
-            downloaded.extend(
-                _register_ifc_files_from_drive_folder(
-                    client,
-                    ifc_folder.id,
-                    data_dir / IFC_MODELS_FOLDER,
-                    project_id,
-                    project.name,
-                    f"{PROJECTS_FOLDER}/{project.name}/{PROJECT_IFC_FOLDER}",
-                    existing_metadata_names=existing_metadata_names,
-                    active_metadata_names=active_metadata_names,
-                    source_is_project=True,
-                    warnings=warnings,
-                )
-            )
-            _prune_project_metadata(target_metadata_dir, active_metadata_names)
-
-        packs_folder = project_children.get(PROJECT_PACKS_FOLDER)
-        if packs_folder and packs_folder.is_folder:
-            pack_downloads = _download_project_grouped_zip_files(
-                client,
-                packs_folder.id,
-                data_dir / ONTOLOGY_PACKS_FOLDER / "indexed",
-                project_id,
-                warnings=warnings,
-            )
-            downloaded.extend(pack_downloads)
-            project_pack_links[project_id] = [_pack_id_from_zip(Path(path)) for path in pack_downloads]
+        project_downloads, pack_ids, packs_folder_found = _download_single_project_assets(
+            client,
+            project,
+            project_id,
+            data_dir,
+            project_children=project_children,
+            warnings=warnings,
+            file_cache=file_cache,
+            skipped=skipped,
+        )
+        downloaded.extend(project_downloads)
+        if packs_folder_found:
+            project_pack_links[project_id] = pack_ids
     _write_project_folders(data_dir, project_folders)
     active_project_ids = {item["projectId"] for item in project_folders}
     if common_folder_found:
         active_project_ids.add(COMMON_PROJECT_ID)
     _prune_removed_project_assets(data_dir, active_project_ids)
     return downloaded, project_pack_links
+
+
+def _download_single_project_assets(
+    client: GoogleDriveClient,
+    project: DriveItem,
+    project_id: str,
+    data_dir: Path,
+    *,
+    project_children: dict[str, DriveItem] | None = None,
+    warnings: list[str] | None = None,
+    file_cache: dict[str, dict[str, Any]] | None = None,
+    skipped: list[str] | None = None,
+) -> tuple[list[str], list[str], bool]:
+    downloaded: list[str] = []
+    project_children = project_children or _children_by_name(client, project.id)
+    metadata_folder = project_children.get("metadata")
+    existing_metadata_names: set[str] = set()
+    target_metadata_dir = data_dir / IFC_MODELS_FOLDER / project_id / "metadata"
+    if metadata_folder and metadata_folder.is_folder:
+        for item in client.list_children(metadata_folder.id):
+            if item.is_folder or not item.name.endswith(".metadata.json"):
+                continue
+            metadata_name = _safe_drive_filename_or_none(item.name, warnings, f"{PROJECTS_FOLDER}/{project.name}/metadata")
+            if not metadata_name:
+                continue
+            target = target_metadata_dir / metadata_name
+            if _download_file_if_changed(
+                client,
+                item,
+                target,
+                data_dir=data_dir,
+                file_cache=file_cache,
+                skipped=skipped,
+            ):
+                downloaded.append(str(target))
+            existing_metadata_names.add(metadata_name)
+
+    ifc_folder = project_children.get(PROJECT_IFC_FOLDER)
+    if ifc_folder and ifc_folder.is_folder:
+        active_metadata_names: set[str] = set()
+        downloaded.extend(
+            _register_ifc_files_from_drive_folder(
+                client,
+                ifc_folder.id,
+                data_dir / IFC_MODELS_FOLDER,
+                project_id,
+                project.name,
+                f"{PROJECTS_FOLDER}/{project.name}/{PROJECT_IFC_FOLDER}",
+                existing_metadata_names=existing_metadata_names,
+                active_metadata_names=active_metadata_names,
+                source_is_project=True,
+                warnings=warnings,
+            )
+        )
+        _prune_project_metadata(target_metadata_dir, active_metadata_names)
+
+    packs_folder = project_children.get(PROJECT_PACKS_FOLDER)
+    if not packs_folder or not packs_folder.is_folder:
+        return downloaded, [], False
+
+    pack_downloads, pack_active_paths = _download_project_grouped_zip_files(
+        client,
+        packs_folder.id,
+        data_dir / ONTOLOGY_PACKS_FOLDER / "indexed",
+        project_id,
+        warnings=warnings,
+        data_dir=data_dir,
+        file_cache=file_cache,
+        skipped=skipped,
+    )
+    downloaded.extend(pack_downloads)
+    return downloaded, [_pack_id_from_zip(Path(path)) for path in pack_active_paths], True
 
 
 def _download_common_zip_files(
@@ -1011,19 +1404,26 @@ def _download_common_zip_files(
     target_dir: Path,
     *,
     warnings: list[str] | None = None,
-) -> list[str]:
+    data_dir: Path | None = None,
+    file_cache: dict[str, dict[str, Any]] | None = None,
+    skipped: list[str] | None = None,
+) -> tuple[list[str], list[str]]:
     downloaded: list[str] = []
+    active_paths: list[str] = []
     packs_folder = common_children.get(PROJECT_PACKS_FOLDER)
     if packs_folder and packs_folder.is_folder:
-        downloaded.extend(
-            _download_project_zip_files(
-                client,
-                packs_folder.id,
-                target_dir,
-                COMMON_PROJECT_ID,
-                warnings=warnings,
-            )
+        pack_downloads, pack_active_paths = _download_project_zip_files(
+            client,
+            packs_folder.id,
+            target_dir,
+            COMMON_PROJECT_ID,
+            warnings=warnings,
+            data_dir=data_dir,
+            file_cache=file_cache,
+            skipped=skipped,
         )
+        downloaded.extend(pack_downloads)
+        active_paths.extend(pack_active_paths)
 
     for category in client.list_children(common_folder_id):
         if not category.is_folder or category.name == PROJECT_PACKS_FOLDER:
@@ -1035,16 +1435,19 @@ def _download_common_zip_files(
         category_packs = category_children.get(PROJECT_PACKS_FOLDER)
         if not category_packs or not category_packs.is_folder:
             continue
-        downloaded.extend(
-            _download_project_zip_files(
-                client,
-                category_packs.id,
-                target_dir,
-                f"{COMMON_PROJECT_ID}__{category_id}",
-                warnings=warnings,
-            )
+        category_downloads, category_active_paths = _download_project_zip_files(
+            client,
+            category_packs.id,
+            target_dir,
+            f"{COMMON_PROJECT_ID}__{category_id}",
+            warnings=warnings,
+            data_dir=data_dir,
+            file_cache=file_cache,
+            skipped=skipped,
         )
-    return downloaded
+        downloaded.extend(category_downloads)
+        active_paths.extend(category_active_paths)
+    return downloaded, active_paths
 
 
 def _download_project_grouped_zip_files(
@@ -1054,13 +1457,19 @@ def _download_project_grouped_zip_files(
     project_id: str,
     *,
     warnings: list[str] | None = None,
-) -> list[str]:
-    downloaded = _download_project_zip_files(
+    data_dir: Path | None = None,
+    file_cache: dict[str, dict[str, Any]] | None = None,
+    skipped: list[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    downloaded, active_paths = _download_project_zip_files(
         client,
         packs_folder_id,
         target_dir,
         project_id,
         warnings=warnings,
+        data_dir=data_dir,
+        file_cache=file_cache,
+        skipped=skipped,
     )
     for category in client.list_children(packs_folder_id):
         if not category.is_folder:
@@ -1072,16 +1481,19 @@ def _download_project_grouped_zip_files(
         )
         if not category_id:
             continue
-        downloaded.extend(
-            _download_project_zip_files(
-                client,
-                category.id,
-                target_dir,
-                f"{project_id}__{category_id}",
-                warnings=warnings,
-            )
+        category_downloads, category_active_paths = _download_project_zip_files(
+            client,
+            category.id,
+            target_dir,
+            f"{project_id}__{category_id}",
+            warnings=warnings,
+            data_dir=data_dir,
+            file_cache=file_cache,
+            skipped=skipped,
         )
-    return downloaded
+        downloaded.extend(category_downloads)
+        active_paths.extend(category_active_paths)
+    return downloaded, active_paths
 
 
 def _prune_removed_project_assets(data_dir: Path, active_project_ids: set[str]) -> None:
@@ -1233,6 +1645,38 @@ def _write_project_pack_links(data_dir: Path, project_pack_links: dict[str, list
     marker.write_text(json.dumps(project_pack_links, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _read_project_pack_links(data_dir: Path) -> dict[str, list[str]]:
+    marker = data_dir / PROJECTS_FOLDER / PROJECT_PACK_LINKS_FILENAME
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    links: dict[str, list[str]] = {}
+    for project_id, pack_ids in payload.items():
+        if not isinstance(pack_ids, list):
+            continue
+        clean_project_id = str(project_id).strip()
+        clean_pack_ids = [str(pack_id).strip() for pack_id in pack_ids if str(pack_id).strip()]
+        if clean_project_id:
+            links[clean_project_id] = list(dict.fromkeys(clean_pack_ids))
+    return links
+
+
+def _merge_project_pack_links(data_dir: Path, updates: dict[str, list[str]]) -> None:
+    links = _read_project_pack_links(data_dir)
+    for project_id, pack_ids in updates.items():
+        clean_project_id = str(project_id).strip()
+        if not clean_project_id:
+            continue
+        clean_pack_ids = [str(pack_id).strip() for pack_id in pack_ids if str(pack_id).strip()]
+        links[clean_project_id] = list(dict.fromkeys(clean_pack_ids))
+    marker = data_dir / PROJECTS_FOLDER / PROJECT_PACK_LINKS_FILENAME
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps(links, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def _write_project_folders(data_dir: Path, project_folders: list[dict[str, str]]) -> None:
     marker = data_dir / PROJECTS_FOLDER / PROJECT_FOLDERS_FILENAME
     marker.parent.mkdir(parents=True, exist_ok=True)
@@ -1339,6 +1783,9 @@ def _download_zip_files(
     target_dir: Path,
     *,
     warnings: list[str] | None = None,
+    data_dir: Path | None = None,
+    file_cache: dict[str, dict[str, Any]] | None = None,
+    skipped: list[str] | None = None,
 ) -> list[str]:
     downloaded: list[str] = []
     for item in client.list_children(folder_id):
@@ -1348,8 +1795,15 @@ def _download_zip_files(
         if not safe_name:
             continue
         target = target_dir / safe_name
-        client.download_file(item.id, target)
-        downloaded.append(str(target))
+        if _download_file_if_changed(
+            client,
+            item,
+            target,
+            data_dir=data_dir,
+            file_cache=file_cache,
+            skipped=skipped,
+        ):
+            downloaded.append(str(target))
     return downloaded
 
 
@@ -1360,8 +1814,12 @@ def _download_project_zip_files(
     project_id: str,
     *,
     warnings: list[str] | None = None,
-) -> list[str]:
+    data_dir: Path | None = None,
+    file_cache: dict[str, dict[str, Any]] | None = None,
+    skipped: list[str] | None = None,
+) -> tuple[list[str], list[str]]:
     downloaded: list[str] = []
+    active_paths: list[str] = []
     active_names: set[str] = set()
     for item in client.list_children(folder_id):
         if item.is_folder or not item.name.lower().endswith(".zip"):
@@ -1371,10 +1829,19 @@ def _download_project_zip_files(
             continue
         target = target_dir / f"{project_id}__{safe_name}"
         active_names.add(target.name)
-        client.download_file(item.id, target)
-        downloaded.append(str(target))
+        if _download_file_if_changed(
+            client,
+            item,
+            target,
+            data_dir=data_dir,
+            file_cache=file_cache,
+            skipped=skipped,
+        ):
+            downloaded.append(str(target))
+        if target.exists():
+            active_paths.append(str(target))
     _prune_project_pack_cache(target_dir, project_id, active_names)
-    return downloaded
+    return downloaded, active_paths
 
 
 def _pack_id_from_zip(path: Path) -> str:

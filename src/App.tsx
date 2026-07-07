@@ -463,6 +463,7 @@ function App() {
   const localDataRef = useRef<{ nodes: LocalNode[]; edges: LocalEdge[]; packCount: number } | null>(null);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [graphDetail, setGraphDetail] = useState<OgDetail<GraphNode> | null>(null);
+  const [syncing, setSyncing] = useState(false);
   const ogControllerRef = useRef<OgController | null>(null);
 
   const applyLocalPacks = async (files: FileList | File[]) => {
@@ -1120,40 +1121,70 @@ function App() {
     setUploadStatus("IFC 연결 저장 완료");
   }
 
-  async function reindexPacks() {
+  async function reindexPacks(scope: "project" | "all" = "project") {
     if (currentUser?.role !== "admin") {
       setUploadStatus("관리자 세션이 필요합니다");
       return;
     }
-    setUploadStatus("Drive 동기화 및 XKT 변환 중");
-    const res = await fetch("/api/admin/storage/google-drive/sync", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${authToken}` },
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "Drive 동기화 실패");
-      return;
-    }
-    const payload = (await res.json()) as {
-      stats?: IndexStats;
-      reindexed?: IndexStats;
-      xktConversion?: { status?: string; converted?: unknown[]; errors?: unknown[]; reason?: string };
-    };
-    const nextStats = payload.reindexed ?? payload.stats;
-    if (nextStats) setIndexStats(nextStats);
-    await refreshData(undefined, authToken);
-    await refreshPublicStatus(authToken);
-    const convertedCount = payload.xktConversion?.converted?.length ?? 0;
-    const errorCount = payload.xktConversion?.errors?.length ?? 0;
-    if (convertedCount > 0) {
-      setUploadStatus(`Drive 동기화 완료 · XKT ${convertedCount}개 자동 변환`);
-    } else if (errorCount > 0) {
-      setUploadStatus(`Drive 동기화 완료 · XKT 변환 오류 ${errorCount}개`);
-    } else if (payload.xktConversion?.status === "skipped") {
-      setUploadStatus(`Drive 동기화 완료 · XKT 변환 건너뜀: ${payload.xktConversion.reason ?? "설정 없음"}`);
-    } else {
-      setUploadStatus("Drive 동기화 완료 · 변환할 IFC 없음");
+    if (syncing) return; // 진행 중 재클릭으로 동기화가 중첩되지 않게
+    // selectedProject가 projects[0]으로 폴백하기 때문에, 명시적 scope 없이는
+    // 전역 동기화가 도달 불가능한 경로였다 — "all"이면 전역 엔드포인트 강제.
+    const syncProject = scope === "all" ? null : selectedProject ?? null;
+    setSyncing(true);
+    setUploadStatus(syncProject ? `${syncProject.name} 프로젝트 Drive 동기화 중` : "Drive 변경 파일 동기화 중");
+    const endpoint = syncProject
+      ? `/api/admin/storage/google-drive/projects/${encodeURIComponent(syncProject.id)}/sync`
+      : "/api/admin/storage/google-drive/sync";
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      if (!res.ok) {
+        const payload = await res.json().catch(() => null);
+        const gatewayHint =
+          res.status === 504 || res.status === 502
+            ? " — 서버 시간제한/게이트웨이 오류입니다. 다시 동기화하면 남은 변경분만 이어서 반영됩니다."
+            : "";
+        setUploadStatus(payload?.detail ?? `Drive 동기화 실패 (HTTP ${res.status})${gatewayHint}`);
+        return;
+      }
+      const payload = (await res.json()) as {
+        stats?: IndexStats;
+        reindexed?: IndexStats;
+        downloaded?: unknown[];
+        skipped?: unknown[];
+        warnings?: unknown[];
+        scope?: string;
+        projectName?: string;
+      };
+      const nextStats = payload.reindexed ?? payload.stats;
+      if (nextStats) setIndexStats(nextStats);
+      await refreshData(undefined, authToken);
+      await refreshPublicStatus(authToken);
+      const changedCount = payload.downloaded?.length ?? 0;
+      const skippedCount = payload.skipped?.length ?? 0;
+      const warningCount = payload.warnings?.length ?? 0;
+      const warningSuffix = warningCount > 0 ? ` · 경고 ${warningCount}건` : "";
+      const syncLabel = payload.scope === "project" ? `${payload.projectName ?? syncProject?.name ?? "프로젝트"} 동기화` : "Drive 동기화";
+      if (changedCount > 0 && skippedCount > 0) {
+        setUploadStatus(`${syncLabel} 완료 · 변경 ${changedCount}개 반영 · 기존 ${skippedCount}개 유지${warningSuffix}`);
+      } else if (changedCount > 0) {
+        setUploadStatus(`${syncLabel} 완료 · 변경 ${changedCount}개 반영${warningSuffix}`);
+      } else if (skippedCount > 0) {
+        setUploadStatus(`${syncLabel} 완료 · 새 변경 없음 · 기존 ${skippedCount}개 유지${warningSuffix}`);
+      } else {
+        setUploadStatus(`${syncLabel} 완료 · 변경 파일 없음${warningSuffix}`);
+      }
+    } catch (error) {
+      // 연결 끊김/터널 드롭 등 HTTP 응답조차 없는 실패 — 상태가 '동기화 중'에 멈추지 않게
+      setUploadStatus(
+        `동기화 연결이 끊겼습니다. 서버에서는 계속 진행 중일 수 있으니 잠시 후 다시 동기화하면 변경분만 반영됩니다. (${
+          error instanceof Error ? error.message : String(error)
+        })`,
+      );
+    } finally {
+      setSyncing(false);
     }
   }
 
@@ -1447,8 +1478,12 @@ function App() {
             packs={packs}
             projects={projects}
             selectedPackId={selectedPackId}
+            selectedProjectId={selectedProject?.id ?? ""}
+            syncing={syncing}
             uploadStatus={uploadStatus}
-            onSync={reindexPacks}
+            onSelectProject={setSelectedProjectId}
+            onSync={() => reindexPacks("project")}
+            onSyncAll={() => reindexPacks("all")}
           />
         )}
 
@@ -1495,11 +1530,11 @@ function App() {
             onDeleteUser={deleteManagedUser}
             onMoveUserCompany={moveManagedUserCompany}
             onRenameCompany={renameManagedCompany}
-            onReindex={reindexPacks}
+            onReindex={() => reindexPacks("all")}
             onRefreshUsers={refreshAdminDirectory}
             onSetUserRole={updateManagedUserRole}
             onSetCompanyProjectAccess={updateCompanyProjectAccess}
-            onUpload={reindexPacks}
+            onUpload={() => reindexPacks("all")}
           />
         )}
 
@@ -2421,16 +2456,24 @@ function SyncView({
   packs,
   projects,
   selectedPackId,
+  selectedProjectId,
+  syncing,
   uploadStatus,
+  onSelectProject,
   onSync,
+  onSyncAll,
 }: {
   currentUser: CurrentUser | null;
   ifcModels: IfcModel[];
   packs: Pack[];
   projects: Project[];
   selectedPackId: string;
+  selectedProjectId: string;
+  syncing: boolean;
   uploadStatus: string;
+  onSelectProject: (projectId: string) => void;
   onSync: () => void;
+  onSyncAll: () => void;
 }) {
   const isAdmin = currentUser?.role === "admin";
   const projectByPackId = new Map<string, string>();
@@ -2444,16 +2487,31 @@ function SyncView({
         <div className="panel-header slim">
           <div>
             <h2>Drive 동기화</h2>
-            <span>{isAdmin ? "Google Drive에 올린 모델과 팩을 앱에 등록합니다" : "관리자 세션이 필요합니다"}</span>
+            <span>{isAdmin ? "Google Drive에 올린 IFC/XKT와 팩을 변경분만 등록합니다" : "관리자 세션이 필요합니다"}</span>
           </div>
           <RefreshCw size={19} />
         </div>
         <div className="action-stack">
-          <button className="primary-button block" disabled={!isAdmin} onClick={onSync}>
+          <label className="select-wrap sync-project-select">
+            <select
+              disabled={!isAdmin || projects.length === 0}
+              value={selectedProjectId}
+              onChange={(event) => onSelectProject(event.target.value)}
+            >
+              {projects.map((project) => (
+                <option key={project.id} value={project.id}>{project.name}</option>
+              ))}
+            </select>
+            <ChevronDown size={16} />
+          </label>
+          <button className="primary-button block" disabled={!isAdmin || projects.length === 0 || syncing} onClick={onSync}>
             <RefreshCw size={17} />
-            Drive에서 동기화
+            {syncing ? "동기화 진행 중…" : "선택 프로젝트 동기화"}
           </button>
-          <span className="sync-status-text">{uploadStatus || "관리자가 Drive에 파일을 올린 뒤 동기화하세요"}</span>
+          <button className="ghost-button block sync-all-button" disabled={!isAdmin || syncing} onClick={onSyncAll}>
+            전체 Drive 동기화 (모든 프로젝트 + 재색인)
+          </button>
+          <span className="sync-status-text">{uploadStatus || "프로젝트의 Drive 폴더에 파일을 올린 뒤 동기화하세요"}</span>
         </div>
       </div>
 
@@ -2472,7 +2530,7 @@ function SyncView({
               <span>{model.projectName || model.projectId || "미연결"}</span>
               <span>{model.storage || "local"}</span>
               <span>{model.sizeBytes ? fileSizeLabel(model.sizeBytes) : "-"}</span>
-              <em>{model.viewerStatus === "ready" ? "뷰어 준비" : "등록됨"}</em>
+              <em>{model.viewerStatus === "ready" ? "뷰어 준비" : "XKT 대기"}</em>
             </div>
           )) : (
             <p className="empty-list-note">동기화된 IFC 모델이 없습니다.</p>
