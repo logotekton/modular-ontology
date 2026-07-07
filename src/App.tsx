@@ -32,6 +32,7 @@ import { mergeLocalPacks, parseLocalPackFile } from "./localPacks";
 import type { LocalEdge, LocalNode, ParsedLocalPack } from "./localPacks";
 import { OntologyGraph } from "./OntologyGraph";
 import type { OgController, OgDetail } from "./OntologyGraph";
+import { AiChatPanel } from "./app/ai-chat/AiChatPanel";
 
 const API_BASE = "";
 const OPENAI_CHAT_MODEL = "gpt-4.1-mini";
@@ -1718,8 +1719,8 @@ function App() {
               </button>
             </div>
             {inspectorTab === "ai" ? (
-              <AiQueryPanel
-                openAiKeyStatus={openAiKeyStatus}
+              <AiChatPanel
+                keyReady={openAiKeyStatus === "valid"}
                 loading={aiLoading}
                 messages={aiMessages}
                 question={aiQuestion}
