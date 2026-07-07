@@ -50,6 +50,7 @@ from .google_drive_sync import (
     google_drive_sync_status,
     restore_ifc_files_from_drive,
     sync_google_drive_registry_files,
+    sync_google_drive_project_storage,
     sync_google_drive_storage,
     sync_google_drive_mcp_tokens_file,
     sync_google_drive_users_file,
@@ -60,7 +61,6 @@ from .google_drive_sync import (
     write_back_pack_file,
     write_back_users_file,
 )
-from .drive_xkt_worker import convert_missing_drive_xkts
 from .mcp_server import TOOL_NAMES, configure_server as configure_mcp_server, mcp as remote_mcp
 from .mcp_tokens import build_user_mcp_urls, ensure_mcp_token_for_user, regenerate_mcp_token_for_user
 from .pack_index import PackFile, build_graph, build_multi_pack_graph, list_packs, list_projects, save_uploaded_pack, unique_pack_files
@@ -155,15 +155,24 @@ def _file_mtime_ns(path: Path) -> int | None:
         return None
 
 
-def run_google_drive_sync(force: bool = False) -> dict[str, Any]:
+def run_google_drive_sync(force: bool = False, *, include_shared_packs: bool = True) -> dict[str, Any]:
     try:
         with _GOOGLE_DRIVE_SYNC_LOCK:
-            result = sync_google_drive_storage(force=force)
+            result = sync_google_drive_storage(force=force, include_shared_packs=include_shared_packs)
         if result.get("status") == "synced":
             invalidate_users_cache()
         return result
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
+
+
+def run_google_drive_project_sync(project_id: str, force: bool = False) -> dict[str, Any]:
+    try:
+        with _GOOGLE_DRIVE_SYNC_LOCK:
+            result = sync_google_drive_project_storage(project_id, force=force)
+        return result
+    except Exception as exc:
+        return {"status": "error", "scope": "project", "projectId": project_id, "error": str(exc)}
 
 
 def run_google_drive_registry_sync(force: bool = False) -> dict[str, Any]:
@@ -324,16 +333,6 @@ def run_google_drive_write_back(
         return {"enabled": True, **result}
     except Exception as exc:
         return {"enabled": True, "status": "error", "error": str(exc)}
-
-
-def run_google_drive_xkt_conversion() -> dict[str, Any]:
-    if not google_drive_sync_enabled():
-        return {"enabled": False, "status": "disabled"}
-    try:
-        result = convert_missing_drive_xkts()
-        return {"enabled": True, **result}
-    except Exception as exc:
-        return {"enabled": True, "status": "error", "error": str(exc), "converted": []}
 
 
 def require_google_drive_write_back(result: dict[str, Any]) -> dict[str, Any]:
@@ -1145,35 +1144,91 @@ def google_drive_storage_status(authorization: str | None = Header(default=None)
     return {"enabled": True, **google_drive_sync_status()}
 
 
+def _sync_changed_zip_paths(result: dict[str, Any]) -> list[Path]:
+    changed: list[Path] = []
+    for entry in result.get("downloaded") or []:
+        path = Path(str(entry))
+        if path.suffix.lower() == ".zip":
+            changed.append(path)
+    return changed
+
+
+def _reindex_packs_by_path(paths: list[Path]) -> dict[str, Any]:
+    """변경된 zip만 재색인 — 전체 delete/reinsert 대신 해당 팩만 갱신한다."""
+    conn = connect()
+    try:
+        init_db(conn)
+        known = {pack.path.resolve(): pack for pack in unique_pack_files()}
+        indexed = []
+        for path in paths:
+            pack = known.get(path.resolve())
+            if pack is not None:
+                indexed.append(index_pack(conn, pack))
+        return {"status": "indexed", "packs": indexed, "stats": index_stats(conn)}
+    finally:
+        conn.close()
+
+
 @app.post("/api/admin/storage/google-drive/sync")
 def admin_sync_google_drive_storage(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_admin(authorization)
     if not google_drive_sync_enabled():
         raise HTTPException(status_code=400, detail="MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set.")
-    conversion = run_google_drive_xkt_conversion()
-    result = run_google_drive_sync(force=True)
-    result["xktConversion"] = conversion
+    result = run_google_drive_sync(force=True, include_shared_packs=False)
     if result.get("status") == "synced":
-        index_result = index_all_packs()
-        result["reindexed"] = index_result.get("stats", {})
-        result["driveProjects"] = _apply_drive_project_folders()
-        result["projectPackLinks"] = _apply_drive_project_pack_links()
-        result["projects"] = list_projects()
-        result["writeBack"] = require_google_drive_write_back(run_google_drive_write_back("database"))
-        if result["driveProjects"].get("accessRenamed") or result["driveProjects"].get("accessRemoved"):
-            result["usersWriteBack"] = require_google_drive_write_back(run_google_drive_write_back("users"))
+        changed = _sync_changed_zip_paths(result)
+        # 재색인/프로젝트 적용/write-back도 동기화 락으로 직렬화 — 동시 요청이
+        # 같은 SQLite에 쓰며 'database is locked'로 500 나던 문제 방지.
+        with _GOOGLE_DRIVE_SYNC_LOCK:
+            if changed:
+                index_result = index_all_packs()
+                result["reindexed"] = index_result.get("stats", {})
+            else:
+                result["reindexed"] = index_stats()
+            result["driveProjects"] = _apply_drive_project_folders()
+            result["projectPackLinks"] = _apply_drive_project_pack_links()
+            result["projects"] = list_projects()
+            if changed:
+                result["writeBack"] = require_google_drive_write_back(run_google_drive_write_back("database"))
+            else:
+                # 변경 없는 동기화가 DB를 재업로드해 modifiedTime을 올리고
+                # 다음 동기화의 캐시를 스스로 무효화하던 루프 차단.
+                result["writeBack"] = {"status": "skipped", "reason": "no changed files"}
+            if result["driveProjects"].get("accessRenamed") or result["driveProjects"].get("accessRemoved"):
+                result["usersWriteBack"] = require_google_drive_write_back(run_google_drive_write_back("users"))
     return {"enabled": True, **result}
 
 
-@app.post("/api/admin/storage/google-drive/convert-xkt")
-def admin_convert_google_drive_xkt(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+@app.post("/api/admin/storage/google-drive/projects/{project_id}/sync")
+def admin_sync_google_drive_project(project_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_admin(authorization)
     if not google_drive_sync_enabled():
         raise HTTPException(status_code=400, detail="MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set.")
-    result = run_google_drive_xkt_conversion()
+    if not any(str(project["id"]) == project_id for project in list_projects()):
+        raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
+    result = run_google_drive_project_sync(project_id, force=True)
+    if result.get("status") == "missing":
+        raise HTTPException(status_code=404, detail=f"Google Drive project folder not found: {project_id}")
     if result.get("status") == "error":
-        raise HTTPException(status_code=502, detail=f"Google Drive XKT conversion failed: {result.get('error') or result.get('errors')}")
-    return result
+        raise HTTPException(status_code=502, detail=f"Google Drive project sync failed: {result.get('error')}")
+    if result.get("status") == "synced":
+        changed = _sync_changed_zip_paths(result)
+        with _GOOGLE_DRIVE_SYNC_LOCK:
+            if changed:
+                # 프로젝트 스코프 동기화는 변경 팩만 재색인 — 전체 재색인이
+                # 스코핑을 무력화하고 요청 시간을 폭증시키던 문제 해결.
+                index_result = _reindex_packs_by_path(changed)
+                result["reindexed"] = index_result.get("stats", {})
+                result["reindexedPacks"] = [entry.get("id") for entry in index_result.get("packs", [])]
+            else:
+                result["reindexed"] = index_stats()
+            result["projectPackLinks"] = _apply_drive_project_pack_links()
+            result["projects"] = list_projects()
+            if changed:
+                result["writeBack"] = require_google_drive_write_back(run_google_drive_write_back("database"))
+            else:
+                result["writeBack"] = {"status": "skipped", "reason": "no changed files"}
+    return {"enabled": True, **result}
 
 
 @app.post("/api/admin/storage/google-drive/write-back")
@@ -1358,7 +1413,6 @@ def reindex(full: bool = False, authorization: str | None = Header(default=None)
         result.update({
             "status": "registry-synced",
             "registry": registry,
-            "xktConversion": {"status": "skipped", "reason": "fast registry sync"},
             "driveProjects": drive_projects,
             "projectPackLinks": links,
             "projects": list_projects(),
@@ -1368,10 +1422,8 @@ def reindex(full: bool = False, authorization: str | None = Header(default=None)
             if drive_projects.get("accessRenamed") or drive_projects.get("accessRemoved"):
                 result["usersWriteBack"] = require_google_drive_write_back(run_google_drive_write_back("users"))
         return result
-    conversion = run_google_drive_xkt_conversion()
     require_google_drive_sync(run_google_drive_sync(force=True))
     result = index_all_packs()
-    result["xktConversion"] = conversion
     result["driveProjects"] = _apply_drive_project_folders()
     result["projectPackLinks"] = _apply_drive_project_pack_links()
     result["projects"] = list_projects()

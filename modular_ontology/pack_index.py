@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -220,7 +221,27 @@ def _title_from_drive_filename(filename: str) -> str | None:
     return re.sub(r"[_-]+", " ", stem).strip() or None
 
 
+# (mtime, size) 서명 기반 메모이즈 — 한 번의 동기화가 unique_pack_files/index_pack/
+# list_packs 경로에서 같은 zip을 3회씩 재파싱하던 것을 제거한다.
+_SUMMARIZE_CACHE: dict[str, tuple[tuple[float, int], dict[str, Any]]] = {}
+
+
 def summarize_pack(pack: PackFile) -> dict[str, Any]:
+    try:
+        stat = pack.path.stat()
+        cache_key = str(pack.path.resolve())
+        signature = (stat.st_mtime, stat.st_size)
+    except OSError:
+        return _summarize_pack_uncached(pack)
+    cached = _SUMMARIZE_CACHE.get(cache_key)
+    if cached is not None and cached[0] == signature:
+        return copy.deepcopy(cached[1])
+    summary = _summarize_pack_uncached(pack)
+    _SUMMARIZE_CACHE[cache_key] = (signature, copy.deepcopy(summary))
+    return summary
+
+
+def _summarize_pack_uncached(pack: PackFile) -> dict[str, Any]:
     with zipfile.ZipFile(pack.path) as zf:
         manifest = _read_json(zf, "manifest.json") or {}
         build_summary = _read_json(zf, "06_reports/build_summary.json") or {}

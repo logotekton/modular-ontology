@@ -1006,8 +1006,8 @@ function ModelViewerCanvas({
         <strong>3D 뷰어 변환 대기 중</strong>
         <span>
           {manifest?.status === "pending-xkt"
-            ? "Drive에 IFC만 있고 같은 이름의 XKT가 아직 없습니다. 동기화가 자동 변환을 시도합니다."
-            : "모델을 선택하거나 XKT 변환이 끝난 모델을 동기화하세요."}
+            ? "Drive에 IFC만 있고 같은 이름의 XKT가 아직 없습니다. 변환한 XKT를 같은 폴더에 올린 뒤 동기화하세요."
+            : "모델을 선택하거나 변환한 XKT가 올라온 모델을 동기화하세요."}
         </span>
         {manifest?.error ? <em>{manifest.error}</em> : null}
       </div>
