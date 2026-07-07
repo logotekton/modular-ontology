@@ -4586,3 +4586,25 @@ dd {
   color: #745b00;
   background: #fdf6e3;
 }
+
+
+/* 전체 Drive 동기화 보조 버튼 (Astryx neutral) */
+.sync-all-button {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid #d4d4d4;
+  border-radius: 10px;
+  background: #ffffff;
+  color: #525252;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.sync-all-button:hover:not(:disabled) {
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.sync-all-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

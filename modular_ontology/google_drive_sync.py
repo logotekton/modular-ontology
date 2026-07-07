@@ -52,6 +52,35 @@ DRIVE_FILE_CACHE_FILENAME = ".google-drive-file-cache.json"
 PROJECT_SYNC_MARKER_FOLDER = ".google-drive-project-sync"
 _DB_SYNC_LOCK = threading.Lock()
 
+# Drive가 지수 백오프 재시도를 요구하는 일시적 오류 (429 rate limit, 5xx)
+_RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
+_RETRY_ATTEMPTS = 4
+
+
+def _urlopen_with_retry(request: urllib.request.Request, *, timeout: float):
+    """일시적 HTTP/네트워크 오류에 지수 백오프로 재시도하는 urlopen.
+
+    308(Resume Incomplete)처럼 호출부가 기대하는 상태 코드는 재시도 대상이
+    아니므로 그대로 전파된다. 대량 순차 호출(list/download 버스트)이 한 번의
+    429/503으로 통째로 실패하던 것을 막는다.
+    """
+    delay = 1.0
+    last_error: Exception | None = None
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            return urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in _RETRYABLE_HTTP_CODES:
+                raise
+            last_error = exc
+        except urllib.error.URLError as exc:
+            last_error = exc
+        if attempt < _RETRY_ATTEMPTS - 1:
+            time.sleep(delay)
+            delay = min(delay * 2.0, 8.0)
+    assert last_error is not None
+    raise last_error
+
 
 @dataclass(frozen=True)
 class DriveItem:
@@ -127,7 +156,7 @@ class GoogleDriveClient:
         url = self._url(f"files/{file_id}", params)
         request = urllib.request.Request(url, headers=self._headers())
         temp = target.with_name(f".{target.name}.tmp")
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with _urlopen_with_retry(request, timeout=60) as response:
             with temp.open("wb") as stream:
                 while True:
                     chunk = response.read(1024 * 1024)
@@ -150,7 +179,7 @@ class GoogleDriveClient:
             headers={**self._headers(), "Content-Type": content_type},
             method="PATCH",
         )
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with _urlopen_with_retry(request, timeout=60) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def create_file(self, parent_id: str, source: Path, name: str | None = None, mime_type: str | None = None) -> dict[str, Any]:
@@ -183,7 +212,7 @@ class GoogleDriveClient:
             headers={**self._headers(), "Content-Type": f"multipart/related; boundary={boundary}"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with _urlopen_with_retry(request, timeout=120) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def _resumable_upload(
@@ -207,7 +236,7 @@ class GoogleDriveClient:
             body = json.dumps(metadata, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json; charset=UTF-8"
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with _urlopen_with_retry(request, timeout=60) as response:
             session_url = response.headers.get("Location")
         if not session_url:
             raise RuntimeError("Google Drive did not return a resumable upload session URL.")
@@ -231,7 +260,7 @@ class GoogleDriveClient:
                     method="PUT",
                 )
                 try:
-                    with urllib.request.urlopen(chunk_request, timeout=300) as response:
+                    with _urlopen_with_retry(chunk_request, timeout=300) as response:
                         return json.loads(response.read().decode("utf-8"))
                 except urllib.error.HTTPError as exc:
                     if exc.code != 308:
@@ -262,7 +291,7 @@ class GoogleDriveClient:
             headers={**self._headers(), "Content-Type": "application/json; charset=UTF-8"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with _urlopen_with_retry(request, timeout=30) as response:
             payload = json.loads(response.read().decode("utf-8"))
         return DriveItem(id=str(payload["id"]), name=str(payload["name"]), mime_type=str(payload["mimeType"]))
 
@@ -287,7 +316,7 @@ class GoogleDriveClient:
     def _request_json(self, path: str, params: dict[str, str]) -> dict[str, Any]:
         url = self._url(path, params)
         request = urllib.request.Request(url, headers=self._headers())
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with _urlopen_with_retry(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def _url(self, path: str, params: dict[str, str]) -> str:

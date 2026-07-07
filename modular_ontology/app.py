@@ -1144,6 +1144,31 @@ def google_drive_storage_status(authorization: str | None = Header(default=None)
     return {"enabled": True, **google_drive_sync_status()}
 
 
+def _sync_changed_zip_paths(result: dict[str, Any]) -> list[Path]:
+    changed: list[Path] = []
+    for entry in result.get("downloaded") or []:
+        path = Path(str(entry))
+        if path.suffix.lower() == ".zip":
+            changed.append(path)
+    return changed
+
+
+def _reindex_packs_by_path(paths: list[Path]) -> dict[str, Any]:
+    """변경된 zip만 재색인 — 전체 delete/reinsert 대신 해당 팩만 갱신한다."""
+    conn = connect()
+    try:
+        init_db(conn)
+        known = {pack.path.resolve(): pack for pack in unique_pack_files()}
+        indexed = []
+        for path in paths:
+            pack = known.get(path.resolve())
+            if pack is not None:
+                indexed.append(index_pack(conn, pack))
+        return {"status": "indexed", "packs": indexed, "stats": index_stats(conn)}
+    finally:
+        conn.close()
+
+
 @app.post("/api/admin/storage/google-drive/sync")
 def admin_sync_google_drive_storage(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_admin(authorization)
@@ -1151,14 +1176,26 @@ def admin_sync_google_drive_storage(authorization: str | None = Header(default=N
         raise HTTPException(status_code=400, detail="MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set.")
     result = run_google_drive_sync(force=True, include_shared_packs=False)
     if result.get("status") == "synced":
-        index_result = index_all_packs()
-        result["reindexed"] = index_result.get("stats", {})
-        result["driveProjects"] = _apply_drive_project_folders()
-        result["projectPackLinks"] = _apply_drive_project_pack_links()
-        result["projects"] = list_projects()
-        result["writeBack"] = require_google_drive_write_back(run_google_drive_write_back("database"))
-        if result["driveProjects"].get("accessRenamed") or result["driveProjects"].get("accessRemoved"):
-            result["usersWriteBack"] = require_google_drive_write_back(run_google_drive_write_back("users"))
+        changed = _sync_changed_zip_paths(result)
+        # 재색인/프로젝트 적용/write-back도 동기화 락으로 직렬화 — 동시 요청이
+        # 같은 SQLite에 쓰며 'database is locked'로 500 나던 문제 방지.
+        with _GOOGLE_DRIVE_SYNC_LOCK:
+            if changed:
+                index_result = index_all_packs()
+                result["reindexed"] = index_result.get("stats", {})
+            else:
+                result["reindexed"] = index_stats()
+            result["driveProjects"] = _apply_drive_project_folders()
+            result["projectPackLinks"] = _apply_drive_project_pack_links()
+            result["projects"] = list_projects()
+            if changed:
+                result["writeBack"] = require_google_drive_write_back(run_google_drive_write_back("database"))
+            else:
+                # 변경 없는 동기화가 DB를 재업로드해 modifiedTime을 올리고
+                # 다음 동기화의 캐시를 스스로 무효화하던 루프 차단.
+                result["writeBack"] = {"status": "skipped", "reason": "no changed files"}
+            if result["driveProjects"].get("accessRenamed") or result["driveProjects"].get("accessRemoved"):
+                result["usersWriteBack"] = require_google_drive_write_back(run_google_drive_write_back("users"))
     return {"enabled": True, **result}
 
 
@@ -1175,11 +1212,22 @@ def admin_sync_google_drive_project(project_id: str, authorization: str | None =
     if result.get("status") == "error":
         raise HTTPException(status_code=502, detail=f"Google Drive project sync failed: {result.get('error')}")
     if result.get("status") == "synced":
-        index_result = index_all_packs()
-        result["reindexed"] = index_result.get("stats", {})
-        result["projectPackLinks"] = _apply_drive_project_pack_links()
-        result["projects"] = list_projects()
-        result["writeBack"] = require_google_drive_write_back(run_google_drive_write_back("database"))
+        changed = _sync_changed_zip_paths(result)
+        with _GOOGLE_DRIVE_SYNC_LOCK:
+            if changed:
+                # 프로젝트 스코프 동기화는 변경 팩만 재색인 — 전체 재색인이
+                # 스코핑을 무력화하고 요청 시간을 폭증시키던 문제 해결.
+                index_result = _reindex_packs_by_path(changed)
+                result["reindexed"] = index_result.get("stats", {})
+                result["reindexedPacks"] = [entry.get("id") for entry in index_result.get("packs", [])]
+            else:
+                result["reindexed"] = index_stats()
+            result["projectPackLinks"] = _apply_drive_project_pack_links()
+            result["projects"] = list_projects()
+            if changed:
+                result["writeBack"] = require_google_drive_write_back(run_google_drive_write_back("database"))
+            else:
+                result["writeBack"] = {"status": "skipped", "reason": "no changed files"}
     return {"enabled": True, **result}
 
 
