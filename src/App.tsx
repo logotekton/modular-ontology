@@ -449,6 +449,7 @@ function App() {
   const localDataRef = useRef<{ nodes: LocalNode[]; edges: LocalEdge[]; packCount: number } | null>(null);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [graphDetail, setGraphDetail] = useState<OgDetail<GraphNode> | null>(null);
+  const [syncing, setSyncing] = useState(false);
   const ogControllerRef = useRef<OgController | null>(null);
 
   const applyLocalPacks = async (files: FileList | File[]) => {
@@ -1110,43 +1111,56 @@ function App() {
       setUploadStatus("관리자 세션이 필요합니다");
       return;
     }
+    if (syncing) return; // 진행 중 재클릭으로 동기화가 중첩되지 않게
     const syncProject = selectedProject ?? null;
+    setSyncing(true);
     setUploadStatus(syncProject ? `${syncProject.name} 프로젝트 Drive 동기화 중` : "Drive 변경 파일 동기화 중");
     const endpoint = syncProject
       ? `/api/admin/storage/google-drive/projects/${encodeURIComponent(syncProject.id)}/sync`
       : "/api/admin/storage/google-drive/sync";
-    const res = await fetch(endpoint, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${authToken}` },
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "Drive 동기화 실패");
-      return;
-    }
-    const payload = (await res.json()) as {
-      stats?: IndexStats;
-      reindexed?: IndexStats;
-      downloaded?: unknown[];
-      skipped?: unknown[];
-      scope?: string;
-      projectName?: string;
-    };
-    const nextStats = payload.reindexed ?? payload.stats;
-    if (nextStats) setIndexStats(nextStats);
-    await refreshData(undefined, authToken);
-    await refreshPublicStatus(authToken);
-    const changedCount = payload.downloaded?.length ?? 0;
-    const skippedCount = payload.skipped?.length ?? 0;
-    const syncLabel = payload.scope === "project" ? `${payload.projectName ?? syncProject?.name ?? "프로젝트"} 동기화` : "Drive 동기화";
-    if (changedCount > 0 && skippedCount > 0) {
-      setUploadStatus(`${syncLabel} 완료 · 변경 ${changedCount}개 반영 · 기존 ${skippedCount}개 유지`);
-    } else if (changedCount > 0) {
-      setUploadStatus(`${syncLabel} 완료 · 변경 ${changedCount}개 반영`);
-    } else if (skippedCount > 0) {
-      setUploadStatus(`${syncLabel} 완료 · 새 변경 없음 · 기존 ${skippedCount}개 유지`);
-    } else {
-      setUploadStatus(`${syncLabel} 완료 · 변경 파일 없음`);
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      if (!res.ok) {
+        const payload = await res.json().catch(() => null);
+        setUploadStatus(payload?.detail ?? "Drive 동기화 실패");
+        return;
+      }
+      const payload = (await res.json()) as {
+        stats?: IndexStats;
+        reindexed?: IndexStats;
+        downloaded?: unknown[];
+        skipped?: unknown[];
+        scope?: string;
+        projectName?: string;
+      };
+      const nextStats = payload.reindexed ?? payload.stats;
+      if (nextStats) setIndexStats(nextStats);
+      await refreshData(undefined, authToken);
+      await refreshPublicStatus(authToken);
+      const changedCount = payload.downloaded?.length ?? 0;
+      const skippedCount = payload.skipped?.length ?? 0;
+      const syncLabel = payload.scope === "project" ? `${payload.projectName ?? syncProject?.name ?? "프로젝트"} 동기화` : "Drive 동기화";
+      if (changedCount > 0 && skippedCount > 0) {
+        setUploadStatus(`${syncLabel} 완료 · 변경 ${changedCount}개 반영 · 기존 ${skippedCount}개 유지`);
+      } else if (changedCount > 0) {
+        setUploadStatus(`${syncLabel} 완료 · 변경 ${changedCount}개 반영`);
+      } else if (skippedCount > 0) {
+        setUploadStatus(`${syncLabel} 완료 · 새 변경 없음 · 기존 ${skippedCount}개 유지`);
+      } else {
+        setUploadStatus(`${syncLabel} 완료 · 변경 파일 없음`);
+      }
+    } catch (error) {
+      // 연결 끊김/터널 드롭 등 HTTP 응답조차 없는 실패 — 상태가 '동기화 중'에 멈추지 않게
+      setUploadStatus(
+        `동기화 연결이 끊겼습니다. 서버에서는 계속 진행 중일 수 있으니 잠시 후 다시 동기화하면 변경분만 반영됩니다. (${
+          error instanceof Error ? error.message : String(error)
+        })`,
+      );
+    } finally {
+      setSyncing(false);
     }
   }
 
@@ -1438,6 +1452,7 @@ function App() {
             projects={projects}
             selectedPackId={selectedPackId}
             selectedProjectId={selectedProject?.id ?? ""}
+            syncing={syncing}
             uploadStatus={uploadStatus}
             onSelectProject={setSelectedProjectId}
             onSync={reindexPacks}
@@ -2402,6 +2417,7 @@ function SyncView({
   projects,
   selectedPackId,
   selectedProjectId,
+  syncing,
   uploadStatus,
   onSelectProject,
   onSync,
@@ -2412,6 +2428,7 @@ function SyncView({
   projects: Project[];
   selectedPackId: string;
   selectedProjectId: string;
+  syncing: boolean;
   uploadStatus: string;
   onSelectProject: (projectId: string) => void;
   onSync: () => void;
@@ -2445,9 +2462,9 @@ function SyncView({
             </select>
             <ChevronDown size={16} />
           </label>
-          <button className="primary-button block" disabled={!isAdmin || projects.length === 0} onClick={onSync}>
+          <button className="primary-button block" disabled={!isAdmin || projects.length === 0 || syncing} onClick={onSync}>
             <RefreshCw size={17} />
-            선택 프로젝트 동기화
+            {syncing ? "동기화 진행 중…" : "선택 프로젝트 동기화"}
           </button>
           <span className="sync-status-text">{uploadStatus || "프로젝트의 Drive 폴더에 파일을 올린 뒤 동기화하세요"}</span>
         </div>
