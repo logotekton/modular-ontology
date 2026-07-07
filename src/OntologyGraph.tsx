@@ -3,6 +3,7 @@
 // 수만 노드도 첫 화면이 바로 뜬다. 차수 필터·포커스(hop)·타입 레전드·
 // 노드 상세 다이얼로그를 포함한다.
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 export type OgNode = {
   id: string;
@@ -119,6 +120,12 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
   const [focusOn, setFocusOn] = useState(false);
   const [paused, setPaused] = useState(false);
   const [stats, setStats] = useState({ shownNodes: 0, shownEdges: 0, totalNodes: 0, totalEdges: 0 });
+  const [controlHost, setControlHost] = useState<HTMLElement | null>(null);
+
+  // 필터·물리 패널은 그래프 안이 아니라 왼쪽 사이드바(#graph-sidebar-controls)로 포털
+  useEffect(() => {
+    setControlHost(document.getElementById("graph-sidebar-controls"));
+  }, [nodes, edges]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -741,6 +748,102 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
 
   const engine = () => engineRef.current;
 
+  const controlsPanel = (
+    <aside className={controlHost ? "og-panel og-controls in-sidebar" : "og-panel og-controls"} aria-label="필터 · 물리">
+      <div className="og-panel-title">필터 · 물리</div>
+      <label>
+        <span>최소 차수 (degree)</span>
+        <strong>{minDeg}</strong>
+        <input
+          type="range"
+          min={0}
+          max={maxDegSlider}
+          step={1}
+          value={minDeg}
+          onChange={(ev) => {
+            const value = Number(ev.target.value);
+            setMinDeg(value);
+            engine()?.setMinDeg(value);
+          }}
+        />
+      </label>
+      <label>
+        <span>포커스 반경 (hop)</span>
+        <strong>{hop}</strong>
+        <input
+          type="range"
+          min={1}
+          max={4}
+          step={1}
+          value={hop}
+          onChange={(ev) => {
+            const value = Number(ev.target.value);
+            setHop(value);
+            engine()?.setHop(value);
+          }}
+        />
+      </label>
+      <label>
+        <span>반발력</span>
+        <strong>{rep.toFixed(1)}</strong>
+        <input
+          type="range"
+          min={0.2}
+          max={3}
+          step={0.1}
+          value={rep}
+          onChange={(ev) => {
+            const value = Number(ev.target.value);
+            setRep(value);
+            engine()?.setRep(value);
+          }}
+        />
+      </label>
+      <label>
+        <span>링크 거리</span>
+        <strong>{link}</strong>
+        <input
+          type="range"
+          min={20}
+          max={200}
+          step={5}
+          value={link}
+          onChange={(ev) => {
+            const value = Number(ev.target.value);
+            setLink(value);
+            engine()?.setLink(value);
+          }}
+        />
+      </label>
+      <div className="og-controls-row">
+        <button type="button" onClick={() => engine()?.reheat()}>
+          🔥 재가열
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            const next = !paused;
+            setPaused(next);
+            engine()?.setPaused(next);
+          }}
+        >
+          {paused ? "▶ 재개" : "⏸ 일시정지"}
+        </button>
+        <button
+          type="button"
+          className={focusOn ? "on" : ""}
+          onClick={() => {
+            const next = !focusOn;
+            setFocusOn(next);
+            engine()?.setFocus(next);
+          }}
+        >
+          ◎ 포커스
+        </button>
+      </div>
+    </aside>
+  );
+
   return (
     <div ref={containerRef} className="og-stage">
       <canvas ref={canvasRef} className="og-canvas" />
@@ -771,99 +874,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
         ))}
       </aside>
 
-      <aside className="og-panel og-controls" aria-label="필터 · 물리">
-        <div className="og-panel-title">필터 · 물리</div>
-        <label>
-          <span>최소 차수 (degree)</span>
-          <strong>{minDeg}</strong>
-          <input
-            type="range"
-            min={0}
-            max={maxDegSlider}
-            step={1}
-            value={minDeg}
-            onChange={(ev) => {
-              const value = Number(ev.target.value);
-              setMinDeg(value);
-              engine()?.setMinDeg(value);
-            }}
-          />
-        </label>
-        <label>
-          <span>포커스 반경 (hop)</span>
-          <strong>{hop}</strong>
-          <input
-            type="range"
-            min={1}
-            max={4}
-            step={1}
-            value={hop}
-            onChange={(ev) => {
-              const value = Number(ev.target.value);
-              setHop(value);
-              engine()?.setHop(value);
-            }}
-          />
-        </label>
-        <label>
-          <span>반발력</span>
-          <strong>{rep.toFixed(1)}</strong>
-          <input
-            type="range"
-            min={0.2}
-            max={3}
-            step={0.1}
-            value={rep}
-            onChange={(ev) => {
-              const value = Number(ev.target.value);
-              setRep(value);
-              engine()?.setRep(value);
-            }}
-          />
-        </label>
-        <label>
-          <span>링크 거리</span>
-          <strong>{link}</strong>
-          <input
-            type="range"
-            min={20}
-            max={200}
-            step={5}
-            value={link}
-            onChange={(ev) => {
-              const value = Number(ev.target.value);
-              setLink(value);
-              engine()?.setLink(value);
-            }}
-          />
-        </label>
-        <div className="og-controls-row">
-          <button type="button" onClick={() => engine()?.reheat()}>
-            🔥 재가열
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              const next = !paused;
-              setPaused(next);
-              engine()?.setPaused(next);
-            }}
-          >
-            {paused ? "▶ 재개" : "⏸ 일시정지"}
-          </button>
-          <button
-            type="button"
-            className={focusOn ? "on" : ""}
-            onClick={() => {
-              const next = !focusOn;
-              setFocusOn(next);
-              engine()?.setFocus(next);
-            }}
-          >
-            ◎ 포커스
-          </button>
-        </div>
-      </aside>
+      {controlHost ? createPortal(controlsPanel, controlHost) : controlsPanel}
 
       <div className="og-panel og-stats">
         노드 <strong>{stats.shownNodes.toLocaleString()}</strong> / {stats.totalNodes.toLocaleString()} · 엣지{" "}

@@ -1309,6 +1309,7 @@ function App() {
             );
           })}
         </nav>
+        {activeTab === "Graph Explorer" && <div id="graph-sidebar-controls" className="sidebar-graph-controls" />}
         {currentUser.role === "admin" && (
         <div className="sidebar-status">
           <ShieldCheck size={18} />

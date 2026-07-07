@@ -4545,3 +4545,15 @@ dd {
   white-space: nowrap;
   padding-right: 10px;
 }
+
+
+/* 사이드바로 포털된 필터·물리 패널 */
+.og-controls.in-sidebar {
+  position: static;
+  width: 100%;
+  box-shadow: none;
+  border: 1px solid #ebebeb;
+  border-radius: 12px;
+  padding: 12px;
+  background: #ffffff;
+}
