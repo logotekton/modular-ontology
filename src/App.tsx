@@ -28,12 +28,14 @@ import {
 import Graph from "graphology";
 import Sigma from "sigma";
 import { ModelExplorerView } from "./ModelExplorer";
+import { mergeLocalPacks, parseLocalPackFile } from "./localPacks";
+import type { LocalEdge, LocalNode, ParsedLocalPack } from "./localPacks";
 
 const API_BASE = "";
 const OPENAI_CHAT_MODEL = "gpt-4.1-mini";
 const NODE_COLLISION_PADDING = 1.45;
 const GRAPH_EDGE_COLOR = "rgba(84, 84, 84, 0.48)";
-const GRAPH_EDGE_SELECTED_COLOR = "rgba(13, 148, 136, 0.78)";
+const GRAPH_EDGE_SELECTED_COLOR = "rgba(0, 116, 226, 0.78)";
 const GRAPH_EDGE_DIMMED_COLOR = "rgba(84, 84, 84, 0.28)";
 const DEFAULT_GRAPH_CONTROLS = {
   nodeSize: 0.5,
@@ -416,7 +418,69 @@ function App() {
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [selectedGraphPackIds, setSelectedGraphPackIds] = useState<string[]>([]);
   const [graph, setGraph] = useState<GraphPayload | null>(null);
+  const [localGraph, setLocalGraph] = useState<GraphPayload | null>(null);
+  const [localPackCount, setLocalPackCount] = useState(0);
+  const [localPackStatus, setLocalPackStatus] = useState("");
+  const [localDragOver, setLocalDragOver] = useState(false);
+  const localPackInputRef = useRef<HTMLInputElement | null>(null);
+  const localDataRef = useRef<{ nodes: LocalNode[]; edges: LocalEdge[]; packCount: number } | null>(null);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
+
+  const applyLocalPacks = async (files: FileList | File[]) => {
+    const list = Array.from(files);
+    if (!list.length) return;
+    setLocalPackStatus("로컬 팩 읽는 중…");
+    const parsed: ParsedLocalPack[] = [];
+    const failures: string[] = [];
+    for (const file of list) {
+      try {
+        parsed.push(await parseLocalPackFile(file));
+      } catch (error) {
+        failures.push(`${file.name}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (!parsed.length) {
+      setLocalPackStatus(failures.join(" / ") || "읽을 수 있는 파일이 없습니다");
+      return;
+    }
+    const previous = localDataRef.current;
+    const merged = mergeLocalPacks(previous ? { nodes: previous.nodes, edges: previous.edges } : null, parsed);
+    const packCount = (previous?.packCount ?? 0) + parsed.length;
+    localDataRef.current = { nodes: merged.nodes, edges: merged.edges, packCount };
+    setLocalPackCount(packCount);
+    setLocalGraph({
+      pack: {
+        id: "__local__",
+        title: packCount === 1 ? parsed[0].title : `로컬 팩 ${packCount}개 병합`,
+        filename: "local",
+        source: "local",
+        validationStatus: "local",
+        counts: {},
+      },
+      nodes: merged.nodes,
+      edges: merged.edges,
+      stats: {
+        visibleNodes: merged.nodes.length,
+        visibleEdges: merged.edges.length,
+        totalNodes: merged.nodes.length,
+        totalEdges: merged.edges.length,
+      },
+    });
+    setSelectedNode(null);
+    const parts = [`+노드 ${merged.addedNodes.toLocaleString()}`, `+엣지 ${merged.addedEdges.toLocaleString()}`];
+    if (merged.placeholders) parts.push(`미해결참조 ${merged.placeholders.toLocaleString()}`);
+    if (merged.resolvedRefs) parts.push(`참조해결 ${merged.resolvedRefs.toLocaleString()}`);
+    if (failures.length) parts.push(`실패 ${failures.length}건`);
+    setLocalPackStatus(parts.join(" · "));
+  };
+
+  const clearLocalPacks = () => {
+    localDataRef.current = null;
+    setLocalGraph(null);
+    setLocalPackCount(0);
+    setLocalPackStatus("");
+    setSelectedNode(null);
+  };
   const [inspectorTab, setInspectorTab] = useState<"node" | "ai">("node");
   const [aiQuestion, setAiQuestion] = useState("");
   const [aiMessages, setAiMessages] = useState<AiMessage[]>([]);
@@ -1389,14 +1453,49 @@ function App() {
         {activeTab === "Graph Explorer" && (
         <>
         <section className="content-grid graph-explorer-grid">
-          <div className="graph-panel">
+          <div
+            className={localDragOver ? "graph-panel local-drag" : "graph-panel"}
+            onDragOver={(event) => {
+              event.preventDefault();
+              setLocalDragOver(true);
+            }}
+            onDragLeave={() => setLocalDragOver(false)}
+            onDrop={(event) => {
+              event.preventDefault();
+              setLocalDragOver(false);
+              if (event.dataTransfer.files.length) void applyLocalPacks(event.dataTransfer.files);
+            }}
+          >
             <div className="panel-header">
               <div>
                 <h2>그래프 탐색기</h2>
                 <span>
-                  {selectedProject?.name ?? graph?.pack.title ?? status}
-                  {graphPackOptions.length ? ` / ${selectedGraphPackIds.length}개 팩 표시` : ""}
+                  {localGraph
+                    ? `${localGraph.pack.title} (세션 전용 · 서버 미등록)`
+                    : selectedProject?.name ?? graph?.pack.title ?? status}
+                  {!localGraph && graphPackOptions.length ? ` / ${selectedGraphPackIds.length}개 팩 표시` : ""}
                 </span>
+              </div>
+              <div className="graph-local-actions">
+                <button type="button" onClick={() => localPackInputRef.current?.click()}>
+                  <FileArchive size={14} /> 로컬 팩 열기
+                </button>
+                {localGraph ? (
+                  <button type="button" onClick={clearLocalPacks}>
+                    <Trash2 size={14} /> 로컬 해제 ({localPackCount})
+                  </button>
+                ) : null}
+                <input
+                  ref={localPackInputRef}
+                  type="file"
+                  accept=".zip,.json,.jsonl"
+                  multiple
+                  hidden
+                  onChange={(event) => {
+                    if (event.target.files?.length) void applyLocalPacks(event.target.files);
+                    event.target.value = "";
+                  }}
+                />
               </div>
               <div className="legend">
                 {["Module", "Assembly", "SinglePart", "Document", "Material"].map((type) => (
@@ -1407,7 +1506,8 @@ function App() {
                 ))}
               </div>
             </div>
-            {graphPackOptions.length ? (
+            {localPackStatus ? <div className="graph-local-status">{localPackStatus}</div> : null}
+            {!localGraph && graphPackOptions.length ? (
               <div className="graph-pack-filter" aria-label="프로젝트 팩 필터">
                 <div>
                   {graphPackGroups.map((group) => {
@@ -1431,7 +1531,9 @@ function App() {
                 </div>
               </div>
             ) : null}
-            {graphPackOptions.length ? (
+            {localGraph ? (
+              <GraphCanvas graph={localGraph} selectedNode={selectedNode} onSelectNode={setSelectedNode} />
+            ) : graphPackOptions.length ? (
               selectedGraphPackIds.length ? (
                 <GraphCanvas graph={graph} selectedNode={selectedNode} onSelectNode={setSelectedNode} />
               ) : (
@@ -3139,6 +3241,7 @@ function GraphProjectEmptyState({ projectName, hasPacks = false }: { projectName
         {hasPacks
           ? "처음에는 무거운 전체 그래프를 자동으로 불러오지 않습니다."
           : "Drive에 온톨로지 ZIP 팩을 올린 뒤 동기화 탭에서 등록하면 그래프 탐색기를 사용할 수 있습니다."}
+        {" "}또는 로컬 팩 ZIP을 이 패널에 바로 드래그하면 등록 없이 즉시 볼 수 있습니다.
       </em>
     </div>
   );
@@ -3222,7 +3325,7 @@ function GraphCanvas({
       enableCameraPanning: true,
       hideEdgesOnMove: true,
       hideLabelsOnMove: true,
-      labelColor: { color: "#334155" },
+      labelColor: { color: "#525252" },
       labelDensity: denseGraph ? 0.05 : 0.12,
       labelGridCellSize: 72,
       labelRenderedSizeThreshold: denseGraph ? 10 : 8,
