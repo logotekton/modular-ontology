@@ -30,6 +30,7 @@ import Sigma from "sigma";
 import { ModelExplorerView } from "./ModelExplorer";
 import { mergeLocalPacks, parseLocalPackFile } from "./localPacks";
 import type { LocalEdge, LocalNode, ParsedLocalPack } from "./localPacks";
+import { OntologyGraph } from "./OntologyGraph";
 
 const API_BASE = "";
 const OPENAI_CHAT_MODEL = "gpt-4.1-mini";
@@ -690,8 +691,9 @@ function App() {
     setGraph(null);
     setStatus("그래프 불러오는 중");
     const query = new URLSearchParams({
-      max_nodes: "4500",
-      max_edges: "10000",
+      // OntologyGraph 엔진은 차수 필터로 표시량을 관리하므로 캡을 크게 잡는다
+      max_nodes: "20000",
+      max_edges: "50000",
       pack_ids: activePackIds.join(","),
     });
     getJson<GraphPayload>(`/api/projects/${encodeURIComponent(selectedProjectId)}/graph?${query.toString()}`, authToken)
@@ -1303,7 +1305,6 @@ function App() {
             );
           })}
         </nav>
-        {activeTab === "Graph Explorer" && <div id="graph-sidebar-controls" className="sidebar-graph-controls" />}
         {currentUser.role === "admin" && (
         <div className="sidebar-status">
           <ShieldCheck size={18} />
@@ -1532,10 +1533,14 @@ function App() {
               </div>
             ) : null}
             {localGraph ? (
-              <GraphCanvas graph={localGraph} selectedNode={selectedNode} onSelectNode={setSelectedNode} />
+              <OntologyGraph nodes={localGraph.nodes} edges={localGraph.edges} onSelectNode={setSelectedNode} />
             ) : graphPackOptions.length ? (
               selectedGraphPackIds.length ? (
-                <GraphCanvas graph={graph} selectedNode={selectedNode} onSelectNode={setSelectedNode} />
+                graph ? (
+                  <OntologyGraph nodes={graph.nodes} edges={graph.edges} onSelectNode={setSelectedNode} />
+                ) : (
+                  <GraphProjectEmptyState hasPacks projectName={selectedProject?.name} />
+                )
               ) : (
                 <GraphProjectEmptyState hasPacks projectName={selectedProject?.name} />
               )
