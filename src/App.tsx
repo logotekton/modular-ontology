@@ -31,6 +31,7 @@ import { ModelExplorerView } from "./ModelExplorer";
 import { mergeLocalPacks, parseLocalPackFile } from "./localPacks";
 import type { LocalEdge, LocalNode, ParsedLocalPack } from "./localPacks";
 import { OntologyGraph } from "./OntologyGraph";
+import type { OgController, OgDetail } from "./OntologyGraph";
 
 const API_BASE = "";
 const OPENAI_CHAT_MODEL = "gpt-4.1-mini";
@@ -426,6 +427,8 @@ function App() {
   const localPackInputRef = useRef<HTMLInputElement | null>(null);
   const localDataRef = useRef<{ nodes: LocalNode[]; edges: LocalEdge[]; packCount: number } | null>(null);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
+  const [graphDetail, setGraphDetail] = useState<OgDetail<GraphNode> | null>(null);
+  const ogControllerRef = useRef<OgController | null>(null);
 
   const applyLocalPacks = async (files: FileList | File[]) => {
     const list = Array.from(files);
@@ -481,6 +484,7 @@ function App() {
     setLocalPackCount(0);
     setLocalPackStatus("");
     setSelectedNode(null);
+    setGraphDetail(null);
   };
   const [inspectorTab, setInspectorTab] = useState<"node" | "ai">("node");
   const [aiQuestion, setAiQuestion] = useState("");
@@ -1533,11 +1537,23 @@ function App() {
               </div>
             ) : null}
             {localGraph ? (
-              <OntologyGraph nodes={localGraph.nodes} edges={localGraph.edges} onSelectNode={setSelectedNode} />
+              <OntologyGraph
+                nodes={localGraph.nodes}
+                edges={localGraph.edges}
+                onSelectNode={setSelectedNode}
+                onDetail={setGraphDetail}
+                controllerRef={ogControllerRef}
+              />
             ) : graphPackOptions.length ? (
               selectedGraphPackIds.length ? (
                 graph ? (
-                  <OntologyGraph nodes={graph.nodes} edges={graph.edges} onSelectNode={setSelectedNode} />
+                  <OntologyGraph
+                    nodes={graph.nodes}
+                    edges={graph.edges}
+                    onSelectNode={setSelectedNode}
+                    onDetail={setGraphDetail}
+                    controllerRef={ogControllerRef}
+                  />
                 ) : (
                   <GraphProjectEmptyState hasPacks projectName={selectedProject?.name} />
                 )
@@ -1615,8 +1631,8 @@ function App() {
                 onQuestionChange={setAiQuestion}
                 onSubmit={askGraphAi}
               />
-            ) : selectedNode ? (
-              <NodeDetails node={selectedNode} />
+            ) : graphDetail ? (
+              <OgNodeInfo detail={graphDetail} onJump={(id) => ogControllerRef.current?.selectById(id)} />
             ) : (
               <div className="empty-state node-empty-state">
                 <strong>그래프 노드를 선택하세요</strong>
@@ -1632,6 +1648,52 @@ function App() {
     </div>
     <ConfirmDialog dialog={confirmDialog} onCancel={closeConfirmDialog} onConfirm={runConfirmedAction} />
     </>
+  );
+}
+
+/** 그래프에서 선택한 노드의 상세 — 인스펙터 [노드 정보] 탭 본문 */
+function OgNodeInfo({ detail, onJump }: { detail: OgDetail<GraphNode>; onJump: (id: string) => void }) {
+  const rows = Object.entries(detail.props).filter(
+    ([key, value]) => !["title", "name", "label", "degree"].includes(key) && value !== null && value !== "",
+  );
+  const neighborTotal = detail.groups.reduce((sum, group) => sum + group.total, 0);
+  return (
+    <div className="og-inspector-detail">
+      <div className="og-detail-name">{detail.label}</div>
+      <div className="og-detail-chips">
+        <span style={{ borderColor: detail.color, color: detail.color }}>{detail.type}</span>
+        <span>차수 {detail.degree}</span>
+      </div>
+      {rows.length ? (
+        <table>
+          <tbody>
+            {rows.slice(0, 15).map(([key, value]) => (
+              <tr key={key}>
+                <td>{key}</td>
+                <td>{typeof value === "object" ? JSON.stringify(value) : String(value)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : null}
+      <div className="og-detail-neighbors">
+        <div className="og-panel-title">이웃 {neighborTotal}</div>
+        {detail.groups.map((group) => (
+          <div key={group.rel} className="og-detail-group">
+            <div className="og-detail-rel">
+              {group.rel} ({group.total})
+            </div>
+            {group.items.map((item) => (
+              <button key={item.id} type="button" onClick={() => onJump(item.id)}>
+                <i style={{ background: item.color }} />
+                <span>{item.label}</span>
+              </button>
+            ))}
+            {group.total > group.items.length ? <div className="og-detail-more">… 외 {group.total - group.items.length}개</div> : null}
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 

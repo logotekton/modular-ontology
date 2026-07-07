@@ -41,12 +41,21 @@ type SimEdge = { a: string; b: string; rel: string };
 
 type LegendEntry = { type: string; count: number; color: string };
 
-type NeighborGroup = { rel: string; items: { id: string; label: string; color: string }[]; total: number };
+export type OgNeighborGroup = { rel: string; items: { id: string; label: string; color: string }[]; total: number };
 
-type DetailData<N> = {
-  node: SimNode<N>;
-  groups: NeighborGroup[];
+/** 선택 노드의 상세 정보 — 인스펙터([노드 정보] 탭)가 렌더링한다 */
+export type OgDetail<N> = {
+  node: N;
+  id: string;
+  label: string;
+  type: string;
+  color: string;
+  degree: number;
+  props: Record<string, unknown>;
+  groups: OgNeighborGroup[];
 };
+
+export type OgController = { selectById: (id: string | null) => void };
 
 type EngineApi = {
   setMinDeg: (value: number) => void;
@@ -87,10 +96,14 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
   nodes,
   edges,
   onSelectNode,
+  onDetail,
+  controllerRef,
 }: {
   nodes: N[];
   edges: E[];
   onSelectNode?: (node: N | null) => void;
+  onDetail?: (detail: OgDetail<N> | null) => void;
+  controllerRef?: { current: OgController | null };
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -106,7 +119,6 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
   const [focusOn, setFocusOn] = useState(false);
   const [paused, setPaused] = useState(false);
   const [stats, setStats] = useState({ shownNodes: 0, shownEdges: 0, totalNodes: 0, totalEdges: 0 });
-  const [detail, setDetail] = useState<DetailData<N> | null>(null);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -526,8 +538,8 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       cam.y = H / 2 - n.y * cam.k;
     };
 
-    const buildDetail = (node: SimNode<N>): DetailData<N> => {
-      const groups = new Map<string, NeighborGroup>();
+    const buildDetail = (node: SimNode<N>): OgDetail<N> => {
+      const groups = new Map<string, OgNeighborGroup>();
       for (const nb of adj.get(node.id) ?? []) {
         const key = `${nb.dir} ${nb.rel || "related"}`;
         let group = groups.get(key);
@@ -541,12 +553,21 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
           group.items.push({ id: m.id, label: m.label, color: m.color });
         }
       }
-      return { node, groups: [...groups.values()] };
+      return {
+        node: node.input,
+        id: node.id,
+        label: node.label,
+        type: node.type,
+        color: node.color,
+        degree: node.degree,
+        props: node.props,
+        groups: [...groups.values()],
+      };
     };
     const select = (node: SimNode<N> | null) => {
       selected = node;
       if (engFocus) rebuildVisible();
-      setDetail(node ? buildDetail(node) : null);
+      onDetail?.(node ? buildDetail(node) : null);
       onSelectNode?.(node ? node.input : null);
     };
 
@@ -678,7 +699,8 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
     setHop(1);
     setFocusOn(false);
     setPaused(false);
-    setDetail(null);
+    onDetail?.(null);
+    if (controllerRef) controllerRef.current = { selectById: (id) => engineRef.current?.selectById(id) };
 
     resize();
     cam.x = W / 2;
@@ -712,6 +734,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       canvas.removeEventListener("pointerup", onPointerUp);
       canvas.removeEventListener("wheel", onWheel);
       engineRef.current = null;
+      if (controllerRef) controllerRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodes, edges]);
@@ -847,48 +870,6 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
         <strong>{stats.shownEdges.toLocaleString()}</strong> / {stats.totalEdges.toLocaleString()}
       </div>
 
-      {detail ? (
-        <aside className="og-panel og-detail" aria-label="노드 상세">
-          <button type="button" className="og-detail-close" onClick={() => engine()?.selectById(null)}>
-            ✕
-          </button>
-          <div className="og-detail-name">{detail.node.label}</div>
-          <div className="og-detail-chips">
-            <span style={{ borderColor: detail.node.color, color: detail.node.color }}>{detail.node.type}</span>
-            <span>차수 {detail.node.degree}</span>
-          </div>
-          <table>
-            <tbody>
-              {Object.entries(detail.node.props)
-                .filter(([key, value]) => !["title", "name", "label", "degree"].includes(key) && value !== null && value !== "")
-                .slice(0, 15)
-                .map(([key, value]) => (
-                  <tr key={key}>
-                    <td>{key}</td>
-                    <td>{typeof value === "object" ? JSON.stringify(value) : String(value)}</td>
-                  </tr>
-                ))}
-            </tbody>
-          </table>
-          <div className="og-detail-neighbors">
-            <div className="og-panel-title">이웃 {detail.groups.reduce((sum, g) => sum + g.total, 0)}</div>
-            {detail.groups.map((group) => (
-              <div key={group.rel} className="og-detail-group">
-                <div className="og-detail-rel">
-                  {group.rel} ({group.total})
-                </div>
-                {group.items.map((item) => (
-                  <button key={item.id} type="button" onClick={() => engine()?.selectById(item.id)}>
-                    <i style={{ background: item.color }} />
-                    <span>{item.label}</span>
-                  </button>
-                ))}
-                {group.total > group.items.length ? <div className="og-detail-more">… 외 {group.total - group.items.length}개</div> : null}
-              </div>
-            ))}
-          </div>
-        </aside>
-      ) : null}
     </div>
   );
 }
