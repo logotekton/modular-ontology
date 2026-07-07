@@ -635,7 +635,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       ev.preventDefault();
       const p = local(ev);
       const factor = Math.pow(1.0015, -ev.deltaY);
-      const k2 = Math.min(8, Math.max(0.03, cam.k * factor));
+      const k2 = Math.min(16, Math.max(0.001, cam.k * factor));
       const w = toWorld(p.x, p.y);
       cam.x = p.x - w.x * k2;
       cam.y = p.y - w.y * k2;
@@ -723,7 +723,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
         draw();
       },
       fit: fitView,
-      stats: () => ({ visible: vNodes.length, edges: vEdges.length, alpha }),
+      stats: () => ({ visible: vNodes.length, edges: vEdges.length, alpha, k: cam.k }),
       select: (id: string | null) => {
         select(id ? byId.get(id) ?? null : null);
         draw();
