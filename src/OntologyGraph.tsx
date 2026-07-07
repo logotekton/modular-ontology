@@ -103,12 +103,15 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
   onSelectNode,
   onDetail,
   controllerRef,
+  serverStats,
 }: {
   nodes: N[];
   edges: E[];
   onSelectNode?: (node: N | null) => void;
   onDetail?: (detail: OgDetail<N> | null) => void;
   controllerRef?: { current: OgController | null };
+  /** 서버가 절단(truncation)한 경우 전체 규모 표시용 — GraphPayload.stats */
+  serverStats?: { totalNodes: number; totalEdges: number };
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -225,6 +228,8 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
 
     // 대용량 가드: 표시 노드가 한도 이하가 되도록 최소 차수 자동 상향
     while (engMinDeg < 200 && simNodes.filter((n) => n.degree >= engMinDeg).length > MAX_VISIBLE_DEFAULT) engMinDeg++;
+    // 균일 차수 그래프에서 가드가 오버슈트하면 표시 0개(빈 캔버스)가 되므로 되돌린다
+    while (engMinDeg > 0 && simNodes.filter((n) => n.degree >= engMinDeg).length === 0) engMinDeg--;
 
     const focusSet = (): Set<string> | null => {
       if (!engFocus || !selected) return null;
@@ -250,7 +255,8 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       vNodes = simNodes.filter(
         (n) =>
           (n.degree >= engMinDeg && !typeOff.has(n.type) && (!fs || fs.has(n.id))) ||
-          (aiHighlight !== null && aiHighlight.has(n.id)),
+          (aiHighlight !== null && aiHighlight.has(n.id)) ||
+          (selected !== null && n.id === selected.id), // 선택 노드는 필터에 걸려도 항상 표시
       );
       const visible = new Set(vNodes.map((n) => n.id));
       vEdges = simEdges.filter((e) => visible.has(e.a) && visible.has(e.b));
@@ -579,7 +585,10 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
     };
     const fitView = () => fitTo(vNodes);
     const applyHighlight = (ids: string[] | null) => {
-      aiHighlight = ids && ids.length ? new Set(ids) : null;
+      // 현재 그래프에 존재하는 id만 강조 — 이전 그래프의 스테일 id로
+      // 전체가 흐려지고 아무것도 강조되지 않는 상태 방지
+      const valid = ids ? ids.filter((id) => byId.has(id)) : [];
+      aiHighlight = valid.length ? new Set(valid) : null;
       rebuildVisible();
       if (aiHighlight) fitTo(vNodes.filter((n) => aiHighlight!.has(n.id)));
     };
@@ -616,8 +625,12 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       };
     };
     const select = (node: SimNode<N> | null) => {
+      const previous = selected;
       selected = node;
-      if (engFocus) rebuildVisible();
+      if (engFocus || (node && !vNodes.some((v) => v.id === node.id)) || (previous && !node)) {
+        // 필터에 숨겨진 노드 선택(이웃 점프) 시 강제 표시를 위해 재계산
+        rebuildVisible();
+      }
       onDetail?.(node ? buildDetail(node) : null);
       onSelectNode?.(node ? node.input : null);
     };
@@ -751,6 +764,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
     setFocusOn(false);
     setPaused(false);
     onDetail?.(null);
+    onSelectNode?.(null); // 그래프 교체 시 부모의 selectedNode(AI 컨텍스트)도 함께 초기화
     if (controllerRef)
       controllerRef.current = {
         selectById: (id) => engineRef.current?.selectById(id),
@@ -931,6 +945,11 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       <div className="og-panel og-stats">
         노드 <strong>{stats.shownNodes.toLocaleString()}</strong> / {stats.totalNodes.toLocaleString()} · 엣지{" "}
         <strong>{stats.shownEdges.toLocaleString()}</strong> / {stats.totalEdges.toLocaleString()}
+        {serverStats && (serverStats.totalNodes > stats.totalNodes || serverStats.totalEdges > stats.totalEdges) ? (
+          <em className="og-stats-truncated">
+            {" "}· 서버 전체 {serverStats.totalNodes.toLocaleString()} / {serverStats.totalEdges.toLocaleString()} 중 일부만 로드됨
+          </em>
+        ) : null}
       </div>
 
     </div>

@@ -164,6 +164,19 @@ type AiMessage = {
 };
 
 /** 답변·근거 텍스트에 라벨이나 id가 등장하는 노드를 찾는다 (AI 참조 하이라이트용) */
+const BOUNDARY_CLASS = "[0-9A-Za-z가-힣]";
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** label이 단어 경계로 등장하는지 — 'Wall'이 'Drywall'에 매칭되는 오탐 방지 */
+function hasBoundedMatch(text: string, label: string): boolean {
+  if (!text.includes(label)) return false; // 정규식 컴파일 전 저비용 프리필터
+  const pattern = new RegExp(`(^|(?!${BOUNDARY_CLASS}).)${escapeRegExp(label)}($|(?!${BOUNDARY_CLASS}).)`, "s");
+  return pattern.test(text);
+}
+
 function matchAnswerToNodes(text: string, nodes: GraphNode[]): string[] {
   if (!text) return [];
   const ids: string[] = [];
@@ -171,7 +184,7 @@ function matchAnswerToNodes(text: string, nodes: GraphNode[]): string[] {
     const label = String(node.label ?? "");
     const idTail = node.id.split(":").slice(-2).join(":");
     const hit =
-      (label.length >= 3 && text.includes(label)) ||
+      (label.length >= 4 && hasBoundedMatch(text, label)) ||
       text.includes(node.id) ||
       (idTail.length >= 6 && text.includes(idTail));
     if (hit) {
@@ -445,6 +458,7 @@ function App() {
   const [localPackCount, setLocalPackCount] = useState(0);
   const [localPackStatus, setLocalPackStatus] = useState("");
   const [localDragOver, setLocalDragOver] = useState(false);
+  const dragDepthRef = useRef(0);
   const localPackInputRef = useRef<HTMLInputElement | null>(null);
   const localDataRef = useRef<{ nodes: LocalNode[]; edges: LocalEdge[]; packCount: number } | null>(null);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
@@ -712,6 +726,7 @@ function App() {
     }
     let active = true;
     setSelectedNode(null);
+    setGraphDetail(null);
     setAiMessages([]);
     setAiQuestion("");
     setGraph(null);
@@ -1216,7 +1231,9 @@ function App() {
 
   async function askGraphAi() {
     const question = aiQuestion.trim();
-    const selectedNodePackId = String(selectedNode?.properties?.pack_id || selectedNode?.packId || "");
+    const rawNodePackId = String(selectedNode?.properties?.pack_id || selectedNode?.packId || "");
+    // 로컬 팩 노드의 "__local__"은 서버 미등록 — 등록된 팩으로 폴백해야 질의가 실패하지 않는다
+    const selectedNodePackId = rawNodePackId === "__local__" ? "" : rawNodePackId;
     const targetPackId = selectedNodePackId || selectedGraphPackIds[0] || selectedPackId;
     if (!question || !targetPackId || aiLoading) return;
     const userOpenAiKey = openAiApiKey.trim();
@@ -1278,7 +1295,8 @@ function App() {
         .join("\n");
       const displayNodes = (localGraph ?? graph)?.nodes ?? [];
       const refNodeIds = matchAnswerToNodes(`${content}\n${evidenceText}`, displayNodes);
-      if (refNodeIds.length) ogControllerRef.current?.setHighlight(refNodeIds);
+      // 오탐 폭주 방지: 매칭이 100개 이하일 때만 자동 적용 (버튼으로는 항상 가능)
+      if (refNodeIds.length && refNodeIds.length <= 100) ogControllerRef.current?.setHighlight(refNodeIds);
       setAiMessages((messages) => [
         ...messages,
         {
@@ -1525,13 +1543,20 @@ function App() {
         <section className="content-grid graph-explorer-grid">
           <div
             className={localDragOver ? "graph-panel local-drag" : "graph-panel"}
-            onDragOver={(event) => {
+            onDragEnter={(event) => {
               event.preventDefault();
+              dragDepthRef.current += 1;
               setLocalDragOver(true);
             }}
-            onDragLeave={() => setLocalDragOver(false)}
+            onDragOver={(event) => event.preventDefault()}
+            onDragLeave={() => {
+              // 자식 요소 진입 때마다 발화하므로 depth 카운터로 실제 이탈만 감지
+              dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+              if (dragDepthRef.current === 0) setLocalDragOver(false);
+            }}
             onDrop={(event) => {
               event.preventDefault();
+              dragDepthRef.current = 0;
               setLocalDragOver(false);
               if (event.dataTransfer.files.length) void applyLocalPacks(event.dataTransfer.files);
             }}
@@ -1618,9 +1643,14 @@ function App() {
                     onSelectNode={setSelectedNode}
                     onDetail={setGraphDetail}
                     controllerRef={ogControllerRef}
+                    serverStats={graph.stats}
                   />
                 ) : (
-                  <GraphProjectEmptyState hasPacks projectName={selectedProject?.name} />
+                  <div className="graph-project-empty-state project-empty-state graph-loading-state">
+                    <LoaderCircle className="loading-spinner" size={28} />
+                    <strong>그래프 불러오는 중…</strong>
+                    <span>대용량 팩은 수 초 걸릴 수 있습니다.</span>
+                  </div>
                 )
               ) : (
                 <GraphProjectEmptyState hasPacks projectName={selectedProject?.name} />
