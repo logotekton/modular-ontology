@@ -198,6 +198,13 @@ async function parseZipPack(file: File): Promise<ParsedLocalPack> {
   return { title, nodes, edges };
 }
 
+// 엣지로 분류: 양 끝점 키가 있고, 노드 신원(node_type)이 없는 레코드만.
+// from/to 같은 속성명을 가진 노드 레코드가 엣지로 오분류돼 사라지는 것을 막는다.
+function looksLikeEdge(obj: RawObject): boolean {
+  if (obj.node_type != null) return false;
+  return (obj.from_id ?? obj.source ?? obj.from) != null && (obj.to_id ?? obj.target ?? obj.to) != null;
+}
+
 async function parseTextPack(file: File): Promise<ParsedLocalPack> {
   const text = await file.text();
   let rawNodes: RawObject[] = [];
@@ -206,7 +213,7 @@ async function parseTextPack(file: File): Promise<ParsedLocalPack> {
     const parsed = JSON.parse(text) as RawObject | RawObject[];
     if (Array.isArray(parsed)) {
       for (const obj of parsed) {
-        if ((obj.from_id ?? obj.source ?? obj.from) != null && (obj.to_id ?? obj.target ?? obj.to) != null) rawEdges.push(obj);
+        if (looksLikeEdge(obj)) rawEdges.push(obj);
         else rawNodes.push(obj);
       }
     } else {
@@ -215,7 +222,7 @@ async function parseTextPack(file: File): Promise<ParsedLocalPack> {
     }
   } catch {
     for (const obj of parseJsonl(text)) {
-      if ((obj.from_id ?? obj.source ?? obj.from) != null && (obj.to_id ?? obj.target ?? obj.to) != null) rawEdges.push(obj);
+      if (looksLikeEdge(obj)) rawEdges.push(obj);
       else rawNodes.push(obj);
     }
   }
@@ -243,7 +250,8 @@ export function mergeLocalPacks(
   existing: { nodes: LocalNode[]; edges: LocalEdge[] } | null,
   packs: ParsedLocalPack[],
 ): LocalMergeResult {
-  const nodes: LocalNode[] = existing ? [...existing.nodes] : [];
+  // React 상태가 참조 중인 기존 노드 객체를 제자리 변경(승격/크기 재계산)하지 않도록 얕은 복사
+  const nodes: LocalNode[] = existing ? existing.nodes.map((n) => ({ ...n })) : [];
   const edges: LocalEdge[] = existing ? [...existing.edges] : [];
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const edgeKeys = new Set(edges.map((e) => `${e.source}${e.relation}${e.target}`));
