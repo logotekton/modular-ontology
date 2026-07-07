@@ -28,12 +28,16 @@ import {
 import Graph from "graphology";
 import Sigma from "sigma";
 import { ModelExplorerView } from "./ModelExplorer";
+import { mergeLocalPacks, parseLocalPackFile } from "./localPacks";
+import type { LocalEdge, LocalNode, ParsedLocalPack } from "./localPacks";
+import { OntologyGraph } from "./OntologyGraph";
+import type { OgController, OgDetail } from "./OntologyGraph";
 
 const API_BASE = "";
 const OPENAI_CHAT_MODEL = "gpt-4.1-mini";
 const NODE_COLLISION_PADDING = 1.45;
 const GRAPH_EDGE_COLOR = "rgba(84, 84, 84, 0.48)";
-const GRAPH_EDGE_SELECTED_COLOR = "rgba(13, 148, 136, 0.78)";
+const GRAPH_EDGE_SELECTED_COLOR = "rgba(0, 116, 226, 0.78)";
 const GRAPH_EDGE_DIMMED_COLOR = "rgba(84, 84, 84, 0.28)";
 const DEFAULT_GRAPH_CONTROLS = {
   nodeSize: 0.5,
@@ -155,7 +159,28 @@ type AiMessage = {
   role: "user" | "assistant";
   content: string;
   evidence?: QueryEvidence[];
+  /** 답변/근거 텍스트에서 매칭된 그래프 노드 id — 하이라이트용 */
+  refNodeIds?: string[];
 };
+
+/** 답변·근거 텍스트에 라벨이나 id가 등장하는 노드를 찾는다 (AI 참조 하이라이트용) */
+function matchAnswerToNodes(text: string, nodes: GraphNode[]): string[] {
+  if (!text) return [];
+  const ids: string[] = [];
+  for (const node of nodes) {
+    const label = String(node.label ?? "");
+    const idTail = node.id.split(":").slice(-2).join(":");
+    const hit =
+      (label.length >= 3 && text.includes(label)) ||
+      text.includes(node.id) ||
+      (idTail.length >= 6 && text.includes(idTail));
+    if (hit) {
+      ids.push(node.id);
+      if (ids.length >= 300) break;
+    }
+  }
+  return ids;
+}
 
 type McpStatus = {
   status: string;
@@ -416,7 +441,72 @@ function App() {
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [selectedGraphPackIds, setSelectedGraphPackIds] = useState<string[]>([]);
   const [graph, setGraph] = useState<GraphPayload | null>(null);
+  const [localGraph, setLocalGraph] = useState<GraphPayload | null>(null);
+  const [localPackCount, setLocalPackCount] = useState(0);
+  const [localPackStatus, setLocalPackStatus] = useState("");
+  const [localDragOver, setLocalDragOver] = useState(false);
+  const localPackInputRef = useRef<HTMLInputElement | null>(null);
+  const localDataRef = useRef<{ nodes: LocalNode[]; edges: LocalEdge[]; packCount: number } | null>(null);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
+  const [graphDetail, setGraphDetail] = useState<OgDetail<GraphNode> | null>(null);
+  const ogControllerRef = useRef<OgController | null>(null);
+
+  const applyLocalPacks = async (files: FileList | File[]) => {
+    const list = Array.from(files);
+    if (!list.length) return;
+    setLocalPackStatus("로컬 팩 읽는 중…");
+    const parsed: ParsedLocalPack[] = [];
+    const failures: string[] = [];
+    for (const file of list) {
+      try {
+        parsed.push(await parseLocalPackFile(file));
+      } catch (error) {
+        failures.push(`${file.name}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (!parsed.length) {
+      setLocalPackStatus(failures.join(" / ") || "읽을 수 있는 파일이 없습니다");
+      return;
+    }
+    const previous = localDataRef.current;
+    const merged = mergeLocalPacks(previous ? { nodes: previous.nodes, edges: previous.edges } : null, parsed);
+    const packCount = (previous?.packCount ?? 0) + parsed.length;
+    localDataRef.current = { nodes: merged.nodes, edges: merged.edges, packCount };
+    setLocalPackCount(packCount);
+    setLocalGraph({
+      pack: {
+        id: "__local__",
+        title: packCount === 1 ? parsed[0].title : `로컬 팩 ${packCount}개 병합`,
+        filename: "local",
+        source: "local",
+        validationStatus: "local",
+        counts: {},
+      },
+      nodes: merged.nodes,
+      edges: merged.edges,
+      stats: {
+        visibleNodes: merged.nodes.length,
+        visibleEdges: merged.edges.length,
+        totalNodes: merged.nodes.length,
+        totalEdges: merged.edges.length,
+      },
+    });
+    setSelectedNode(null);
+    const parts = [`+노드 ${merged.addedNodes.toLocaleString()}`, `+엣지 ${merged.addedEdges.toLocaleString()}`];
+    if (merged.placeholders) parts.push(`미해결참조 ${merged.placeholders.toLocaleString()}`);
+    if (merged.resolvedRefs) parts.push(`참조해결 ${merged.resolvedRefs.toLocaleString()}`);
+    if (failures.length) parts.push(`실패 ${failures.length}건`);
+    setLocalPackStatus(parts.join(" · "));
+  };
+
+  const clearLocalPacks = () => {
+    localDataRef.current = null;
+    setLocalGraph(null);
+    setLocalPackCount(0);
+    setLocalPackStatus("");
+    setSelectedNode(null);
+    setGraphDetail(null);
+  };
   const [inspectorTab, setInspectorTab] = useState<"node" | "ai">("node");
   const [aiQuestion, setAiQuestion] = useState("");
   const [aiMessages, setAiMessages] = useState<AiMessage[]>([]);
@@ -626,8 +716,9 @@ function App() {
     setGraph(null);
     setStatus("그래프 불러오는 중");
     const query = new URLSearchParams({
-      max_nodes: "4500",
-      max_edges: "10000",
+      // OntologyGraph 엔진은 차수 필터로 표시량을 관리하므로 캡을 크게 잡는다
+      max_nodes: "20000",
+      max_edges: "50000",
       pack_ids: activePackIds.join(","),
     });
     getJson<GraphPayload>(`/api/projects/${encodeURIComponent(selectedProjectId)}/graph?${query.toString()}`, authToken)
@@ -1150,6 +1241,13 @@ function App() {
       const content = payload.llmError
         ? `${formatAiQueryWarning(payload.llmError)}\n\nFallback Graph RAG answer:\n${fallbackAnswer}`
         : fallbackAnswer;
+      // 답변+근거 텍스트를 현재 표시 그래프의 노드와 매칭 → 참조 노드 하이라이트
+      const evidenceText = (payload.evidence ?? [])
+        .map((item) => `${item.title ?? ""}\n${item.path ?? ""}\n${item.snippet ?? ""}`)
+        .join("\n");
+      const displayNodes = (localGraph ?? graph)?.nodes ?? [];
+      const refNodeIds = matchAnswerToNodes(`${content}\n${evidenceText}`, displayNodes);
+      if (refNodeIds.length) ogControllerRef.current?.setHighlight(refNodeIds);
       setAiMessages((messages) => [
         ...messages,
         {
@@ -1157,6 +1255,7 @@ function App() {
           role: "assistant",
           content,
           evidence: payload.evidence ?? [],
+          refNodeIds,
         },
       ]);
     } catch (error) {
@@ -1389,14 +1488,49 @@ function App() {
         {activeTab === "Graph Explorer" && (
         <>
         <section className="content-grid graph-explorer-grid">
-          <div className="graph-panel">
+          <div
+            className={localDragOver ? "graph-panel local-drag" : "graph-panel"}
+            onDragOver={(event) => {
+              event.preventDefault();
+              setLocalDragOver(true);
+            }}
+            onDragLeave={() => setLocalDragOver(false)}
+            onDrop={(event) => {
+              event.preventDefault();
+              setLocalDragOver(false);
+              if (event.dataTransfer.files.length) void applyLocalPacks(event.dataTransfer.files);
+            }}
+          >
             <div className="panel-header">
               <div>
                 <h2>그래프 탐색기</h2>
                 <span>
-                  {selectedProject?.name ?? graph?.pack.title ?? status}
-                  {graphPackOptions.length ? ` / ${selectedGraphPackIds.length}개 팩 표시` : ""}
+                  {localGraph
+                    ? `${localGraph.pack.title} (세션 전용 · 서버 미등록)`
+                    : selectedProject?.name ?? graph?.pack.title ?? status}
+                  {!localGraph && graphPackOptions.length ? ` / ${selectedGraphPackIds.length}개 팩 표시` : ""}
                 </span>
+              </div>
+              <div className="graph-local-actions">
+                <button type="button" onClick={() => localPackInputRef.current?.click()}>
+                  <FileArchive size={14} /> 로컬 팩 열기
+                </button>
+                {localGraph ? (
+                  <button type="button" onClick={clearLocalPacks}>
+                    <Trash2 size={14} /> 로컬 해제 ({localPackCount})
+                  </button>
+                ) : null}
+                <input
+                  ref={localPackInputRef}
+                  type="file"
+                  accept=".zip,.json,.jsonl"
+                  multiple
+                  hidden
+                  onChange={(event) => {
+                    if (event.target.files?.length) void applyLocalPacks(event.target.files);
+                    event.target.value = "";
+                  }}
+                />
               </div>
               <div className="legend">
                 {["Module", "Assembly", "SinglePart", "Document", "Material"].map((type) => (
@@ -1407,7 +1541,8 @@ function App() {
                 ))}
               </div>
             </div>
-            {graphPackOptions.length ? (
+            {localPackStatus ? <div className="graph-local-status">{localPackStatus}</div> : null}
+            {!localGraph && graphPackOptions.length ? (
               <div className="graph-pack-filter" aria-label="프로젝트 팩 필터">
                 <div>
                   {graphPackGroups.map((group) => {
@@ -1431,9 +1566,27 @@ function App() {
                 </div>
               </div>
             ) : null}
-            {graphPackOptions.length ? (
+            {localGraph ? (
+              <OntologyGraph
+                nodes={localGraph.nodes}
+                edges={localGraph.edges}
+                onSelectNode={setSelectedNode}
+                onDetail={setGraphDetail}
+                controllerRef={ogControllerRef}
+              />
+            ) : graphPackOptions.length ? (
               selectedGraphPackIds.length ? (
-                <GraphCanvas graph={graph} selectedNode={selectedNode} onSelectNode={setSelectedNode} />
+                graph ? (
+                  <OntologyGraph
+                    nodes={graph.nodes}
+                    edges={graph.edges}
+                    onSelectNode={setSelectedNode}
+                    onDetail={setGraphDetail}
+                    controllerRef={ogControllerRef}
+                  />
+                ) : (
+                  <GraphProjectEmptyState hasPacks projectName={selectedProject?.name} />
+                )
               ) : (
                 <GraphProjectEmptyState hasPacks projectName={selectedProject?.name} />
               )
@@ -1507,9 +1660,10 @@ function App() {
                 question={aiQuestion}
                 onQuestionChange={setAiQuestion}
                 onSubmit={askGraphAi}
+                onHighlight={(ids) => ogControllerRef.current?.setHighlight(ids)}
               />
-            ) : selectedNode ? (
-              <NodeDetails node={selectedNode} />
+            ) : graphDetail ? (
+              <OgNodeInfo detail={graphDetail} onJump={(id) => ogControllerRef.current?.selectById(id)} />
             ) : (
               <div className="empty-state node-empty-state">
                 <strong>그래프 노드를 선택하세요</strong>
@@ -1525,6 +1679,52 @@ function App() {
     </div>
     <ConfirmDialog dialog={confirmDialog} onCancel={closeConfirmDialog} onConfirm={runConfirmedAction} />
     </>
+  );
+}
+
+/** 그래프에서 선택한 노드의 상세 — 인스펙터 [노드 정보] 탭 본문 */
+function OgNodeInfo({ detail, onJump }: { detail: OgDetail<GraphNode>; onJump: (id: string) => void }) {
+  const rows = Object.entries(detail.props).filter(
+    ([key, value]) => !["title", "name", "label", "degree"].includes(key) && value !== null && value !== "",
+  );
+  const neighborTotal = detail.groups.reduce((sum, group) => sum + group.total, 0);
+  return (
+    <div className="og-inspector-detail">
+      <div className="og-detail-name">{detail.label}</div>
+      <div className="og-detail-chips">
+        <span style={{ borderColor: detail.color, color: detail.color }}>{detail.type}</span>
+        <span>차수 {detail.degree}</span>
+      </div>
+      {rows.length ? (
+        <table>
+          <tbody>
+            {rows.slice(0, 15).map(([key, value]) => (
+              <tr key={key}>
+                <td>{key}</td>
+                <td>{typeof value === "object" ? JSON.stringify(value) : String(value)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : null}
+      <div className="og-detail-neighbors">
+        <div className="og-panel-title">이웃 {neighborTotal}</div>
+        {detail.groups.map((group) => (
+          <div key={group.rel} className="og-detail-group">
+            <div className="og-detail-rel">
+              {group.rel} ({group.total})
+            </div>
+            {group.items.map((item) => (
+              <button key={item.id} type="button" onClick={() => onJump(item.id)}>
+                <i style={{ background: item.color }} />
+                <span>{item.label}</span>
+              </button>
+            ))}
+            {group.total > group.items.length ? <div className="og-detail-more">… 외 {group.total - group.items.length}개</div> : null}
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -2920,6 +3120,7 @@ function AiQueryPanel({
   question,
   onQuestionChange,
   onSubmit,
+  onHighlight,
 }: {
   openAiKeyStatus: AiKeyStatus;
   loading: boolean;
@@ -2927,6 +3128,7 @@ function AiQueryPanel({
   question: string;
   onQuestionChange: (value: string) => void;
   onSubmit: () => void;
+  onHighlight?: (ids: string[] | null) => void;
 }) {
   return (
     <div className="ai-query-panel">
@@ -2943,6 +3145,16 @@ function AiQueryPanel({
                       {item.title || item.path || `근거 ${index + 1}`}
                     </span>
                   ))}
+                </div>
+              ) : null}
+              {message.refNodeIds?.length && onHighlight ? (
+                <div className="ai-highlight-actions">
+                  <button type="button" onClick={() => onHighlight(message.refNodeIds ?? null)}>
+                    🔦 그래프에서 보기 ({message.refNodeIds.length})
+                  </button>
+                  <button type="button" onClick={() => onHighlight(null)}>
+                    해제
+                  </button>
                 </div>
               ) : null}
             </article>
@@ -3139,6 +3351,7 @@ function GraphProjectEmptyState({ projectName, hasPacks = false }: { projectName
         {hasPacks
           ? "처음에는 무거운 전체 그래프를 자동으로 불러오지 않습니다."
           : "Drive에 온톨로지 ZIP 팩을 올린 뒤 동기화 탭에서 등록하면 그래프 탐색기를 사용할 수 있습니다."}
+        {" "}또는 로컬 팩 ZIP을 이 패널에 바로 드래그하면 등록 없이 즉시 볼 수 있습니다.
       </em>
     </div>
   );
@@ -3222,7 +3435,7 @@ function GraphCanvas({
       enableCameraPanning: true,
       hideEdgesOnMove: true,
       hideLabelsOnMove: true,
-      labelColor: { color: "#334155" },
+      labelColor: { color: "#525252" },
       labelDensity: denseGraph ? 0.05 : 0.12,
       labelGridCellSize: 72,
       labelRenderedSizeThreshold: denseGraph ? 10 : 8,

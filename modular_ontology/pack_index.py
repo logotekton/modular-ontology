@@ -15,18 +15,19 @@ from .config import DB_PATH, LEGACY_STRUCTURED_PACKS_DIR, PACKS_DIR, ROOT, USE_S
 UPLOAD_DIR = PACKS_DIR
 
 
+# Astryx theme-neutral palette (light) — @astryxdesign/theme-neutral 0.1.3
 TYPE_COLORS = {
-    "Document": "#2563eb",
-    "Chunk": "#94a3b8",
-    "Module": "#0f766e",
-    "ModuleType": "#14b8a6",
-    "Assembly": "#f59e0b",
-    "SinglePart": "#ef4444",
-    "Material": "#64748b",
-    "Section": "#8b5cf6",
-    "Category": "#22c55e",
-    "Element": "#0891b2",
-    "Evidence": "#84cc16",
+    "Document": "#6d9cfe",
+    "Chunk": "#a3a3a3",
+    "Module": "#63ab9d",
+    "ModuleType": "#67a7b8",
+    "Assembly": "#c0990e",
+    "SinglePart": "#ff6f6c",
+    "Material": "#737373",
+    "Section": "#dd74f0",
+    "Category": "#69ad67",
+    "Element": "#0074e2",
+    "Evidence": "#84c980",
 }
 
 
@@ -175,7 +176,7 @@ def _node(node_id: str, obj: dict[str, Any], pack_id: str) -> dict[str, Any]:
         "type": kind,
         "packId": pack_id,
         "size": size,
-        "color": TYPE_COLORS.get(kind, "#64748b"),
+        "color": TYPE_COLORS.get(kind, "#737373"),
         "properties": obj.get("properties", obj),
     }
 
@@ -1001,7 +1002,7 @@ def _build_graph_from_db(pack_id: str, max_nodes: int = 900, max_edges: int = 16
                 "type": node_type,
                 "packId": summary["id"],
                 "size": _node_size_for_type(node_type),
-                "color": TYPE_COLORS.get(node_type, "#64748b"),
+                "color": TYPE_COLORS.get(node_type, "#737373"),
                 "properties": properties,
             }
         )
