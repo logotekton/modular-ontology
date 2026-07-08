@@ -4418,16 +4418,16 @@ dd {
 }
 
 /* ChatMessageBubble의 name 슬롯(astryx-internal nameRow)은 height:20px 고정 —
-   짧은 텍스트 라벨 전제. Avatar size="tiny"(20px 콘텐츠, ~25px 렌더 높이)로
-   맞춰서 위아래로 삐져나오지 않게 하고, 답변 본문은 별도 wrapper에 margin-top을
-   둬서 이전 메시지·아바타와의 간격을 nameRow의 margin-bottom과 독립적으로 조절한다. */
+   짧은 텍스트 라벨 전제. 40px 아바타를 거기 넣으면 중앙 정렬로 위아래 각 10px씩
+   삐져나온다. 이전 메시지·답변 본문 양쪽에 그 삐져나온 만큼 이상의 여백을 둬서
+   메시지 크기와 무관하게 겹치지 않게 한다(라이브 측정: 위 10px, 아래 8px). */
 .ai-chat-astryx .ai-chat-avatar-name {
   display: inline-block;
-  margin-bottom: 4px;
+  margin-top: 16px;
 }
 
 .ai-chat-astryx .ai-chat-answer-body {
-  margin-top: 8px;
+  margin-top: 28px;
 }
 
 /* 전체 Drive 동기화 보조 버튼 (Astryx neutral) */
