@@ -70,7 +70,14 @@ export function AiChatPanel({
                 // 답변 앞에 큰 여백이 생긴다. 대신 ChatMessageBubble의 name 슬롯(버블 위 렌더)에
                 // 아바타를 놓아 "A / 그 아래 답변" 형태로 쌓는다 — 전체 폭을 답변에 쓴다.
                 <ChatMessage key={message.id} sender="assistant">
-                  <ChatMessageBubble variant="ghost" name={<Avatar name="AI" size="small" />}>
+                  <ChatMessageBubble
+                    variant="ghost"
+                    name={
+                      <span className="ai-chat-avatar-name">
+                        <Avatar name="AI" size="small" />
+                      </span>
+                    }
+                  >
                     <Markdown density="compact">{message.content}</Markdown>
                   </ChatMessageBubble>
                   {message.evidence?.length ? (
@@ -98,7 +105,14 @@ export function AiChatPanel({
             )}
             {loading ? (
               <ChatMessage sender="assistant">
-                <ChatMessageBubble variant="ghost" name={<Avatar name="AI" size="small" />}>
+                <ChatMessageBubble
+                  variant="ghost"
+                  name={
+                    <span className="ai-chat-avatar-name">
+                      <Avatar name="AI" size="small" />
+                    </span>
+                  }
+                >
                   답변을 생성중입니다…
                 </ChatMessageBubble>
               </ChatMessage>
