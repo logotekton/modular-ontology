@@ -74,11 +74,13 @@ export function AiChatPanel({
                     variant="ghost"
                     name={
                       <span className="ai-chat-avatar-name">
-                        <Avatar name="AI" size="small" />
+                        <Avatar name="AI" size="tiny" />
                       </span>
                     }
                   >
-                    <Markdown density="compact">{message.content}</Markdown>
+                    <div className="ai-chat-answer-body">
+                      <Markdown density="compact">{message.content}</Markdown>
+                    </div>
                   </ChatMessageBubble>
                   {message.evidence?.length ? (
                     <VStack gap={1} className="ai-chat-evidence">
@@ -109,11 +111,11 @@ export function AiChatPanel({
                   variant="ghost"
                   name={
                     <span className="ai-chat-avatar-name">
-                      <Avatar name="AI" size="small" />
+                      <Avatar name="AI" size="tiny" />
                     </span>
                   }
                 >
-                  답변을 생성중입니다…
+                  <div className="ai-chat-answer-body">답변을 생성중입니다…</div>
                 </ChatMessageBubble>
               </ChatMessage>
             ) : null}
