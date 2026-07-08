@@ -4417,6 +4417,14 @@ dd {
   margin: 8px 0 0 4px;
 }
 
+/* ChatMessageBubble의 name 슬롯은 아래 콘텐츠와 음수 마진으로 붙어있는 걸 전제로
+   설계돼 있어(이름 텍스트용), 아바타 이미지를 넣으면 답변 텍스트와 겹친다.
+   실측: 겹침 10px → 아래 여백으로 상쇄 + 원하는 간격만큼 추가. */
+.ai-chat-astryx .ai-chat-avatar-name {
+  display: inline-block;
+  margin-bottom: 36px;
+}
+
 /* 전체 Drive 동기화 보조 버튼 (Astryx neutral) */
 .sync-all-button {
   width: 100%;
