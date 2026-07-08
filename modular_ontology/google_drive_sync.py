@@ -14,6 +14,10 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
+import io
+from concurrent.futures import ThreadPoolExecutor
+
+import requests
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -57,24 +61,66 @@ _RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
 _RETRY_ATTEMPTS = 4
 
 
-def _urlopen_with_retry(request: urllib.request.Request, *, timeout: float):
-    """일시적 HTTP/네트워크 오류에 지수 백오프로 재시도하는 urlopen.
+# 커넥션 풀 공유 세션 — 호출마다 새 TCP+TLS 핸드셰이크를 하던 urllib 직접 호출 대체.
+# 스레드 안전(내부 urllib3 풀)이므로 프로젝트 병렬 동기화에서도 공유한다.
+_HTTP_SESSION = requests.Session()
+_HTTP_SESSION.mount("https://", requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=16))
 
-    308(Resume Incomplete)처럼 호출부가 기대하는 상태 코드는 재시도 대상이
-    아니므로 그대로 전파된다. 대량 순차 호출(list/download 버스트)이 한 번의
-    429/503으로 통째로 실패하던 것을 막는다.
+
+class _HttpResponse:
+    """호출부가 기대하는 urllib 응답 인터페이스(read/headers/컨텍스트)를 requests 위에 제공."""
+
+    def __init__(self, response: requests.Response) -> None:
+        self._response = response
+        self.headers = response.headers
+
+    def read(self, size: int | None = None) -> bytes:
+        if size is None:
+            return self._response.content
+        return self._response.raw.read(size, decode_content=True)
+
+    def __enter__(self) -> "_HttpResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        self._response.close()
+        return False
+
+
+def _urlopen_with_retry(request: urllib.request.Request, *, timeout: float) -> _HttpResponse:
+    """일시적 HTTP/네트워크 오류에 지수 백오프로 재시도하는 실행기.
+
+    urllib.request.Request를 받아 공유 requests 세션으로 실행한다(커넥션 재사용).
+    308(Resume Incomplete)은 호출부의 재개 로직이 기대하므로 재시도 없이
+    urllib.error.HTTPError로 즉시 전파한다. 429/5xx는 백오프 재시도.
     """
     delay = 1.0
     last_error: Exception | None = None
+    method = request.get_method()
+    headers = dict(request.header_items())
     for attempt in range(_RETRY_ATTEMPTS):
         try:
-            return urllib.request.urlopen(request, timeout=timeout)
-        except urllib.error.HTTPError as exc:
-            if exc.code not in _RETRYABLE_HTTP_CODES:
-                raise
+            response = _HTTP_SESSION.request(
+                method,
+                request.full_url,
+                headers=headers,
+                data=request.data,
+                timeout=timeout,
+                stream=True,
+            )
+        except requests.RequestException as exc:
             last_error = exc
-        except urllib.error.URLError as exc:
-            last_error = exc
+        else:
+            status = response.status_code
+            if status < 300:
+                return _HttpResponse(response)
+            error = urllib.error.HTTPError(
+                request.full_url, status, response.reason or "", response.headers, io.BytesIO(response.content)
+            )
+            response.close()
+            if status not in _RETRYABLE_HTTP_CODES:
+                raise error
+            last_error = error
         if attempt < _RETRY_ATTEMPTS - 1:
             time.sleep(delay)
             delay = min(delay * 2.0, 8.0)
@@ -96,9 +142,16 @@ class DriveItem:
 
 
 class GoogleDriveClient:
-    def __init__(self, api_key: str | None = None, access_token: str | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        access_token: str | None = None,
+        token_provider=None,
+    ) -> None:
         self.api_key = api_key
         self._access_token = access_token
+        # 요청 시점마다 유효 토큰을 반환 — 1시간 이상 걸리는 동기화 중 만료 대응
+        self._token_provider = token_provider
 
     @classmethod
     def from_env(cls) -> "GoogleDriveClient":
@@ -111,7 +164,7 @@ class GoogleDriveClient:
 
         service_account = _load_service_account_info()
         if service_account:
-            return cls(access_token=_service_account_access_token(service_account))
+            return cls(token_provider=_service_account_token_provider(service_account))
 
         api_key = env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_API_KEY") or os.environ.get("GOOGLE_DRIVE_API_KEY")
         if api_key:
@@ -329,6 +382,8 @@ class GoogleDriveClient:
         return f"{DRIVE_UPLOAD_API}/{path}?{urllib.parse.urlencode(params)}"
 
     def _headers(self) -> dict[str, str]:
+        if self._token_provider is not None:
+            return {"Authorization": f"Bearer {self._token_provider()}"}
         if self._access_token:
             return {"Authorization": f"Bearer {self._access_token}"}
         return {}
@@ -1272,13 +1327,13 @@ def _download_project_assets(
     project_pack_links: dict[str, list[str]] = {}
     project_folders: list[dict[str, str]] = []
     common_folder_found = False
+    normal_projects: list[tuple[DriveItem, str]] = []
     for project in client.list_children(projects_folder_id):
         if not project.is_folder:
             continue
         project_id = _safe_drive_filename_or_none(project.name, warnings, f"{PROJECTS_FOLDER} project folder")
         if not project_id:
             continue
-        project_children = _children_by_name(client, project.id)
         if project_id == COMMON_PROJECT_ID:
             common_folder_found = True
             if not include_common_packs:
@@ -1286,7 +1341,7 @@ def _download_project_assets(
             common_downloads, common_active_paths = _download_common_zip_files(
                 client,
                 project.id,
-                project_children,
+                _children_by_name(client, project.id),
                 data_dir / ONTOLOGY_PACKS_FOLDER / "indexed",
                 warnings=warnings,
                 data_dir=data_dir,
@@ -1296,27 +1351,46 @@ def _download_project_assets(
             downloaded.extend(common_downloads)
             project_pack_links[COMMON_PROJECT_PACK_LINKS_KEY] = [_pack_id_from_zip(Path(path)) for path in common_active_paths]
             continue
-        project_folders.append(
-            {
-                "folderId": project.id,
-                "projectId": project_id,
-                "name": project.name,
-                "modifiedTime": project.modified_time,
-            }
-        )
-        project_downloads, pack_ids, packs_folder_found = _download_single_project_assets(
+        normal_projects.append((project, project_id))
+
+    def _process_project(entry: tuple[DriveItem, str]):
+        project, project_id = entry
+        local_warnings: list[str] = []
+        local_skipped: list[str] = []
+        children = _children_by_name(client, project.id)
+        result = _download_single_project_assets(
             client,
             project,
             project_id,
             data_dir,
-            project_children=project_children,
-            warnings=warnings,
+            project_children=children,
+            warnings=local_warnings,
             file_cache=file_cache,
-            skipped=skipped,
+            skipped=local_skipped,
         )
-        downloaded.extend(project_downloads)
-        if packs_folder_found:
-            project_pack_links[project_id] = pack_ids
+        return project, project_id, result, local_warnings, local_skipped
+
+    # 프로젝트별 Drive 트리 워크는 I/O 바운드 — 병렬화로 순차 왕복 지연을 겹친다.
+    # (파일 캐시 dict 갱신은 GIL 하 원자적 연산이고, 대상 경로는 프로젝트별로 분리됨)
+    if normal_projects:
+        with ThreadPoolExecutor(max_workers=min(6, len(normal_projects))) as pool:
+            for project, project_id, result, local_warnings, local_skipped in pool.map(_process_project, normal_projects):
+                project_downloads, pack_ids, packs_folder_found = result
+                if warnings is not None:
+                    warnings.extend(local_warnings)
+                if skipped is not None:
+                    skipped.extend(local_skipped)
+                project_folders.append(
+                    {
+                        "folderId": project.id,
+                        "projectId": project_id,
+                        "name": project.name,
+                        "modifiedTime": project.modified_time,
+                    }
+                )
+                downloaded.extend(project_downloads)
+                if packs_folder_found:
+                    project_pack_links[project_id] = pack_ids
     _write_project_folders(data_dir, project_folders)
     active_project_ids = {item["projectId"] for item in project_folders}
     if common_folder_found:
@@ -1425,7 +1499,8 @@ def _download_common_zip_files(
         downloaded.extend(pack_downloads)
         active_paths.extend(pack_active_paths)
 
-    for category in client.list_children(common_folder_id):
+    # common_children에 이미 폴더 목록이 있으므로 재조회하지 않는다
+    for category in common_children.values():
         if not category.is_folder or category.name == PROJECT_PACKS_FOLDER:
             continue
         category_id = _safe_drive_filename_or_none(category.name, warnings, f"{PROJECTS_FOLDER}/{COMMON_PROJECT_ID} category folder")
@@ -1899,6 +1974,32 @@ def _gcloud_access_token() -> str:
     if not token:
         raise RuntimeError("gcloud did not return an access token.")
     return token
+
+
+def _service_account_token_provider(service_account: dict[str, Any]):
+    """만료 시 자동 재발급하는 토큰 provider (요청마다 호출, 갱신은 락으로 직렬화)."""
+    try:
+        from google.auth.transport.requests import Request
+        from google.oauth2 import service_account as google_service_account
+    except ImportError as exc:
+        raise RuntimeError("Install google-auth and requests to use Google Drive service account sync.") from exc
+
+    credentials = google_service_account.Credentials.from_service_account_info(
+        service_account,
+        scopes=["https://www.googleapis.com/auth/drive"],
+    )
+    refresh_lock = threading.Lock()
+
+    def provider() -> str:
+        if not credentials.valid:
+            with refresh_lock:
+                if not credentials.valid:
+                    credentials.refresh(Request())
+        if not credentials.token:
+            raise RuntimeError("Google Drive service account did not return an access token.")
+        return str(credentials.token)
+
+    return provider
 
 
 def _service_account_access_token(service_account: dict[str, Any]) -> str:
