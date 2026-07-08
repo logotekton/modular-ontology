@@ -628,7 +628,8 @@ def test_resumable_upload_retries_same_chunk_when_drive_omits_range(monkeypatch,
             return FakeResponse(json.dumps({"id": "drive-file", "name": "large.ifc"}).encode("utf-8"))
         raise AssertionError(f"Unexpected request: {request.get_method()} {request.full_url}")
 
-    monkeypatch.setattr(drive_module.urllib.request, "urlopen", fake_urlopen)
+    # 전송 계층이 공유 requests 세션으로 이동 — 재시도 실행기 지점에서 후킹
+    monkeypatch.setattr(drive_module, "_urlopen_with_retry", fake_urlopen)
     result = GoogleDriveClient(access_token="token").create_file("folder", source, "large.ifc", "application/octet-stream")
 
     expected_range = f"bytes 0-{source.stat().st_size - 1}/{source.stat().st_size}"
