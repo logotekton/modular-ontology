@@ -74,7 +74,7 @@ export function AiChatPanel({
                     variant="ghost"
                     name={
                       <span className="ai-chat-avatar-name">
-                        <Avatar name="AI" size="tiny" />
+                        <Avatar name="AI" size={40} />
                       </span>
                     }
                   >
@@ -111,7 +111,7 @@ export function AiChatPanel({
                   variant="ghost"
                   name={
                     <span className="ai-chat-avatar-name">
-                      <Avatar name="AI" size="tiny" />
+                      <Avatar name="AI" size={40} />
                     </span>
                   }
                 >
