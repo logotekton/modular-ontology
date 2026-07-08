@@ -4360,10 +4360,53 @@ dd {
   display: flex;
   flex-direction: column;
   flex: 1;
-  height: 100%;
-  min-height: 420px;
+  min-height: 0; /* 인스펙터 그리드 높이 안에서 축소 허용 */
   overflow: hidden;
-  padding: 12px 14px 14px;
+}
+
+/* 메시지 스크롤 영역 — 내용이 넘칠 때만 스크롤바가 생긴다 (빈 상태엔 없음).
+   flex 컬럼이라 빈 상태가 배너 아래 남은 공간을 채워 스크롤이 생기지 않는다. */
+.ai-chat-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 2px;
+}
+
+/* 출력 영역 상단 경고 배너 (key 미검증 시) */
+.ai-chat-keywarn {
+  flex-shrink: 0;
+  padding: 4px 2px 8px;
+}
+
+.ai-chat-messages {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 4px 2px 8px;
+}
+
+/* 빈 상태 — 남은 공간을 채워 스크롤이 생기지 않는다 */
+.ai-chat-empty {
+  flex: 1;
+  min-height: 160px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 6px;
+  padding: 20px 18px;
+}
+
+/* 컴포저 하단 도크 — 프로스티드 오버레이 대신 얇은 구분선 */
+.ai-chat-dock {
+  flex-shrink: 0;
+  padding-top: 10px;
+  margin-top: 6px;
+  border-top: 1px solid #ebebeb;
 }
 
 .ai-chat-astryx .ai-chat-evidence {
