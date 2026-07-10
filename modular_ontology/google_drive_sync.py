@@ -474,7 +474,9 @@ def sync_google_drive_storage(
             warnings=warnings,
             file_cache=file_cache,
             skipped=skipped,
-            include_common_packs=include_shared_packs,
+            # _Common은 프로젝트 모델의 일부(모든 프로젝트에 공통 팩 배포)라 항상 동기화.
+            # include_shared_packs는 레거시 전역 팩 폴더(02/04_Ontology_Packs)에만 적용.
+            include_common_packs=True,
         )
         downloaded.extend(project_downloads)
         _write_project_pack_links(data_dir, project_pack_links)

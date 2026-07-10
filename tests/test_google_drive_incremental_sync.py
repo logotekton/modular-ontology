@@ -76,7 +76,7 @@ def test_google_drive_sync_downloads_changed_project_pack_zip(tmp_path) -> None:
     assert json.loads(links_path.read_text(encoding="utf-8")) == {"changed-project": ["changed-pack-v2"]}
 
 
-def test_google_drive_sync_can_skip_shared_packs_for_admin_button(tmp_path) -> None:
+def test_google_drive_sync_skips_global_packs_but_always_syncs_common(tmp_path) -> None:
     payloads = {
         "project-pack": _pack_bytes("project-pack"),
         "common-pack": _pack_bytes("common-pack"),
@@ -130,8 +130,12 @@ def test_google_drive_sync_can_skip_shared_packs_for_admin_button(tmp_path) -> N
     links_path = tmp_path / "02_Projects" / ".drive-project-pack-links.json"
 
     assert result["sharedPacksIncluded"] is False
-    assert fake_drive.download_calls == ["project-pack"]
-    assert json.loads(links_path.read_text(encoding="utf-8")) == {"project-a": ["project-pack"]}
+    # 전역(레거시) 팩 폴더만 스킵 — _Common은 모든 프로젝트 공통 팩이라 항상 동기화
+    assert sorted(fake_drive.download_calls) == ["common-pack", "project-pack"]
+    assert json.loads(links_path.read_text(encoding="utf-8")) == {
+        "__common__": ["common-pack"],
+        "project-a": ["project-pack"],
+    }
 
 
 def test_google_drive_project_sync_merges_pack_links_without_touching_other_projects(tmp_path) -> None:
