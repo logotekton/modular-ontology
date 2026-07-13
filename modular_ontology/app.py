@@ -40,6 +40,7 @@ from .auth import (
     set_user_role,
 )
 from .config import EPHEMERAL_STORAGE, DATA_DIR, IFC_MODELS_FOLDER, MCP_REMOTE_FILE, MCP_TOKENS_FILE, PROJECTS_FOLDER, ROOT, env
+from .canonical_ai import CanonicalPlannerError, build_canonical_answer, openai_plan_question
 from .google_drive_sync import (
     COMMON_PROJECT_ID,
     COMMON_PROJECT_PACK_LINKS_KEY,
@@ -61,7 +62,17 @@ from .google_drive_sync import (
     write_back_pack_file,
     write_back_users_file,
 )
-from .mcp_server import TOOL_NAMES, configure_server as configure_mcp_server, mcp as remote_mcp
+from .mcp_server import (
+    TOOL_NAMES,
+    CanonicalSnapshotToolError,
+    _load_canonical_snapshot,
+    _resolve_canonical_snapshot_id,
+    _snapshot_summary,
+    _snapshot_verification_payload,
+    _verify_canonical_snapshot,
+    configure_server as configure_mcp_server,
+    mcp as remote_mcp,
+)
 from .mcp_tokens import (
     build_user_mcp_urls,
     ensure_mcp_token_for_user,
@@ -79,6 +90,9 @@ from .project_store import (
     update_project,
 )
 from .qa import answer_pack_question, validate_openai_api_key
+from .project_query import ProjectQueryExecution
+from .query_contract import validate_query_plan
+from .query_engine import execute_query
 from .store import connect, index_all_packs, index_pack, index_stats, init_db
 
 
@@ -385,6 +399,12 @@ class QueryRequest(BaseModel):
 
 
 class OpenAIKeyValidationRequest(BaseModel):
+    openai_api_key: str
+    openai_model: str | None = None
+
+
+class CanonicalQuestionRequest(BaseModel):
+    question: str
     openai_api_key: str
     openai_model: str | None = None
 
@@ -1755,6 +1775,67 @@ def query_ontology(request: QueryRequest, authorization: str | None = Header(def
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Pack not found: {request.pack_id}") from None
     return result
+
+
+@app.post("/api/projects/{project_id}/canonical-question")
+def query_canonical_project(
+    project_id: str,
+    request: CanonicalQuestionRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Answer from one promoted project snapshot through the M2/M3 path."""
+
+    ensure_runtime_registry()
+    user = current_user(authorization)
+    ensure_project_access(project_id, user)
+    clean_key = request.openai_api_key.strip()
+    if not clean_key:
+        raise HTTPException(status_code=400, detail="OpenAI API key is required.")
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question is required.")
+    try:
+        canonical_id, routing_mode = _resolve_canonical_snapshot_id("", project_id)
+        manifest, snapshot = _load_canonical_snapshot(canonical_id)
+        verification = _verify_canonical_snapshot(snapshot)
+        planner_context = manifest.get("planner_context") or {
+            "canonical_project_id": snapshot.project_id,
+            "project_aliases": manifest.get("project_aliases") or [],
+        }
+        plan, planner = openai_plan_question(
+            request.question,
+            planner_context,
+            api_key=clean_key,
+            model=(request.openai_model or "gpt-4.1-mini").strip(),
+        )
+        result = execute_query(plan, snapshot)
+        execution = ProjectQueryExecution(
+            snapshot=snapshot,
+            verification=verification,
+            plan=validate_query_plan(plan),
+            result=result,
+            question=request.question.strip(),
+        )
+        answer = build_canonical_answer(request.question, execution)
+    except CanonicalSnapshotToolError as exc:
+        raise HTTPException(status_code=404, detail={"code": exc.code, "message": exc.detail}) from exc
+    except CanonicalPlannerError as exc:
+        raise HTTPException(status_code=422, detail={"code": "nl_to_plan_failed", "message": str(exc)}) from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=422, detail={"code": "canonical_query_failed", "message": str(exc)}) from exc
+
+    return {
+        "status": "ok",
+        "routing": {
+            "mode": routing_mode,
+            "requested_project_id": project_id,
+            "canonical_id": canonical_id,
+        },
+        "m2": {"status": "planned", "plan": plan, "planner": planner},
+        "m3": {"status": "verified", **answer},
+        "snapshot": _snapshot_summary(manifest, snapshot),
+        "verification": _snapshot_verification_payload(verification),
+        "result": result.as_dict(),
+    }
 
 
 @app.post("/api/llm/openai/validate")

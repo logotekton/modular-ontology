@@ -140,6 +140,26 @@ type QueryEvidence = {
   snippet?: string;
 };
 
+type CanonicalAiMetadata = {
+  plan: Record<string, unknown>;
+  planner: { model?: string; attempts?: number; plan_hash?: string; contract?: string };
+  routing: { mode?: string; canonical_id?: string };
+  snapshot: {
+    canonical_id?: string;
+    default_for_project?: boolean;
+    included_pack_count?: number;
+    internal_snapshot_hash?: string;
+    source_composite_sha256?: string;
+  };
+  verification: { valid?: boolean; checked_pack_count?: number };
+  evidence: {
+    query_hash?: string;
+    result_hash?: string;
+    contribution_digest?: string;
+    contribution_count?: number;
+  };
+};
+
 type AiMessage = {
   id: string;
   role: "user" | "assistant";
@@ -147,6 +167,7 @@ type AiMessage = {
   evidence?: QueryEvidence[];
   /** 답변/근거 텍스트에서 매칭된 그래프 노드 id — 하이라이트용 */
   refNodeIds?: string[];
+  canonical?: CanonicalAiMetadata;
 };
 
 /** 답변·근거 텍스트에 라벨이나 id가 등장하는 노드를 찾는다 (AI 참조 하이라이트용) */
@@ -1221,7 +1242,11 @@ function App() {
     // 로컬 팩 노드의 "__local__"은 서버 미등록 — 등록된 팩으로 폴백해야 질의가 실패하지 않는다
     const selectedNodePackId = rawNodePackId === "__local__" ? "" : rawNodePackId;
     const targetPackId = selectedNodePackId || selectedGraphPackIds[0] || selectedPackId;
-    if (!question || !targetPackId || aiLoading) return;
+    const useCanonicalProject = Boolean(
+      selectedProject &&
+        (selectedProject.id === "yeoju-modular-dormitory" || selectedProject.name.includes("여주")),
+    );
+    if (!question || (!useCanonicalProject && !targetPackId) || aiLoading) return;
     const userOpenAiKey = openAiApiKey.trim();
     if (!userOpenAiKey) {
       setAiMessages((messages) => [
@@ -1250,19 +1275,29 @@ function App() {
     setAiQuestion("");
     setAiLoading(true);
     try {
-      const res = await fetch("/api/query", {
+      const endpoint = useCanonicalProject
+        ? `/api/projects/${encodeURIComponent(selectedProject.id)}/canonical-question`
+        : "/api/query";
+      const requestBody = useCanonicalProject
+        ? {
+            question,
+            openai_api_key: userOpenAiKey,
+            openai_model: OPENAI_CHAT_MODEL,
+          }
+        : {
+            pack_id: targetPackId,
+            question,
+            use_openai: true,
+            openai_api_key: userOpenAiKey,
+            openai_model: OPENAI_CHAT_MODEL,
+          };
+      const res = await fetch(endpoint, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
         },
-        body: JSON.stringify({
-          pack_id: targetPackId,
-          question,
-          use_openai: true,
-          openai_api_key: userOpenAiKey,
-          openai_model: OPENAI_CHAT_MODEL,
-        }),
+        body: JSON.stringify(requestBody),
       });
       if (!res.ok) throw new Error(await res.text());
       const payload = (await res.json()) as {
@@ -1270,8 +1305,19 @@ function App() {
         evidence?: QueryEvidence[];
         llmError?: string | null;
         mode?: string;
+        routing?: CanonicalAiMetadata["routing"];
+        m2?: {
+          plan?: Record<string, unknown>;
+          planner?: CanonicalAiMetadata["planner"];
+        };
+        m3?: {
+          answer?: string;
+          evidence?: CanonicalAiMetadata["evidence"];
+        };
+        snapshot?: CanonicalAiMetadata["snapshot"];
+        verification?: CanonicalAiMetadata["verification"];
       };
-      const fallbackAnswer = payload.answer || "답변을 생성하지 못했습니다.";
+      const fallbackAnswer = payload.m3?.answer || payload.answer || "답변을 생성하지 못했습니다.";
       const content = payload.llmError
         ? `${formatAiQueryWarning(payload.llmError)}\n\nFallback Graph RAG answer:\n${fallbackAnswer}`
         : fallbackAnswer;
@@ -1291,6 +1337,17 @@ function App() {
           content,
           evidence: payload.evidence ?? [],
           refNodeIds,
+          canonical:
+            payload.m2?.plan && payload.m2.planner && payload.routing && payload.snapshot && payload.verification && payload.m3?.evidence
+              ? {
+                  plan: payload.m2.plan,
+                  planner: payload.m2.planner,
+                  routing: payload.routing,
+                  snapshot: payload.snapshot,
+                  verification: payload.verification,
+                  evidence: payload.m3.evidence,
+                }
+              : undefined,
         },
       ]);
     } catch (error) {

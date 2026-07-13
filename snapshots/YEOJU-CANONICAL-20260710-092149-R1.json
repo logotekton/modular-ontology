@@ -2,6 +2,65 @@
   "schema_version": 1,
   "project_id": "yeoju",
   "default_for_project": true,
+  "project_aliases": [
+    "yeoju-modular-dormitory",
+    "여주 군관사",
+    "여주"
+  ],
+  "planner_context": {
+    "canonical_project_id": "yeoju",
+    "project_aliases": [
+      "yeoju-modular-dormitory",
+      "여주 군관사",
+      "여주"
+    ],
+    "terminology": {
+      "physical_object_count": {
+        "metric": "count_distinct",
+        "field": "source_element_id"
+      },
+      "unique_type_count": {
+        "metric": "count_distinct",
+        "field": "type_name"
+      },
+      "type_list": {
+        "metric": "collect_distinct",
+        "field": "type_name"
+      },
+      "level_field": "level_name"
+    },
+    "unit_aliases": {
+      "㎡": "square_meter",
+      "m2": "square_meter",
+      "TON": "metric_ton",
+      "ton": "metric_ton"
+    },
+    "filter_order": {
+      "element": [
+        "level_name",
+        "type_name",
+        "source_element_id"
+      ],
+      "boq_item": [
+        "item_name",
+        "specification",
+        "normalized_unit"
+      ]
+    },
+    "boq_material_catalog": [
+      {
+        "item_name": "용접구조용 압연강재",
+        "shape": "H형강",
+        "grade": "SM355",
+        "normalized_unit": "metric_ton",
+        "specifications": [
+          "H 150x150x7x10, SM355",
+          "H 200x200x8x12, SM355",
+          "H 300x150x6.5x9, SM355"
+        ]
+      }
+    ]
+  },
   "source_signature": "sha256:b17100532752e6012050f421107aaa80bb9f7e7dfb934e4c98346f852286eebe",
   "canonical_id": "YEOJU-CANONICAL-20260710-092149-R1",
   "source_composite_sha256": "B17100532752E6012050F421107AAA80BB9F7E7DFB934E4C98346F852286EEBE",

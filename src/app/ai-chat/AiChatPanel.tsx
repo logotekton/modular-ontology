@@ -11,6 +11,25 @@ import { Text } from "@astryxdesign/core/Text";
 import { HStack, VStack } from "@astryxdesign/core/Layout";
 
 type ChatEvidence = { title?: string; path?: string; snippet?: string };
+type CanonicalMetadata = {
+  plan: Record<string, unknown>;
+  planner: { model?: string; attempts?: number; plan_hash?: string; contract?: string };
+  routing: { mode?: string; canonical_id?: string };
+  snapshot: {
+    canonical_id?: string;
+    default_for_project?: boolean;
+    included_pack_count?: number;
+    internal_snapshot_hash?: string;
+    source_composite_sha256?: string;
+  };
+  verification: { valid?: boolean; checked_pack_count?: number };
+  evidence: {
+    query_hash?: string;
+    result_hash?: string;
+    contribution_digest?: string;
+    contribution_count?: number;
+  };
+};
 
 export type AiChatMessage = {
   id: string;
@@ -18,6 +37,7 @@ export type AiChatMessage = {
   content: string;
   evidence?: ChatEvidence[];
   refNodeIds?: string[];
+  canonical?: CanonicalMetadata;
 };
 
 export function AiChatPanel({
@@ -90,6 +110,34 @@ export function AiChatPanel({
                         </Text>
                       ))}
                     </VStack>
+                  ) : null}
+                  {message.canonical ? (
+                    <div className="ai-chat-canonical" data-testid="canonical-verification">
+                      <div className="ai-chat-canonical-badges" aria-label="지식그래프 검증 상태">
+                        <span className="ai-chat-canonical-badge">M2 계획</span>
+                        <span className="ai-chat-canonical-badge">
+                          {message.canonical.snapshot.default_for_project ? "R1 기본" : "스냅샷 지정"}
+                        </span>
+                        <span className={`ai-chat-canonical-badge ${message.canonical.verification.valid ? "is-valid" : "is-invalid"}`}>
+                          {message.canonical.verification.checked_pack_count ?? 0}/
+                          {message.canonical.snapshot.included_pack_count ?? 0} 검증
+                        </span>
+                      </div>
+                      <details className="ai-chat-canonical-details">
+                        <summary>질의 계획 보기</summary>
+                        <pre>{JSON.stringify(message.canonical.plan, null, 2)}</pre>
+                      </details>
+                      <details className="ai-chat-canonical-details">
+                        <summary>스냅샷·근거 해시 보기</summary>
+                        <dl>
+                          <div><dt>Canonical</dt><dd>{message.canonical.routing.canonical_id}</dd></div>
+                          <div><dt>Plan</dt><dd>{message.canonical.planner.plan_hash}</dd></div>
+                          <div><dt>Query</dt><dd>{message.canonical.evidence.query_hash}</dd></div>
+                          <div><dt>Result</dt><dd>{message.canonical.evidence.result_hash}</dd></div>
+                          <div><dt>Evidence</dt><dd>{message.canonical.evidence.contribution_digest}</dd></div>
+                        </dl>
+                      </details>
+                    </div>
                   ) : null}
                   {message.refNodeIds?.length && onHighlight ? (
                     <HStack gap={2} className="ai-chat-highlight-row">

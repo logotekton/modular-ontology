@@ -444,12 +444,14 @@ def _default_canonical_snapshot_id(project_id: str) -> str:
             "project_id_required",
             "project_id is required when canonical_id is omitted.",
         )
-    matches = [
-        canonical_id
-        for canonical_id, _, manifest in _canonical_snapshot_manifests()
-        if str(manifest.get("project_id") or "").strip() == requested
-        and manifest.get("default_for_project") is True
-    ]
+    matches = []
+    for canonical_id, _, manifest in _canonical_snapshot_manifests():
+        aliases = {
+            str(manifest.get("project_id") or "").strip(),
+            *(str(item).strip() for item in manifest.get("project_aliases") or []),
+        }
+        if requested in aliases and manifest.get("default_for_project") is True:
+            matches.append(canonical_id)
     if not matches:
         raise CanonicalSnapshotToolError(
             "default_snapshot_not_found",
