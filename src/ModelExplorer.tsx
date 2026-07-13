@@ -16,6 +16,7 @@ import {
   Focus,
   Glasses,
   Layers,
+  LoaderCircle,
   MapPin,
   Minus,
   MousePointer2,
@@ -55,6 +56,8 @@ type ModelManifest = {
   xktUrl?: string | null;
   error?: string | null;
 };
+
+type ViewerLoadStage = "idle" | "manifest" | "downloading" | "parsing" | "ready" | "error";
 
 type SelectedObject = {
   objectId: string;
@@ -155,6 +158,7 @@ export function ModelExplorerView({
   const [propertyFilter, setPropertyFilter] = useState<PropertyFilter>({ key: "category", value: "" });
   const [viewerCommand, setViewerCommand] = useState<ViewerCommand | null>(null);
   const [viewerError, setViewerError] = useState("");
+  const [viewerLoadStage, setViewerLoadStage] = useState<ViewerLoadStage>("idle");
   const objectDetailControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
@@ -165,18 +169,21 @@ export function ModelExplorerView({
   }, [visibleModels]);
 
   useEffect(() => {
+    setManifest(null);
     setModelTree([]);
     setExpandedTreeIds(new Set());
     setSelectedObject(null);
     setSelectedTreeNodeIds(new Set());
     setPropertyFilter((current) => ({ ...current, value: "" }));
     setViewerError("");
+    setViewerLoadStage(selectedModelId ? "manifest" : "idle");
   }, [selectedModelId]);
 
   useEffect(() => {
     if (!selectedModelId) {
       setManifest(null);
       setManifestError("");
+      setViewerLoadStage("idle");
       return;
     }
     const controller = new AbortController();
@@ -186,12 +193,16 @@ export function ModelExplorerView({
       signal: controller.signal,
     })
       .then((payload) => {
-        if (!controller.signal.aborted) setManifest(payload);
+        if (!controller.signal.aborted) {
+          setManifest(payload);
+          setViewerLoadStage(payload.xktUrl ? "downloading" : "idle");
+        }
       })
       .catch((error) => {
         if (!controller.signal.aborted && !isAbortError(error)) {
           setManifest(null);
           setManifestError(error instanceof Error ? error.message : "Model manifest load failed");
+          setViewerLoadStage("error");
         }
       });
     return () => {
@@ -217,6 +228,7 @@ export function ModelExplorerView({
   );
   const selectedObjectCount = useMemo(() => getUniqueObjectIdsForNodes(selectedTreeNodes).length, [selectedTreeNodes]);
   const treeObjectCount = useMemo(() => getUniqueObjectIdsForNodes(modelTree).length, [modelTree]);
+  const viewerIsLoading = viewerLoadStage === "manifest" || viewerLoadStage === "downloading" || viewerLoadStage === "parsing";
 
   const issueViewerCommand = useCallback((type: ViewerCommand["type"], payload: Record<string, unknown> = {}) => {
     setViewerCommand({ type, payload, seq: Date.now() + Math.random() });
@@ -394,7 +406,7 @@ export function ModelExplorerView({
         </label>
 
         <div className="model-tree-status" aria-live="polite">
-          <span>{treeObjectCount.toLocaleString()}개 객체</span>
+          <span>{viewerIsLoading ? "불러오는 중" : `${treeObjectCount.toLocaleString()}개 객체`}</span>
           {selectedTreeNodeIds.size ? (
             <button
               type="button"
@@ -426,6 +438,8 @@ export function ModelExplorerView({
                 onToggleSelection={toggleTreeNodeSelection}
               />
             ))
+          ) : viewerIsLoading ? (
+            <ModelTreeLoading stage={viewerLoadStage} />
           ) : (
             <div className="model-tree-empty">
               <Database size={18} />
@@ -577,12 +591,14 @@ export function ModelExplorerView({
               manifest={manifest}
               onModelTreeLoaded={handleModelTreeLoaded}
               onObjectClear={handleObjectClear}
+              onLoadStageChange={setViewerLoadStage}
               onViewerError={setViewerError}
               onObjectPick={handleObjectPick}
             />
           ) : (
             <ModelProjectEmptyState projectName={project?.name} />
           )}
+          {visibleModels.length && viewerIsLoading ? <ModelViewerLoading stage={viewerLoadStage} /> : null}
         </div>
 
         {manifestError || viewerError ? <p className="model-viewer-error">{manifestError || viewerError}</p> : null}
@@ -607,6 +623,31 @@ function ModelProjectEmptyState({ projectName }: { projectName?: string }) {
       <strong>IFC 모델이 없습니다.</strong>
       <span>{projectName ? `${projectName} 프로젝트에 연결된 IFC 모델이 없습니다.` : "선택한 프로젝트에 연결된 IFC 모델이 없습니다."}</span>
       <em>Drive에 IFC/XKT 파일을 올린 뒤 동기화 탭에서 등록하면 모델 탐색기를 사용할 수 있습니다.</em>
+    </div>
+  );
+}
+
+function viewerLoadLabel(stage: ViewerLoadStage) {
+  if (stage === "manifest") return "모델 정보를 확인하는 중";
+  if (stage === "downloading") return "Drive에서 XKT를 불러오는 중";
+  return "3D 객체와 속성을 분석하는 중";
+}
+
+function ModelTreeLoading({ stage }: { stage: ViewerLoadStage }) {
+  return (
+    <div className="model-tree-loading" role="status">
+      <LoaderCircle size={18} />
+      <strong>{viewerLoadLabel(stage)}</strong>
+      <span>모델 구조가 준비되면 자동으로 표시됩니다.</span>
+    </div>
+  );
+}
+
+function ModelViewerLoading({ stage }: { stage: ViewerLoadStage }) {
+  return (
+    <div className="model-viewer-loading" role="status">
+      <LoaderCircle size={22} />
+      <strong>{viewerLoadLabel(stage)}</strong>
     </div>
   );
 }
@@ -942,6 +983,7 @@ function ModelViewerCanvas({
   command,
   onModelTreeLoaded,
   onObjectClear,
+  onLoadStageChange,
   onViewerError,
   onObjectPick,
 }: {
@@ -950,6 +992,7 @@ function ModelViewerCanvas({
   command: ViewerCommand | null;
   onModelTreeLoaded: (nodes: ModelTreeNode[]) => void;
   onObjectClear: () => void;
+  onLoadStageChange: (stage: ViewerLoadStage) => void;
   onViewerError: (message: string) => void;
   onObjectPick: (objectId: string, picked?: Record<string, unknown>) => void;
 }) {
@@ -985,13 +1028,18 @@ function ModelViewerCanvas({
     let cancelled = false;
     const controller = new AbortController();
     async function boot() {
-      if (!manifest?.xktUrl) return;
+      if (!manifest?.xktUrl) {
+        onLoadStageChange("idle");
+        return;
+      }
       onViewerError("");
+      onLoadStageChange("downloading");
       const xeokit = await import("@xeokit/xeokit-sdk");
       if (cancelled) return;
       const assetResponse = await request(manifest.xktUrl, { token: authToken, signal: controller.signal });
       const xktData = await assetResponse.arrayBuffer();
       if (cancelled) return;
+      onLoadStageChange("parsing");
       xeokitRef.current = xeokit;
       viewerRef.current?.destroy?.();
       const viewer = new xeokit.Viewer({
@@ -1003,6 +1051,8 @@ function ModelViewerCanvas({
         saoEnabled: true,
       });
       configureViewer(viewer, xeokit);
+      viewerRef.current = viewer;
+      resizeModelViewer(viewer);
       sectionPlanesRef.current = new xeokit.SectionPlanesPlugin(viewer, { overviewVisible: false });
       if (xeokit.DistanceMeasurementsPlugin && xeokit.DistanceMeasurementsMouseControl) {
         distanceMeasurementsRef.current = new xeokit.DistanceMeasurementsPlugin(viewer);
@@ -1023,8 +1073,10 @@ function ModelViewerCanvas({
       modelRef.current = model;
       model.on("loaded", () => {
         if (cancelled) return;
+        resizeModelViewer(viewer);
         const objectCount = Object.keys(viewer.scene.objects || {}).length;
         onModelTreeLoaded(buildModelTree(viewer, manifest.modelId));
+        onLoadStageChange("ready");
         const modelAABB = getFiniteAABB(model.aabb);
         const sceneAABB = getFiniteAABB(viewer.scene.aabb);
         const targetAABB = modelAABB || sceneAABB;
@@ -1047,6 +1099,7 @@ function ModelViewerCanvas({
       });
       model.on("error", (error: unknown) => {
         console.error("[model-explorer] XKT load failed", error);
+        onLoadStageChange("error");
         onViewerError(`XKT 모델을 불러오지 못했습니다. ${String(error)}`);
       });
       viewer.cameraControl.on("picked", (pickResult: any) => {
@@ -1070,11 +1123,11 @@ function ModelViewerCanvas({
         viewer.scene.render(true);
         onObjectClear();
       });
-      viewerRef.current = viewer;
     }
     boot().catch((error) => {
       if (controller.signal.aborted || isAbortError(error)) return;
       console.error("[model-explorer] XKT boot failed", error);
+      onLoadStageChange("error");
       onViewerError(`XKT 파일을 불러오지 못했습니다. ${error instanceof Error ? error.message : String(error)}`);
       onModelTreeLoaded([]);
     });
@@ -1090,7 +1143,7 @@ function ModelViewerCanvas({
       distanceMeasurementsRef.current = null;
       distanceControlRef.current = null;
     };
-  }, [authToken, manifest?.modelId, manifest?.xktUrl, onModelTreeLoaded, onObjectClear, onObjectPick, onViewerError]);
+  }, [authToken, manifest?.modelId, manifest?.xktUrl, onLoadStageChange, onModelTreeLoaded, onObjectClear, onObjectPick, onViewerError]);
 
   useEffect(() => {
     if (!command || !viewerRef.current) return;
@@ -1195,6 +1248,11 @@ function configureViewer(viewer: any, xeokit: any) {
   viewer.camera.look = [0, 0, 0];
   viewer.camera.up = [0, 1, 0];
   viewer.camera.projection = "perspective";
+}
+
+function resizeModelViewer(viewer: any) {
+  window.dispatchEvent(new Event("resize"));
+  viewer.scene?.render?.(true);
 }
 
 function buildModelTree(viewer: any, modelId: string): ModelTreeNode[] {
