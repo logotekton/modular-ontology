@@ -437,6 +437,39 @@ def _canonical_snapshot_manifest(canonical_id: str) -> tuple[Path, dict]:
     )
 
 
+def _default_canonical_snapshot_id(project_id: str) -> str:
+    requested = project_id.strip()
+    if not requested:
+        raise CanonicalSnapshotToolError(
+            "project_id_required",
+            "project_id is required when canonical_id is omitted.",
+        )
+    matches = [
+        canonical_id
+        for canonical_id, _, manifest in _canonical_snapshot_manifests()
+        if str(manifest.get("project_id") or "").strip() == requested
+        and manifest.get("default_for_project") is True
+    ]
+    if not matches:
+        raise CanonicalSnapshotToolError(
+            "default_snapshot_not_found",
+            f"No promoted default canonical snapshot is available for project: {requested}",
+        )
+    if len(matches) != 1:
+        raise CanonicalSnapshotToolError(
+            "default_snapshot_ambiguous",
+            f"More than one default canonical snapshot is declared for project: {requested}",
+        )
+    return matches[0]
+
+
+def _resolve_canonical_snapshot_id(canonical_id: str, project_id: str) -> tuple[str, str]:
+    explicit = canonical_id.strip()
+    if explicit:
+        return explicit, "explicit"
+    return _default_canonical_snapshot_id(project_id), "project_default"
+
+
 def _load_canonical_snapshot(canonical_id: str) -> tuple[dict, ProjectSnapshot]:
     path, manifest = _canonical_snapshot_manifest(canonical_id)
     snapshot = load_snapshot(path)
@@ -473,6 +506,7 @@ def _snapshot_summary(manifest: dict, snapshot: ProjectSnapshot) -> dict:
     return {
         "canonical_id": str(manifest["canonical_id"]),
         "project_id": snapshot.project_id,
+        "default_for_project": manifest.get("default_for_project") is True,
         "internal_snapshot_id": snapshot.snapshot_id,
         "internal_snapshot_hash": snapshot.snapshot_hash,
         "source_signature": snapshot.source_signature,
@@ -707,6 +741,11 @@ def _tool_manifest_payload() -> dict:
                 "mo_snapshot_query",
                 "mo_snapshot_bundle_query",
             ],
+            "defaultSnapshotRouting": (
+                "For a structured project plan or bundle, omit canonical_id to use the "
+                "project's promoted default snapshot. An explicit canonical_id remains "
+                "available for regression and historical replay."
+            ),
             "packLevelTools": ["mo_pack_overview", "mo_pack_schema", "mo_document_list", "mo_document_read"],
         },
         "tools": TOOL_MANIFEST,
@@ -4169,41 +4208,59 @@ def mo_snapshot_list() -> str:
             manifest, snapshot = _load_canonical_snapshot(canonical_id)
             if _snapshot_is_visible(snapshot):
                 snapshots.append(_snapshot_summary(manifest, snapshot))
-        return _json({"status": "ok", "count": len(snapshots), "snapshots": snapshots})
+        defaults = {
+            item["project_id"]: item["canonical_id"]
+            for item in snapshots
+            if item["default_for_project"]
+        }
+        return _json(
+            {
+                "status": "ok",
+                "count": len(snapshots),
+                "defaults": defaults,
+                "snapshots": snapshots,
+            }
+        )
     except Exception as exc:
         return _json(_snapshot_error_payload(exc))
 
 
 @mcp.tool()
-def mo_snapshot_status(canonical_id: str) -> str:
-    """Load and SHA-256 verify every included pack in one canonical snapshot."""
+def mo_snapshot_status(canonical_id: str = "", project_id: str = "") -> str:
+    """Verify one snapshot, resolving a promoted project default when its ID is omitted."""
 
     try:
         if not _mcp_authorized():
             raise CanonicalSnapshotToolError("unauthorized", "Invalid MCP user URL token.")
-        manifest, snapshot = _load_canonical_snapshot(canonical_id)
+        resolved_id, routing_mode = _resolve_canonical_snapshot_id(canonical_id, project_id)
+        manifest, snapshot = _load_canonical_snapshot(resolved_id)
         _require_snapshot_access(snapshot)
         verification = _verify_canonical_snapshot(snapshot)
         return _json(
             {
                 "status": "ok",
+                "routing": {"mode": routing_mode, "canonical_id": resolved_id},
                 "snapshot": _snapshot_summary(manifest, snapshot),
                 "verification": _snapshot_verification_payload(verification),
             }
         )
     except Exception as exc:
-        return _json(_snapshot_error_payload(exc, canonical_id=canonical_id))
+        return _json(_snapshot_error_payload(exc, canonical_id=canonical_id or None))
 
 
 @mcp.tool()
-def mo_snapshot_query(canonical_id: str, plan: dict) -> str:
-    """Execute an exact seven-field plan only after canonical snapshot SHA verification."""
+def mo_snapshot_query(plan: dict, canonical_id: str = "") -> str:
+    """Execute a seven-field plan against its promoted project default unless explicitly pinned."""
 
     try:
         if not _mcp_authorized():
             raise CanonicalSnapshotToolError("unauthorized", "Invalid MCP user URL token.")
         canonical_plan = _exact_snapshot_query_plan(plan)
-        manifest, snapshot = _load_canonical_snapshot(canonical_id)
+        resolved_id, routing_mode = _resolve_canonical_snapshot_id(
+            canonical_id,
+            str(canonical_plan["project_id"]),
+        )
+        manifest, snapshot = _load_canonical_snapshot(resolved_id)
         _require_snapshot_access(snapshot)
 
         # This preflight hashes every included pack.  The orchestrator then
@@ -4221,6 +4278,7 @@ def mo_snapshot_query(canonical_id: str, plan: dict) -> str:
         return _json(
             {
                 "status": "ok",
+                "routing": {"mode": routing_mode, "canonical_id": resolved_id},
                 "snapshot": _snapshot_summary(manifest, execution.snapshot),
                 "verification": _snapshot_verification_payload(execution.verification),
                 "plan": execution.plan.as_dict(),
@@ -4228,12 +4286,12 @@ def mo_snapshot_query(canonical_id: str, plan: dict) -> str:
             }
         )
     except Exception as exc:
-        return _json(_snapshot_error_payload(exc, canonical_id=canonical_id))
+        return _json(_snapshot_error_payload(exc, canonical_id=canonical_id or None))
 
 
 @mcp.tool()
-def mo_snapshot_bundle_query(canonical_id: str, bundle: dict) -> str:
-    """Execute an exact plan bundle against one fully verified canonical snapshot."""
+def mo_snapshot_bundle_query(bundle: dict, canonical_id: str = "") -> str:
+    """Execute a bundle against its promoted project default unless explicitly pinned."""
 
     try:
         if not _mcp_authorized():
@@ -4242,7 +4300,11 @@ def mo_snapshot_bundle_query(canonical_id: str, bundle: dict) -> str:
         # Validate the complete bundle, including recursively forbidden pack
         # and snapshot selectors, before any snapshot file is opened.
         canonical_bundle = _exact_snapshot_query_bundle(bundle)
-        manifest, snapshot = _load_canonical_snapshot(canonical_id)
+        resolved_id, routing_mode = _resolve_canonical_snapshot_id(
+            canonical_id,
+            str(canonical_bundle["project_id"]),
+        )
+        manifest, snapshot = _load_canonical_snapshot(resolved_id)
         _require_snapshot_access(snapshot)
 
         # Hash every included pack before execution. Each subplan hashes its
@@ -4261,6 +4323,7 @@ def mo_snapshot_bundle_query(canonical_id: str, bundle: dict) -> str:
         return _json(
             {
                 "status": "ok",
+                "routing": {"mode": routing_mode, "canonical_id": resolved_id},
                 "snapshot": _snapshot_summary(manifest, snapshot),
                 "verification": _snapshot_verification_payload(after),
                 "bundle": canonical_bundle,
@@ -4269,7 +4332,7 @@ def mo_snapshot_bundle_query(canonical_id: str, bundle: dict) -> str:
             }
         )
     except Exception as exc:
-        return _json(_snapshot_error_payload(exc, canonical_id=canonical_id))
+        return _json(_snapshot_error_payload(exc, canonical_id=canonical_id or None))
 
 
 @mcp.tool()

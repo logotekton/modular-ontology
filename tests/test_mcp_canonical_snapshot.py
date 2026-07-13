@@ -66,6 +66,8 @@ def test_mcp_snapshot_status_verifies_all_173_pinned_packs() -> None:
 
     assert listed["status"] == "ok"
     assert [item["canonical_id"] for item in listed["snapshots"]] == [CANONICAL_ID]
+    assert listed["defaults"] == {"yeoju": CANONICAL_ID}
+    assert listed["snapshots"][0]["default_for_project"] is True
     assert status["status"] == "ok"
     assert status["snapshot"]["canonical_id"] == CANONICAL_ID
     assert status["snapshot"]["internal_snapshot_id"] == INTERNAL_SNAPSHOT_ID
@@ -91,7 +93,7 @@ def test_mcp_snapshot_status_verifies_all_173_pinned_packs() -> None:
 
 
 def test_mcp_snapshot_query_a01_binds_result_to_verified_snapshot_and_hashes() -> None:
-    payload = json.loads(mcp_server.mo_snapshot_query(CANONICAL_ID, _a01_plan()))
+    payload = json.loads(mcp_server.mo_snapshot_query(_a01_plan(), CANONICAL_ID))
 
     assert payload["status"] == "ok"
     assert payload["verification"]["valid"] is True
@@ -117,6 +119,40 @@ def test_mcp_snapshot_query_a01_binds_result_to_verified_snapshot_and_hashes() -
     assert all(len(pack["sha256"]) == 64 for pack in result["source_packs"])
 
 
+def test_mcp_snapshot_status_resolves_promoted_yeoju_default() -> None:
+    payload = json.loads(mcp_server.mo_snapshot_status(project_id="yeoju"))
+
+    assert payload["status"] == "ok"
+    assert payload["routing"] == {
+        "mode": "project_default",
+        "canonical_id": CANONICAL_ID,
+    }
+    assert payload["snapshot"]["default_for_project"] is True
+    assert payload["verification"]["checked_pack_count"] == 173
+
+
+def test_mcp_snapshot_query_automatically_uses_promoted_yeoju_default() -> None:
+    payload = json.loads(mcp_server.mo_snapshot_query(_a01_plan()))
+
+    assert payload["status"] == "ok"
+    assert payload["routing"] == {
+        "mode": "project_default",
+        "canonical_id": CANONICAL_ID,
+    }
+    assert payload["result"]["values"] == {"object_count": 94, "type_count": 13}
+
+
+def test_mcp_snapshot_bundle_automatically_uses_promoted_yeoju_default() -> None:
+    payload = json.loads(mcp_server.mo_snapshot_bundle_query(_a01_bundle()))
+
+    assert payload["status"] == "ok"
+    assert payload["routing"] == {
+        "mode": "project_default",
+        "canonical_id": CANONICAL_ID,
+    }
+    assert payload["result"]["reducers"]["object_count_is_94"] is True
+
+
 @pytest.mark.parametrize(
     ("forbidden_key", "forbidden_value"),
     [
@@ -130,7 +166,7 @@ def test_mcp_snapshot_query_rejects_plan_selected_pack_or_snapshot(
 ) -> None:
     plan = {**_a01_plan(), forbidden_key: forbidden_value}
 
-    payload = json.loads(mcp_server.mo_snapshot_query(CANONICAL_ID, plan))
+    payload = json.loads(mcp_server.mo_snapshot_query(plan, CANONICAL_ID))
 
     assert payload["status"] == "error"
     assert payload["error"]["code"] == "invalid_query_plan"
@@ -142,7 +178,7 @@ def test_mcp_snapshot_query_rejects_plan_selected_pack_or_snapshot(
 
 
 def test_mcp_snapshot_bundle_query_binds_snapshot_result_and_subplan_pack_hashes() -> None:
-    payload = json.loads(mcp_server.mo_snapshot_bundle_query(CANONICAL_ID, _a01_bundle()))
+    payload = json.loads(mcp_server.mo_snapshot_bundle_query(_a01_bundle(), CANONICAL_ID))
 
     assert payload["status"] == "ok"
     assert payload["verification"] == {
@@ -190,7 +226,7 @@ def test_mcp_snapshot_bundle_query_rejects_pack_or_snapshot_selector_at_any_dept
     bundle = _a01_bundle()
     bundle["reducers"][0]["right"][forbidden_key] = forbidden_value
 
-    payload = json.loads(mcp_server.mo_snapshot_bundle_query(CANONICAL_ID, bundle))
+    payload = json.loads(mcp_server.mo_snapshot_bundle_query(bundle, CANONICAL_ID))
 
     assert payload["status"] == "error"
     assert payload["error"]["code"] == "invalid_plan_bundle"
@@ -206,7 +242,7 @@ def test_mcp_snapshot_bundle_query_requires_exact_top_level_field_set() -> None:
     bundle = _a01_bundle()
     bundle.pop("reducers")
 
-    payload = json.loads(mcp_server.mo_snapshot_bundle_query(CANONICAL_ID, bundle))
+    payload = json.loads(mcp_server.mo_snapshot_bundle_query(bundle, CANONICAL_ID))
 
     assert payload["status"] == "error"
     assert payload["error"]["code"] == "invalid_plan_bundle"
@@ -233,7 +269,7 @@ def test_mcp_snapshot_bundle_query_fails_closed_on_non_sha256_query_hash(monkeyp
 
     monkeypatch.setattr(mcp_server, "execute_query_bundle", execute_with_short_hash)
 
-    payload = json.loads(mcp_server.mo_snapshot_bundle_query(CANONICAL_ID, _a01_bundle()))
+    payload = json.loads(mcp_server.mo_snapshot_bundle_query(_a01_bundle(), CANONICAL_ID))
 
     assert payload["status"] == "error"
     assert payload["error"]["code"] == "query_binding_failed"

@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "project_id": "yeoju",
+  "default_for_project": true,
   "source_signature": "sha256:b17100532752e6012050f421107aaa80bb9f7e7dfb934e4c98346f852286eebe",
   "canonical_id": "YEOJU-CANONICAL-20260710-092149-R1",
   "source_composite_sha256": "B17100532752E6012050F421107AAA80BB9F7E7DFB934E4C98346F852286EEBE",
