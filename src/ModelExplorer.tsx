@@ -1,17 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from "react";
 import {
   Box,
+  Boxes,
   Building2,
   Camera,
+  Check,
   ChevronDown,
   ChevronRight,
+  Copy,
   Database,
   Download,
   Eye,
   EyeOff,
+  FolderTree,
   Focus,
   Glasses,
   Layers,
+  MapPin,
+  Minus,
   MousePointer2,
   Paintbrush,
   RotateCcw,
@@ -20,6 +26,7 @@ import {
   Search,
   X,
 } from "lucide-react";
+import { getJson, isAbortError, request } from "./api/http";
 
 type Project = {
   id: string;
@@ -111,14 +118,6 @@ const MODEL_FILTER_KEYS = [
   { key: "family", label: "family" },
 ];
 
-async function getJson<T>(path: string, token?: string): Promise<T> {
-  const response = await fetch(path, {
-    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-  });
-  if (!response.ok) throw new Error(await response.text());
-  return response.json() as Promise<T>;
-}
-
 function displayValue(value: unknown) {
   if (value == null || value === "") return "-";
   if (typeof value === "object") return JSON.stringify(value);
@@ -156,6 +155,7 @@ export function ModelExplorerView({
   const [propertyFilter, setPropertyFilter] = useState<PropertyFilter>({ key: "category", value: "" });
   const [viewerCommand, setViewerCommand] = useState<ViewerCommand | null>(null);
   const [viewerError, setViewerError] = useState("");
+  const objectDetailControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     setSelectedModelId((current) => {
@@ -179,20 +179,23 @@ export function ModelExplorerView({
       setManifestError("");
       return;
     }
-    let cancelled = false;
+    const controller = new AbortController();
     setManifestError("");
-    getJson<ModelManifest>(`/api/ifc/model-viewer/manifest?model_id=${encodeURIComponent(selectedModelId)}`, authToken)
+    getJson<ModelManifest>(`/api/ifc/model-viewer/manifest?model_id=${encodeURIComponent(selectedModelId)}`, {
+      token: authToken,
+      signal: controller.signal,
+    })
       .then((payload) => {
-        if (!cancelled) setManifest(payload);
+        if (!controller.signal.aborted) setManifest(payload);
       })
       .catch((error) => {
-        if (!cancelled) {
+        if (!controller.signal.aborted && !isAbortError(error)) {
           setManifest(null);
           setManifestError(error instanceof Error ? error.message : "Model manifest load failed");
         }
       });
     return () => {
-      cancelled = true;
+      controller.abort();
     };
   }, [authToken, selectedModelId]);
 
@@ -202,6 +205,18 @@ export function ModelExplorerView({
   const selectedFilterOption = activeFilterOptions.find((option) => option.value === propertyFilter.value) ?? null;
   const forceExpandedTree = Boolean(treeSearch.trim());
   const viewerWindowRef = useRef<HTMLDivElement | null>(null);
+  const modelTreeListRef = useRef<HTMLDivElement | null>(null);
+  const modelTreeParentIndexRef = useRef<Map<string, string>>(new Map());
+  const modelTreeNodeIndex = useMemo(() => buildModelTreeNodeIndex(modelTree), [modelTree]);
+  const selectedTreeNodes = useMemo(
+    () =>
+      [...selectedTreeNodeIds]
+        .map((nodeId) => modelTreeNodeIndex.get(nodeId))
+        .filter((node): node is ModelTreeNode => Boolean(node)),
+    [modelTreeNodeIndex, selectedTreeNodeIds],
+  );
+  const selectedObjectCount = useMemo(() => getUniqueObjectIdsForNodes(selectedTreeNodes).length, [selectedTreeNodes]);
+  const treeObjectCount = useMemo(() => getUniqueObjectIdsForNodes(modelTree).length, [modelTree]);
 
   const issueViewerCommand = useCallback((type: ViewerCommand["type"], payload: Record<string, unknown> = {}) => {
     setViewerCommand({ type, payload, seq: Date.now() + Math.random() });
@@ -224,6 +239,8 @@ export function ModelExplorerView({
   const handleObjectPick = useCallback(
     async (objectId: string, picked?: Record<string, unknown>) => {
       if (!objectId) return;
+      objectDetailControllerRef.current?.abort();
+      objectDetailControllerRef.current = null;
       const pickedProperties = picked?.properties;
       const fallback: SelectedObject = {
         objectId,
@@ -236,23 +253,33 @@ export function ModelExplorerView({
             : picked,
       };
       setSelectedTreeNodeIds(new Set([objectId]));
+      setExpandedTreeIds((current) => expandTreeAncestors(current, objectId, modelTreeParentIndexRef.current));
       setSelectedObject(fallback);
       if (pickedProperties) return;
       if (!selectedModelId) return;
+      const controller = new AbortController();
+      objectDetailControllerRef.current = controller;
       try {
         const resolved = await getJson<SelectedObject>(
           `/api/ifc/model-viewer/object?model_id=${encodeURIComponent(selectedModelId)}&object_id=${encodeURIComponent(objectId)}`,
-          authToken,
+          { token: authToken, signal: controller.signal },
         );
-        setSelectedObject(resolved);
-      } catch {
-        setSelectedObject(fallback);
+        if (!controller.signal.aborted) setSelectedObject(resolved);
+      } catch (error) {
+        if (!controller.signal.aborted && !isAbortError(error)) setSelectedObject(fallback);
+      } finally {
+        if (objectDetailControllerRef.current === controller) objectDetailControllerRef.current = null;
       }
     },
     [authToken, selectedModelId],
   );
 
+  useEffect(() => {
+    return () => objectDetailControllerRef.current?.abort();
+  }, [authToken, selectedModelId]);
+
   const handleModelTreeLoaded = useCallback((nodes: ModelTreeNode[]) => {
+    modelTreeParentIndexRef.current = buildModelTreeParentIndex(nodes);
     setModelTree(nodes);
     setExpandedTreeIds(new Set(getDefaultExpandedTreeIds(nodes)));
   }, []);
@@ -261,6 +288,16 @@ export function ModelExplorerView({
     setSelectedObject(null);
     setSelectedTreeNodeIds(new Set());
   }, []);
+
+  useEffect(() => {
+    if (selectedTreeNodeIds.size !== 1) return;
+    const frame = requestAnimationFrame(() => {
+      const list = modelTreeListRef.current;
+      list?.querySelector<HTMLElement>('[data-tree-selected="true"]')?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      if (list) list.scrollLeft = 0;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [expandedTreeIds, selectedTreeNodeIds]);
 
   useEffect(() => {
     setPropertyFilter((current) => {
@@ -296,8 +333,7 @@ export function ModelExplorerView({
     });
   }
 
-  function selectTreeNode(node: ModelTreeNode, event: ReactMouseEvent<HTMLButtonElement>) {
-    const additive = event.ctrlKey || event.metaKey;
+  function applyTreeSelection(node: ModelTreeNode, additive: boolean) {
     const nextIds = new Set(additive ? selectedTreeNodeIds : []);
     if (additive && nextIds.has(node.id)) {
       nextIds.delete(node.id);
@@ -305,7 +341,7 @@ export function ModelExplorerView({
       nextIds.add(node.id);
     }
     const nextNodes = [...nextIds]
-      .map((nodeId) => (nodeId === node.id ? node : findModelTreeNodeById(modelTree, nodeId)))
+      .map((nodeId) => (nodeId === node.id ? node : modelTreeNodeIndex.get(nodeId)))
       .filter((item): item is ModelTreeNode => Boolean(item));
     const objectIds = getUniqueObjectIdsForNodes(nextNodes);
     setSelectedTreeNodeIds(new Set(nextNodes.map((item) => item.id)));
@@ -313,8 +349,16 @@ export function ModelExplorerView({
     issueViewerCommand("select", { objectIds });
   }
 
+  function selectTreeNode(node: ModelTreeNode, event: ReactMouseEvent<HTMLButtonElement>) {
+    applyTreeSelection(node, event.ctrlKey || event.metaKey);
+  }
+
+  function toggleTreeNodeSelection(node: ModelTreeNode) {
+    applyTreeSelection(node, true);
+  }
+
   return (
-    <section className="model-explorer-grid">
+    <section className={selectedObject ? "model-explorer-grid with-properties" : "model-explorer-grid"}>
       <aside className="model-tree-panel">
         <div className="panel-header slim">
           <div>
@@ -342,9 +386,32 @@ export function ModelExplorerView({
         <label className="model-tree-search">
           <Search size={16} />
           <input value={treeSearch} placeholder="모델 객체 검색" onChange={(event) => setTreeSearch(event.target.value)} />
+          {treeSearch ? (
+            <button type="button" onClick={() => setTreeSearch("")} aria-label="검색어 지우기" title="검색어 지우기">
+              <X size={14} />
+            </button>
+          ) : null}
         </label>
 
-        <div className="model-tree-list" role="tree">
+        <div className="model-tree-status" aria-live="polite">
+          <span>{treeObjectCount.toLocaleString()}개 객체</span>
+          {selectedTreeNodeIds.size ? (
+            <button
+              type="button"
+              onClick={() => {
+                handleObjectClear();
+                issueViewerCommand("clearSelection");
+              }}
+            >
+              {selectedTreeNodeIds.size}개 항목 · {selectedObjectCount.toLocaleString()}개 객체 선택
+              <X size={13} />
+            </button>
+          ) : (
+            <em>선택 없음</em>
+          )}
+        </div>
+
+        <div className="model-tree-list" role="tree" ref={modelTreeListRef}>
           {filteredTree.length ? (
             filteredTree.map((node) => (
               <ModelTreeNodeItem
@@ -356,6 +423,7 @@ export function ModelExplorerView({
                 selectedTreeNodeIds={selectedTreeNodeIds}
                 onSelect={selectTreeNode}
                 onToggle={toggleTreeNode}
+                onToggleSelection={toggleTreeNodeSelection}
               />
             ))
           ) : (
@@ -515,19 +583,19 @@ export function ModelExplorerView({
           ) : (
             <ModelProjectEmptyState projectName={project?.name} />
           )}
-          {selectedObject ? (
-            <ModelPropertiesPanel
-              object={selectedObject}
-              onClose={() => {
-                handleObjectClear();
-                issueViewerCommand("clearSelection");
-              }}
-            />
-          ) : null}
         </div>
 
         {manifestError || viewerError ? <p className="model-viewer-error">{manifestError || viewerError}</p> : null}
       </div>
+      {selectedObject ? (
+        <ModelPropertiesPanel
+          object={selectedObject}
+          onClose={() => {
+            handleObjectClear();
+            issueViewerCommand("clearSelection");
+          }}
+        />
+      ) : null}
     </section>
   );
 }
@@ -551,6 +619,7 @@ function ModelTreeNodeItem({
   selectedTreeNodeIds,
   onSelect,
   onToggle,
+  onToggleSelection,
 }: {
   expandedIds: Set<string>;
   forceExpanded: boolean;
@@ -559,13 +628,25 @@ function ModelTreeNodeItem({
   selectedTreeNodeIds: Set<string>;
   onSelect: (node: ModelTreeNode, event: ReactMouseEvent<HTMLButtonElement>) => void;
   onToggle: (nodeId: string) => void;
+  onToggleSelection: (node: ModelTreeNode) => void;
 }) {
   const hasChildren = node.children.length > 0;
   const expanded = forceExpanded || expandedIds.has(node.id);
   const selected = selectedTreeNodeIds.has(node.id);
+  const kind = modelTreeNodeKind(node);
+  const objectCount = getModelTreeNodeObjectCount(node);
   return (
-    <div className="model-tree-branch" role="treeitem" aria-expanded={hasChildren ? expanded : undefined} aria-selected={selected}>
-      <div className={selected ? "model-tree-node active" : "model-tree-node"} style={{ "--tree-depth": level } as CSSProperties}>
+    <div
+      className="model-tree-branch"
+      role="treeitem"
+      aria-expanded={hasChildren ? expanded : undefined}
+      aria-selected={selected}
+      data-tree-selected={selected ? "true" : undefined}
+    >
+      <div
+        className={selected ? `model-tree-node ${kind} active` : `model-tree-node ${kind}`}
+        style={{ "--tree-depth": level } as CSSProperties}
+      >
         <button
           className="model-tree-toggle"
           disabled={!hasChildren}
@@ -573,14 +654,27 @@ function ModelTreeNodeItem({
           aria-label={expanded ? "하위 항목 접기" : "하위 항목 펼치기"}
           onClick={() => onToggle(node.id)}
         >
-          {hasChildren ? expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} /> : <Box size={13} />}
+          {hasChildren ? expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} /> : null}
         </button>
+        {node.selectable ? (
+          <input
+            className="model-tree-checkbox"
+            type="checkbox"
+            checked={selected}
+            onChange={() => onToggleSelection(node)}
+            onClick={(event) => event.stopPropagation()}
+            aria-label={`${node.label || node.id} 선택`}
+          />
+        ) : (
+          <span className="model-tree-checkbox-spacer" />
+        )}
         <button className="model-tree-node-content" type="button" onClick={(event) => onSelect(node, event)}>
-          <span>
+          <ModelTreeNodeIcon node={node} />
+          <span className="model-tree-node-label">
             <strong>{node.label || node.id}</strong>
             <em>{node.type}</em>
           </span>
-          {node.childCount ? <small>{node.childCount}</small> : null}
+          {objectCount ? <small title={`${objectCount.toLocaleString()}개 객체`}>{objectCount.toLocaleString()}</small> : null}
         </button>
       </div>
       {hasChildren && expanded ? (
@@ -595,12 +689,38 @@ function ModelTreeNodeItem({
               selectedTreeNodeIds={selectedTreeNodeIds}
               onSelect={onSelect}
               onToggle={onToggle}
+              onToggleSelection={onToggleSelection}
             />
           ))}
         </div>
       ) : null}
     </div>
   );
+}
+
+function ModelTreeNodeIcon({ node }: { node: ModelTreeNode }) {
+  const kind = modelTreeNodeKind(node);
+  if (kind === "project") return <FolderTree size={14} aria-hidden="true" />;
+  if (kind === "site") return <MapPin size={14} aria-hidden="true" />;
+  if (kind === "building") return <Building2 size={14} aria-hidden="true" />;
+  if (kind === "storey") return <Layers size={14} aria-hidden="true" />;
+  if (kind === "group") return <Boxes size={14} aria-hidden="true" />;
+  return <Box size={13} aria-hidden="true" />;
+}
+
+function modelTreeNodeKind(node: ModelTreeNode) {
+  if (node.syntheticGroup) return "group";
+  const type = node.type.toLowerCase();
+  if (type.includes("project")) return "project";
+  if (type.includes("site")) return "site";
+  if (type.includes("buildingstorey") || type.includes("storey")) return "storey";
+  if (type.includes("building")) return "building";
+  return "object";
+}
+
+function getModelTreeNodeObjectCount(node: ModelTreeNode) {
+  if (node.children.length === 0) return 0;
+  return new Set(node.objectIds ?? []).size || node.childCount;
 }
 
 function filterModelTree(nodes: ModelTreeNode[], search: string) {
@@ -628,13 +748,34 @@ function getDefaultExpandedTreeIds(nodes: ModelTreeNode[], depth = 0): string[] 
   return ids;
 }
 
-function findModelTreeNodeById(nodes: ModelTreeNode[], nodeId: string): ModelTreeNode | null {
-  for (const node of nodes) {
-    if (node.id === nodeId) return node;
-    const child = findModelTreeNodeById(node.children, nodeId);
-    if (child) return child;
+function buildModelTreeNodeIndex(nodes: ModelTreeNode[]) {
+  const index = new Map<string, ModelTreeNode>();
+  const visit = (node: ModelTreeNode) => {
+    index.set(node.id, node);
+    node.children.forEach(visit);
+  };
+  nodes.forEach(visit);
+  return index;
+}
+
+function buildModelTreeParentIndex(nodes: ModelTreeNode[]) {
+  const parents = new Map<string, string>();
+  const visit = (node: ModelTreeNode, parentId?: string) => {
+    if (parentId) parents.set(node.id, parentId);
+    node.children.forEach((child) => visit(child, node.id));
+  };
+  nodes.forEach((node) => visit(node));
+  return parents;
+}
+
+function expandTreeAncestors(current: Set<string>, nodeId: string, parents: Map<string, string>) {
+  const next = new Set(current);
+  let parentId = parents.get(nodeId);
+  while (parentId) {
+    next.add(parentId);
+    parentId = parents.get(parentId);
   }
-  return null;
+  return next;
 }
 
 function getUniqueObjectIdsForNodes(nodes: ModelTreeNode[]) {
@@ -813,6 +954,7 @@ function ModelViewerCanvas({
   onObjectPick: (objectId: string, picked?: Record<string, unknown>) => void;
 }) {
   const canvasIdRef = useRef(`xeokit-canvas-${Math.random().toString(36).slice(2)}`);
+  const canvasElementRef = useRef<HTMLCanvasElement | null>(null);
   const viewerRef = useRef<any>(null);
   const modelRef = useRef<any>(null);
   const xeokitRef = useRef<any>(null);
@@ -822,18 +964,32 @@ function ModelViewerCanvas({
   const distanceControlRef = useRef<any>(null);
 
   useEffect(() => {
+    const canvas = canvasElementRef.current;
+    if (!canvas || typeof ResizeObserver === "undefined") return;
+    let frame = 0;
+    const observer = new ResizeObserver(() => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        window.dispatchEvent(new Event("resize"));
+        viewerRef.current?.scene?.render?.(true);
+      });
+    });
+    observer.observe(canvas);
+    return () => {
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
     async function boot() {
       if (!manifest?.xktUrl) return;
       onViewerError("");
       const xeokit = await import("@xeokit/xeokit-sdk");
       if (cancelled) return;
-      const assetResponse = await fetch(manifest.xktUrl, {
-        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
-      });
-      if (!assetResponse.ok) {
-        throw new Error(await assetResponse.text());
-      }
+      const assetResponse = await request(manifest.xktUrl, { token: authToken, signal: controller.signal });
       const xktData = await assetResponse.arrayBuffer();
       if (cancelled) return;
       xeokitRef.current = xeokit;
@@ -917,12 +1073,14 @@ function ModelViewerCanvas({
       viewerRef.current = viewer;
     }
     boot().catch((error) => {
+      if (controller.signal.aborted || isAbortError(error)) return;
       console.error("[model-explorer] XKT boot failed", error);
       onViewerError(`XKT 파일을 불러오지 못했습니다. ${error instanceof Error ? error.message : String(error)}`);
       onModelTreeLoaded([]);
     });
     return () => {
       cancelled = true;
+      controller.abort();
       viewerRef.current?.destroy?.();
       viewerRef.current = null;
       modelRef.current = null;
@@ -1014,7 +1172,7 @@ function ModelViewerCanvas({
     );
   }
 
-  return <canvas id={canvasIdRef.current} className="model-xeokit-canvas" />;
+  return <canvas ref={canvasElementRef} id={canvasIdRef.current} className="model-xeokit-canvas" />;
 }
 
 function configureViewer(viewer: any, xeokit: any) {
@@ -1474,31 +1632,180 @@ function ModelPropertiesPanel({
   object: SelectedObject;
   onClose: () => void;
 }) {
-  const properties = object.properties ?? {};
-  const rows = Object.entries(properties).filter(([, value]) => value != null && value !== "");
+  const [propertySearch, setPropertySearch] = useState("");
+  const groups = useMemo(() => groupModelProperties(object.properties ?? {}), [object.properties]);
+  const query = propertySearch.trim().toLowerCase();
+  const visibleGroups = useMemo(
+    () =>
+      groups
+        .map((group) => ({
+          ...group,
+          entries: group.entries.filter(
+            (entry) =>
+              !query ||
+              group.label.toLowerCase().includes(query) ||
+              entry.key.toLowerCase().includes(query) ||
+              entry.label.toLowerCase().includes(query) ||
+              displayValue(entry.value).toLowerCase().includes(query),
+          ),
+        }))
+        .filter((group) => group.entries.length),
+    [groups, query],
+  );
+  const propertyCount = groups.reduce((total, group) => total + group.entries.length, 0);
   return (
-    <aside className="model-properties-panel">
-      <div className="panel-header slim">
-        <div>
-          <h2>객체 특성</h2>
-          <span>{object.type ?? "Object"}</span>
+    <aside className="model-properties-panel" aria-label="객체 특성">
+      <div className="model-properties-header">
+        <div className="model-properties-title">
+          <span className="model-properties-type"><Box size={13} />{object.type ?? "Object"}</span>
+          <h2>{object.label || object.objectId}</h2>
+          <span className="model-properties-id" title={object.objectId}>{object.objectId}</span>
         </div>
-        <button className="icon-only-button" type="button" onClick={onClose} aria-label="객체 특성 닫기">
-          <X size={16} />
-        </button>
+        <div className="model-properties-actions">
+          <button
+            className="icon-only-button"
+            type="button"
+            onClick={() => void navigator.clipboard?.writeText(object.objectId)}
+            aria-label="객체 ID 복사"
+            title="객체 ID 복사"
+          >
+            <Copy size={15} />
+          </button>
+          <button className="icon-only-button" type="button" onClick={onClose} aria-label="객체 특성 닫기" title="닫기">
+            <X size={16} />
+          </button>
+        </div>
       </div>
-      <div className="model-property-hero">
-        <strong>{object.label || object.objectId}</strong>
-        <span>{object.objectId}</span>
-      </div>
-      <dl className="model-property-list">
-        {rows.map(([key, value]) => (
-          <div className="model-property-row" key={key}>
-            <dt>{key}</dt>
-            <dd>{displayValue(value)}</dd>
-          </div>
-        ))}
+
+      <dl className="model-properties-summary">
+        <div><dt>분류</dt><dd>{friendlyIfcCategory(object.type ?? "Object")}</dd></div>
+        <div><dt>소스</dt><dd>{object.source ?? "IFC model"}</dd></div>
+        <div><dt>속성</dt><dd>{propertyCount.toLocaleString()}개</dd></div>
       </dl>
+
+      <label className="model-property-search">
+        <Search size={15} />
+        <input
+          value={propertySearch}
+          placeholder="속성 이름 또는 값 검색"
+          onChange={(event) => setPropertySearch(event.target.value)}
+        />
+        {propertySearch ? (
+          <button type="button" onClick={() => setPropertySearch("")} aria-label="속성 검색어 지우기" title="검색어 지우기">
+            <X size={13} />
+          </button>
+        ) : null}
+      </label>
+
+      <div className="model-property-groups">
+        {visibleGroups.length ? visibleGroups.map((group) => (
+          <details className="model-property-group" key={group.id} open>
+            <summary>
+              <span>{group.label}</span>
+              <small>{group.entries.length}</small>
+              <ChevronDown size={14} />
+            </summary>
+            <dl className="model-property-list">
+              {group.entries.map((entry) => (
+                <div className="model-property-row" key={entry.key}>
+                  <dt title={entry.key}>{entry.label}</dt>
+                  <dd title={displayValue(entry.value)}><ModelPropertyValue value={entry.value} /></dd>
+                  <button
+                    type="button"
+                    onClick={() => void navigator.clipboard?.writeText(displayValue(entry.value))}
+                    aria-label={`${entry.label} 값 복사`}
+                    title="값 복사"
+                  >
+                    <Copy size={12} />
+                  </button>
+                </div>
+              ))}
+            </dl>
+          </details>
+        )) : (
+          <div className="model-property-empty">
+            <Search size={18} />
+            <strong>일치하는 속성이 없습니다.</strong>
+          </div>
+        )}
+      </div>
     </aside>
   );
+}
+
+type ModelPropertyEntry = { key: string; label: string; value: unknown };
+type ModelPropertyGroup = { id: string; label: string; entries: ModelPropertyEntry[] };
+
+function groupModelProperties(properties: Record<string, unknown>): ModelPropertyGroup[] {
+  const groups = new Map<string, ModelPropertyGroup>();
+  const ensureGroup = (id: string, label: string) => {
+    const current = groups.get(id) ?? { id, label, entries: [] };
+    groups.set(id, current);
+    return current;
+  };
+
+  Object.entries(properties).forEach(([key, value]) => {
+    if (value == null || value === "" || ["id", "name", "type"].includes(key)) return;
+    let groupId = "general";
+    let groupLabel = "기타 속성";
+    let propertyLabel = humanizePropertyKey(key);
+
+    if (["originalSystemId", "childCount", "objectCount"].includes(key)) {
+      groupId = "identity";
+      groupLabel = "기본 정보";
+    } else if (key.startsWith("external.")) {
+      groupId = "external";
+      groupLabel = "외부 데이터";
+      propertyLabel = humanizePropertyKey(key.slice("external.".length));
+    } else if (key.includes(" - ")) {
+      const separator = key.indexOf(" - ");
+      const rawGroup = key.slice(0, separator);
+      const rawProperty = key.slice(separator + 3);
+      groupId = `set:${rawGroup}`;
+      groupLabel = humanizePropertyGroup(rawGroup);
+      propertyLabel = humanizePropertyKey(rawProperty);
+    }
+
+    ensureGroup(groupId, groupLabel).entries.push({ key, label: propertyLabel, value });
+  });
+
+  const priority = new Map([["identity", 0], ["external", 90], ["general", 100]]);
+  return [...groups.values()].sort(
+    (left, right) => (priority.get(left.id) ?? 10) - (priority.get(right.id) ?? 10) || left.label.localeCompare(right.label),
+  );
+}
+
+function humanizePropertyGroup(value: string) {
+  const aliases: Record<string, string> = {
+    ProfileProperties: "프로파일",
+    BaseQuantities: "기본 수량",
+  };
+  if (aliases[value]) return aliases[value];
+  return value
+    .replace(/^Pset_/, "")
+    .replace(/Properties$/, "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/_/g, " ")
+    .trim();
+}
+
+function humanizePropertyKey(value: string) {
+  const aliases: Record<string, string> = {
+    originalSystemId: "원본 시스템 ID",
+    childCount: "하위 항목 수",
+    objectCount: "객체 수",
+  };
+  return aliases[value] ?? value.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/_/g, " ");
+}
+
+function ModelPropertyValue({ value }: { value: unknown }) {
+  if (typeof value === "boolean") {
+    return (
+      <span className={value ? "model-property-boolean true" : "model-property-boolean false"}>
+        {value ? <Check size={12} /> : <Minus size={12} />}
+        {value ? "예" : "아니오"}
+      </span>
+    );
+  }
+  return <>{displayValue(value)}</>;
 }
