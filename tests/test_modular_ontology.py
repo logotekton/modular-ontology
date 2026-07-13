@@ -1761,7 +1761,7 @@ def test_mcp_user_token_regeneration_revokes_previous_token(tmp_path) -> None:
     assert [record["status"] for record in records] == ["revoked", "active"]
 
 
-def test_mcp_status_returns_user_url_when_token_drive_write_back_fails(monkeypatch) -> None:
+def test_mcp_status_rejects_user_url_when_token_sync_fails(monkeypatch) -> None:
     from modular_ontology import app as app_module
 
     user = User(
@@ -1774,7 +1774,7 @@ def test_mcp_status_returns_user_url_when_token_drive_write_back_fails(monkeypat
         status="active",
     )
 
-    monkeypatch.setattr(app_module, "current_user", lambda authorization: user)
+    monkeypatch.setattr(app_module, "get_user_by_token", lambda token: user)
     monkeypatch.setattr(
         app_module,
         "_public_mcp_remote",
@@ -1783,32 +1783,106 @@ def test_mcp_status_returns_user_url_when_token_drive_write_back_fails(monkeypat
     monkeypatch.setattr(
         app_module,
         "run_google_drive_mcp_tokens_sync",
-        lambda: {"enabled": True, "status": "error", "error": "drive download failed"},
-    )
-    monkeypatch.setattr(
-        app_module,
-        "ensure_mcp_token_for_user",
-        lambda active_user: {
-            "token": "mom_test-token",
-            "userEmail": active_user.email,
-            "userName": active_user.name,
-            "company": active_user.company,
-            "role": active_user.role,
-        },
-    )
-    monkeypatch.setattr(
-        app_module,
-        "run_google_drive_write_back",
-        lambda kind: {"enabled": True, "status": "error", "error": "drive upload failed"},
+        lambda force=False: {"enabled": True, "status": "error", "error": "drive download failed"},
     )
 
     response = client.get("/api/mcp/status", headers={"Authorization": "Bearer test-token"})
     payload = response.json()
 
+    assert response.status_code == 502
+    assert payload["detail"] == "Google Drive sync failed: drive download failed"
+
+
+def test_mcp_user_url_regenerate_rejects_unpersisted_token(monkeypatch, tmp_path) -> None:
+    from modular_ontology import app as app_module
+
+    user = User(
+        id="client-member",
+        name="Client Member",
+        email="client.member@example.com",
+        company="Client Co",
+        role="member",
+        password_hash=_hash_password("member-pass"),
+        status="active",
+    )
+    token_record = {
+        "token": "mom_test-token",
+        "userEmail": user.email,
+        "userName": user.name,
+        "company": user.company,
+        "role": user.role,
+    }
+    mtimes = iter((1, 2))
+    monkeypatch.setattr(app_module, "MCP_TOKENS_FILE", tmp_path / "mcp_tokens.json")
+    monkeypatch.setattr(app_module, "get_user_by_token", lambda token: user)
+    monkeypatch.setattr(app_module, "google_drive_sync_enabled", lambda: True)
+    monkeypatch.setattr(
+        app_module,
+        "run_google_drive_mcp_tokens_sync",
+        lambda force=False: {"enabled": True, "status": "synced"},
+    )
+    monkeypatch.setattr(app_module, "regenerate_mcp_token_for_user", lambda active_user: token_record)
+    monkeypatch.setattr(app_module, "_file_mtime_ns", lambda path: next(mtimes))
+    monkeypatch.setattr(
+        app_module,
+        "run_google_drive_write_back",
+        lambda kind: {"enabled": True, "status": "error", "error": "drive upload failed"},
+    )
+    monkeypatch.setattr(app_module, "get_mcp_token_record", lambda token: None)
+
+    response = client.post("/api/mcp/user-url/regenerate", headers={"Authorization": "Bearer test-token"})
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "MCP URL persistence failed: drive upload failed"
+
+
+def test_mcp_user_url_regenerate_returns_only_verified_token(monkeypatch, tmp_path) -> None:
+    from modular_ontology import app as app_module
+
+    user = User(
+        id="client-member",
+        name="Client Member",
+        email="client.member@example.com",
+        company="Client Co",
+        role="member",
+        password_hash=_hash_password("member-pass"),
+        status="active",
+    )
+    token_record = {
+        "token": "mom_verified-token",
+        "userEmail": user.email,
+        "userName": user.name,
+        "company": user.company,
+        "role": user.role,
+    }
+    mtimes = iter((1, 2))
+    monkeypatch.setattr(app_module, "MCP_TOKENS_FILE", tmp_path / "mcp_tokens.json")
+    monkeypatch.setattr(app_module, "get_user_by_token", lambda token: user)
+    monkeypatch.setattr(app_module, "google_drive_sync_enabled", lambda: True)
+    monkeypatch.setattr(
+        app_module,
+        "run_google_drive_mcp_tokens_sync",
+        lambda force=False: {"enabled": True, "status": "synced"},
+    )
+    monkeypatch.setattr(app_module, "regenerate_mcp_token_for_user", lambda active_user: token_record)
+    monkeypatch.setattr(app_module, "_file_mtime_ns", lambda path: next(mtimes))
+    monkeypatch.setattr(
+        app_module,
+        "run_google_drive_write_back",
+        lambda kind: {"enabled": True, "status": "written"},
+    )
+    monkeypatch.setattr(
+        app_module,
+        "get_mcp_token_record",
+        lambda token: token_record if token == token_record["token"] else None,
+    )
+
+    response = client.post("/api/mcp/user-url/regenerate", headers={"Authorization": "Bearer test-token"})
+    payload = response.json()
+
     assert response.status_code == 200
-    assert payload["remote"]["userUrl"]["publicUrl"] == "https://modular-ontology.xyz/mcp/mom_test-token"
-    assert payload["remote"]["tokenSync"]["status"] == "error"
-    assert payload["remote"]["tokenWriteBack"]["status"] == "error"
+    assert payload["remote"]["userUrl"]["publicUrl"].endswith("/mcp/mom_verified-token")
+    assert payload["remote"]["tokenWriteBack"]["verified"] is True
 
 
 def test_mcp_user_url_regenerate_requires_login() -> None:

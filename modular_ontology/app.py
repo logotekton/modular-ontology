@@ -62,7 +62,12 @@ from .google_drive_sync import (
     write_back_users_file,
 )
 from .mcp_server import TOOL_NAMES, configure_server as configure_mcp_server, mcp as remote_mcp
-from .mcp_tokens import build_user_mcp_urls, ensure_mcp_token_for_user, regenerate_mcp_token_for_user
+from .mcp_tokens import (
+    build_user_mcp_urls,
+    ensure_mcp_token_for_user,
+    get_mcp_token_record,
+    regenerate_mcp_token_for_user,
+)
 from .pack_index import PackFile, build_graph, build_multi_pack_graph, list_packs, list_projects, save_uploaded_pack, unique_pack_files
 from .project_store import (
     attach_pack_to_project,
@@ -1783,6 +1788,30 @@ def _public_mcp_remote(request: Request | None = None) -> tuple[str | None, str 
     return public_url, public_base_url
 
 
+def _persist_and_verify_mcp_token(token_record: dict[str, Any]) -> dict[str, Any]:
+    write_back = run_google_drive_write_back("mcp_tokens")
+    if not google_drive_sync_enabled():
+        return {**write_back, "verified": True}
+
+    verification_sync = run_google_drive_mcp_tokens_sync(force=True)
+    persisted_record = get_mcp_token_record(str(token_record.get("token") or ""))
+    sync_verified = verification_sync.get("status") in {"synced", "cached"}
+    if not sync_verified or not persisted_record:
+        if not sync_verified:
+            MCP_TOKENS_FILE.unlink(missing_ok=True)
+        reason = (
+            write_back.get("error")
+            or verification_sync.get("error")
+            or "the issued token was not found after central-store verification"
+        )
+        raise HTTPException(status_code=502, detail=f"MCP URL persistence failed: {reason}")
+    return {
+        **write_back,
+        "verified": True,
+        "verificationSyncStatus": verification_sync.get("status"),
+    }
+
+
 def _mcp_status_payload(request: Request, authorization: str | None, *, regenerate_user_token: bool = False) -> dict[str, Any]:
     public_url, public_base_url = _public_mcp_remote(request)
     user_url: dict[str, Any] | None = None
@@ -1799,6 +1828,7 @@ def _mcp_status_payload(request: Request, authorization: str | None, *, regenera
         raise HTTPException(status_code=401, detail="Login is required to regenerate an MCP URL.")
     if user and user.status == "active":
         token_sync = run_google_drive_mcp_tokens_sync(force=regenerate_user_token or not MCP_TOKENS_FILE.exists())
+        require_google_drive_sync(token_sync)
         token_file_mtime = _file_mtime_ns(MCP_TOKENS_FILE)
         token_record = regenerate_mcp_token_for_user(user) if regenerate_user_token else ensure_mcp_token_for_user(user)
         token_file_changed = token_file_mtime != _file_mtime_ns(MCP_TOKENS_FILE)
@@ -1812,7 +1842,7 @@ def _mcp_status_payload(request: Request, authorization: str | None, *, regenera
             "role": token_record["role"],
         }
         if token_file_changed:
-            token_write_back = run_google_drive_write_back("mcp_tokens")
+            token_write_back = _persist_and_verify_mcp_token(token_record)
     return {
         "status": "ready",
         "server": "python -m modular_ontology.mcp_server",
