@@ -370,7 +370,7 @@ export function ModelExplorerView({
   }
 
   return (
-    <section className={selectedObject ? "model-explorer-grid with-properties" : "model-explorer-grid"}>
+    <section className="model-explorer-grid">
       <aside className="model-tree-panel">
         <div className="panel-header slim">
           <div>
@@ -599,19 +599,19 @@ export function ModelExplorerView({
             <ModelProjectEmptyState projectName={project?.name} />
           )}
           {visibleModels.length && viewerIsLoading ? <ModelViewerLoading stage={viewerLoadStage} /> : null}
+          {selectedObject ? (
+            <ModelPropertiesPanel
+              object={selectedObject}
+              onClose={() => {
+                handleObjectClear();
+                issueViewerCommand("clearSelection");
+              }}
+            />
+          ) : null}
         </div>
 
         {manifestError || viewerError ? <p className="model-viewer-error">{manifestError || viewerError}</p> : null}
       </div>
-      {selectedObject ? (
-        <ModelPropertiesPanel
-          object={selectedObject}
-          onClose={() => {
-            handleObjectClear();
-            issueViewerCommand("clearSelection");
-          }}
-        />
-      ) : null}
     </section>
   );
 }
@@ -1712,7 +1712,7 @@ function ModelPropertiesPanel({
   );
   const propertyCount = groups.reduce((total, group) => total + group.entries.length, 0);
   return (
-    <aside className="model-properties-panel" aria-label="객체 특성">
+    <aside className="model-properties-panel" role="dialog" aria-modal="false" aria-label="객체 특성">
       <div className="model-properties-header">
         <div className="model-properties-title">
           <span className="model-properties-type"><Box size={13} />{object.type ?? "Object"}</span>
