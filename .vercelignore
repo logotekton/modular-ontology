@@ -9,6 +9,7 @@ test/
 *.sqlite3-*
 *.db
 *.zip
+!canonical_packs/**/*.zip
 *.ifc
 *.ifczip
 *.xkt

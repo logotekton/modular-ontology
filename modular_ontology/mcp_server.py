@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import json
 import re
 import zipfile
@@ -10,7 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .auth import get_company_project_access
-from .config import env
+from .config import ROOT, env
 from .mcp_tokens import get_mcp_token_record
 from .pack_index import (
     build_graph as read_graph,
@@ -36,6 +35,26 @@ from .pack_index import (
     score_terms,
 )
 from .qa import answer_pack_question
+from . import query_primitives
+from .project_query import ProjectQueryError, execute_structured_project_query
+from .query_contract import (
+    ContractIssue,
+    PLAN_BUNDLE_FIELDS,
+    PLAN_FIELDS,
+    PlanBundleContractError,
+    QueryContractError,
+    validate_plan_bundle,
+    validate_query_plan,
+)
+from .query_engine import QueryBundleResult, QueryExecutionError, execute_query_bundle
+from .snapshot_store import (
+    ProjectSnapshot,
+    SnapshotManifestError,
+    SnapshotVerification,
+    SnapshotVerificationError,
+    load_snapshot,
+    verify_snapshot,
+)
 from .source_anchor import anchors_from_chunk, coverage as source_anchor_coverage
 from .store import connect as connect_index_db, init_db as init_index_db, search_documents as search_indexed_documents
 
@@ -102,6 +121,10 @@ TOOL_ALIASES = {
 TOOL_MANIFEST = [
     {"name": "mo_server_status", "legacy": ["copycrab_status"], "domain": "server", "action": "status"},
     {"name": "mo_tool_manifest", "legacy": [], "domain": "tool", "action": "manifest"},
+    {"name": "mo_snapshot_list", "legacy": [], "domain": "snapshot", "action": "list"},
+    {"name": "mo_snapshot_status", "legacy": [], "domain": "snapshot", "action": "status"},
+    {"name": "mo_snapshot_query", "legacy": [], "domain": "snapshot", "action": "query"},
+    {"name": "mo_snapshot_bundle_query", "legacy": [], "domain": "snapshot_bundle", "action": "query"},
     {"name": "mo_ontology_manifest", "legacy": [], "domain": "ontology", "action": "manifest"},
     {"name": "mo_project_list", "legacy": ["list_projects"], "domain": "project", "action": "list"},
     {"name": "mo_project_overview", "legacy": [], "domain": "project", "action": "overview"},
@@ -336,6 +359,331 @@ def _filter_sources(payload: dict) -> dict:
     return {**payload, "count": len(filtered_sources), "sources": filtered_sources}
 
 
+class CanonicalSnapshotToolError(RuntimeError):
+    """Fail-closed error raised before a canonical snapshot result is exposed."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
+_SHA256_HEX_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def _is_sha256_hex(value: object) -> bool:
+    return isinstance(value, str) and _SHA256_HEX_PATTERN.fullmatch(value) is not None
+
+
+def _canonical_snapshot_root() -> Path:
+    configured = env("MODULAR_ONTOLOGY_SNAPSHOT_DIR")
+    return Path(configured or ROOT / "snapshots").expanduser().resolve()
+
+
+def _canonical_snapshot_manifests() -> list[tuple[str, Path, dict]]:
+    root = _canonical_snapshot_root()
+    if not root.is_dir():
+        raise CanonicalSnapshotToolError(
+            "snapshot_store_unavailable",
+            "Canonical snapshot directory is unavailable.",
+        )
+
+    manifests: list[tuple[str, Path, dict]] = []
+    seen: set[str] = set()
+    for path in sorted(root.glob("*.json"), key=lambda item: item.name.casefold()):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CanonicalSnapshotToolError(
+                "snapshot_manifest_invalid",
+                f"Cannot read canonical snapshot manifest {path.name}: {exc}",
+            ) from exc
+        if not isinstance(payload, dict):
+            raise CanonicalSnapshotToolError(
+                "snapshot_manifest_invalid",
+                f"Canonical snapshot manifest {path.name} must be a JSON object.",
+            )
+        canonical_id = str(payload.get("canonical_id") or "").strip()
+        if not canonical_id:
+            raise CanonicalSnapshotToolError(
+                "snapshot_manifest_invalid",
+                f"Canonical snapshot manifest {path.name} has no canonical_id.",
+            )
+        if canonical_id in seen:
+            raise CanonicalSnapshotToolError(
+                "snapshot_id_ambiguous",
+                f"Canonical snapshot id is declared more than once: {canonical_id}",
+            )
+        seen.add(canonical_id)
+        manifests.append((canonical_id, path, payload))
+    return manifests
+
+
+def _canonical_snapshot_manifest(canonical_id: str) -> tuple[Path, dict]:
+    requested = canonical_id.strip()
+    if not requested:
+        raise CanonicalSnapshotToolError("snapshot_id_required", "canonical_id is required.")
+    for current_id, path, payload in _canonical_snapshot_manifests():
+        if current_id == requested:
+            return path, payload
+    raise CanonicalSnapshotToolError(
+        "snapshot_not_found",
+        f"Canonical snapshot is not available: {requested}",
+    )
+
+
+def _load_canonical_snapshot(canonical_id: str) -> tuple[dict, ProjectSnapshot]:
+    path, manifest = _canonical_snapshot_manifest(canonical_id)
+    snapshot = load_snapshot(path)
+    source_composite = str(manifest.get("source_composite_sha256") or "").strip().lower()
+    if not source_composite or snapshot.source_signature != f"sha256:{source_composite}":
+        raise CanonicalSnapshotToolError(
+            "snapshot_source_signature_mismatch",
+            "Canonical snapshot source signature is not bound to its composite SHA-256.",
+        )
+    return manifest, snapshot
+
+
+def _snapshot_is_visible(snapshot: ProjectSnapshot) -> bool:
+    if not _mcp_authorized():
+        return False
+    if _is_internal_company(_mcp_company()):
+        return True
+    required_pack_ids = {pack.pack_id for pack in snapshot.packs if pack.included}
+    return required_pack_ids.issubset(_visible_pack_ids())
+
+
+def _require_snapshot_access(snapshot: ProjectSnapshot) -> None:
+    if not _mcp_authorized():
+        raise CanonicalSnapshotToolError("unauthorized", "Invalid MCP user URL token.")
+    if not _snapshot_is_visible(snapshot):
+        raise CanonicalSnapshotToolError(
+            "forbidden",
+            "Canonical snapshot is outside the current MCP company scope.",
+        )
+
+
+def _snapshot_summary(manifest: dict, snapshot: ProjectSnapshot) -> dict:
+    included = [pack for pack in snapshot.packs if pack.included]
+    return {
+        "canonical_id": str(manifest["canonical_id"]),
+        "project_id": snapshot.project_id,
+        "internal_snapshot_id": snapshot.snapshot_id,
+        "internal_snapshot_hash": snapshot.snapshot_hash,
+        "source_signature": snapshot.source_signature,
+        "source_composite_sha256": str(manifest["source_composite_sha256"]),
+        "pack_count": len(snapshot.packs),
+        "included_pack_count": len(included),
+    }
+
+
+def _snapshot_verification_payload(verification: SnapshotVerification) -> dict:
+    return {
+        "valid": verification.valid,
+        "checked_pack_count": len(verification.checked_pack_ids),
+        "issues": [
+            {"code": issue.code, "message": issue.message, "pack_id": issue.pack_id}
+            for issue in verification.issues
+        ],
+        "warnings": [
+            {"code": issue.code, "message": issue.message, "pack_id": issue.pack_id}
+            for issue in verification.warnings
+        ],
+    }
+
+
+def _verify_canonical_snapshot(snapshot: ProjectSnapshot) -> SnapshotVerification:
+    verification = verify_snapshot(snapshot)
+    verification.require_valid()
+    included_count = sum(pack.included for pack in snapshot.packs)
+    if len(verification.checked_pack_ids) != included_count:
+        raise CanonicalSnapshotToolError(
+            "snapshot_verification_incomplete",
+            "Snapshot verification did not check every included pack.",
+        )
+    return verification
+
+
+def _exact_snapshot_query_plan(plan: dict) -> dict:
+    validated = validate_query_plan(plan)
+    actual_fields = {str(field) for field in plan}
+    if actual_fields != PLAN_FIELDS:
+        missing = sorted(PLAN_FIELDS - actual_fields)
+        extra = sorted(actual_fields - PLAN_FIELDS)
+        raise QueryContractError(
+            [
+                ContractIssue(
+                    "field_set_mismatch",
+                    "$",
+                    f"plan must contain exactly the seven fields; missing={missing}, extra={extra}",
+                )
+            ]
+        )
+    return validated.as_dict()
+
+
+def _exact_snapshot_query_bundle(bundle: dict) -> dict:
+    validated = validate_plan_bundle(bundle)
+    actual_fields = {str(field) for field in bundle}
+    if actual_fields != PLAN_BUNDLE_FIELDS:
+        missing = sorted(PLAN_BUNDLE_FIELDS - actual_fields)
+        extra = sorted(actual_fields - PLAN_BUNDLE_FIELDS)
+        raise PlanBundleContractError(
+            [
+                ContractIssue(
+                    "field_set_mismatch",
+                    "$",
+                    f"bundle must contain exactly project_id, plans, and reducers; missing={missing}, extra={extra}",
+                )
+            ]
+        )
+    return validated.as_dict()
+
+
+def _snapshot_bundle_bindings(
+    manifest: dict,
+    snapshot: ProjectSnapshot,
+    result: QueryBundleResult,
+) -> dict:
+    """Validate and expose immutable snapshot/query/result/source-pack bindings."""
+
+    if not result.complete or result.snapshot_id != snapshot.snapshot_id:
+        raise CanonicalSnapshotToolError(
+            "snapshot_binding_failed",
+            "Bundle result is not completely bound to the requested canonical snapshot.",
+        )
+    if (
+        result.bundle_hash != result.query_hash
+        or not _is_sha256_hex(result.bundle_hash)
+        or not _is_sha256_hex(result.query_hash)
+    ):
+        raise CanonicalSnapshotToolError(
+            "query_binding_failed",
+            "Bundle hash and query hash must match and be 64-digit SHA-256 hex values.",
+        )
+
+    evidence = result.evidence
+    if (
+        evidence.get("snapshot_id") != snapshot.snapshot_id
+        or evidence.get("bundle_hash") != result.bundle_hash
+        or evidence.get("query_hash") != result.query_hash
+        or evidence.get("result_hash") != result.result_hash
+        or not _is_sha256_hex(result.result_hash)
+    ):
+        raise CanonicalSnapshotToolError(
+            "result_binding_failed",
+            "Bundle evidence hashes do not match the completed result.",
+        )
+
+    expected_packs = {
+        pack.pack_id: pack.sha256.casefold()
+        for pack in snapshot.packs
+        if pack.included
+    }
+    raw_plan_bindings = evidence.get("plan_bindings")
+    if not isinstance(raw_plan_bindings, dict):
+        raise CanonicalSnapshotToolError(
+            "subplan_binding_failed",
+            "Bundle evidence has no subplan bindings.",
+        )
+
+    subplans: dict[str, dict] = {}
+    if set(raw_plan_bindings) != set(result.plan_results):
+        raise CanonicalSnapshotToolError(
+            "subplan_binding_failed",
+            "Bundle evidence does not cover exactly the completed subplans.",
+        )
+    for plan_id, plan_result in sorted(result.plan_results.items()):
+        raw_binding = raw_plan_bindings.get(plan_id)
+        if not isinstance(raw_binding, dict):
+            raise CanonicalSnapshotToolError(
+                "subplan_binding_failed",
+                f"Subplan {plan_id!r} has no hash binding.",
+            )
+        source_packs = [dict(pack) for pack in plan_result.source_packs]
+        if (
+            not plan_result.complete
+            or plan_result.snapshot_id != snapshot.snapshot_id
+            or plan_result.evidence.get("snapshot_id") != snapshot.snapshot_id
+            or plan_result.evidence.get("query_hash") != plan_result.query_hash
+            or plan_result.evidence.get("result_hash") != plan_result.result_hash
+            or raw_binding.get("query_hash") != plan_result.query_hash
+            or raw_binding.get("result_hash") != plan_result.result_hash
+            or raw_binding.get("source_packs") != source_packs
+            or not _is_sha256_hex(plan_result.query_hash)
+            or not _is_sha256_hex(plan_result.result_hash)
+        ):
+            raise CanonicalSnapshotToolError(
+                "subplan_binding_failed",
+                f"Subplan {plan_id!r} hashes are not internally consistent.",
+            )
+        if not source_packs:
+            raise CanonicalSnapshotToolError(
+                "subplan_binding_failed",
+                f"Subplan {plan_id!r} has no source-pack SHA binding.",
+            )
+        for source_pack in source_packs:
+            pack_id = str(source_pack.get("pack_id") or "")
+            source_sha = str(source_pack.get("sha256") or "").casefold()
+            if not pack_id or expected_packs.get(pack_id) != source_sha:
+                raise CanonicalSnapshotToolError(
+                    "subplan_binding_failed",
+                    f"Subplan {plan_id!r} source pack {pack_id!r} is outside "
+                    "the canonical snapshot or has a stale SHA-256.",
+                )
+        subplans[plan_id] = {
+            "snapshot_id": plan_result.snapshot_id,
+            "query_hash": plan_result.query_hash,
+            "result_hash": plan_result.result_hash,
+            "source_packs": source_packs,
+        }
+
+    return {
+        "snapshot": {
+            "canonical_id": str(manifest["canonical_id"]),
+            "internal_snapshot_id": snapshot.snapshot_id,
+            "internal_snapshot_hash": snapshot.snapshot_hash,
+            "source_signature": snapshot.source_signature,
+            "source_composite_sha256": str(manifest["source_composite_sha256"]),
+        },
+        "query": {
+            "bundle_hash": result.bundle_hash,
+            "query_hash": result.query_hash,
+        },
+        "result": {"result_hash": result.result_hash},
+        "subplans": subplans,
+    }
+
+
+def _snapshot_error_payload(exc: Exception, *, canonical_id: str | None = None) -> dict:
+    if isinstance(exc, PlanBundleContractError):
+        error = {"code": "invalid_plan_bundle", "detail": str(exc), "issues": exc.as_dict()["issues"]}
+    elif isinstance(exc, QueryContractError):
+        error = {"code": "invalid_query_plan", "detail": str(exc), "issues": exc.as_dict()["issues"]}
+    elif isinstance(exc, SnapshotVerificationError):
+        error = {
+            "code": "snapshot_verification_failed",
+            "detail": str(exc),
+            "verification": _snapshot_verification_payload(exc.result),
+        }
+    elif isinstance(exc, CanonicalSnapshotToolError):
+        error = {"code": exc.code, "detail": exc.detail}
+    elif isinstance(exc, SnapshotManifestError):
+        error = {"code": "snapshot_manifest_invalid", "detail": str(exc)}
+    elif isinstance(exc, ProjectQueryError):
+        error = {"code": "snapshot_query_rejected", "detail": str(exc)}
+    elif isinstance(exc, QueryExecutionError):
+        error = {"code": "snapshot_bundle_query_rejected", "detail": str(exc)}
+    elif isinstance(exc, OSError):
+        error = {"code": "snapshot_io_error", "detail": str(exc)}
+    else:
+        error = {"code": "snapshot_operation_failed", "detail": str(exc)}
+    payload: dict[str, object] = {"status": "error", "error": error}
+    if canonical_id is not None:
+        payload["canonical_id"] = canonical_id
+    return payload
+
+
 def _tool_manifest_payload() -> dict:
     return {
         "naming": {
@@ -348,6 +696,12 @@ def _tool_manifest_payload() -> dict:
             "primaryUnit": "project",
             "guidance": "Start with project tools. Use pack tools only when the user explicitly wants to inspect a specific pack.",
             "recommendedStart": ["mo_project_list", "mo_project_pack_list", "mo_project_overview", "mo_project_search"],
+            "canonicalSnapshotTools": [
+                "mo_snapshot_list",
+                "mo_snapshot_status",
+                "mo_snapshot_query",
+                "mo_snapshot_bundle_query",
+            ],
             "packLevelTools": ["mo_pack_overview", "mo_pack_schema", "mo_document_list", "mo_document_read"],
         },
         "tools": TOOL_MANIFEST,
@@ -501,243 +855,73 @@ def _not_found_payload(kind: str, identifier: str) -> str:
     )
 
 
-_MISSING = object()
-_HEAVY_FIELDS = {
-    "bim_references",
-    "content",
-    "embedding",
-    "formula",
-    "formula_details",
-    "formula_source",
-    "raw",
-    "raw_json",
-    "raw_text",
-    "source_text",
-}
-_DEFAULT_NODE_FIELDS = [
-    "id",
-    "label",
-    "type",
-    "module_id",
-    "module_type",
-    "workset_name",
-    "category",
-    "class",
-    "family_name",
-    "family_and_type",
-    "type_name",
-    "work_category",
-    "item_name",
-    "specification",
-    "quantity",
-    "unit",
-    "normalized_unit",
-    "source_sheet",
-    "source_row",
-    "source_element_id",
-    "ifc_guid",
-]
+_MISSING = query_primitives.MISSING
+_DEFAULT_NODE_FIELDS = query_primitives.DEFAULT_NODE_FIELDS
 _MODULE_PATTERN = re.compile(r"^[0-9]+-[0-9]{2}-(A|ST|L|G|O)$")
 
 
 def _normalize_tool_dict(value: dict | None) -> dict:
-    return value if isinstance(value, dict) else {}
+    return query_primitives.normalize_dict(value)
 
 
 def _normalize_tool_list(value: Sequence | None) -> list:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [item.strip() for item in value.split(",") if item.strip()]
-    return list(value)
+    return query_primitives.normalize_list(value)
 
 
 def _node_field(node: dict, field: str) -> object:
-    if field in node:
-        return node.get(field)
-    properties = node.get("properties")
-    if not isinstance(properties, dict):
-        return _MISSING
-    if field.startswith("properties."):
-        field = field.split(".", 1)[1]
-    current: object = properties
-    for part in field.split("."):
-        if isinstance(current, dict) and part in current:
-            current = current[part]
-        else:
-            return _MISSING
-    return current
+    return query_primitives.node_field(node, field)
 
 
 def _node_has_field(node: dict, field: str) -> bool:
-    return _node_field(node, field) is not _MISSING
+    return query_primitives.node_has_field(node, field)
 
 
 def _is_heavy_field(field: str) -> bool:
-    normalized = field.split(".", 1)[-1]
-    return normalized in _HEAVY_FIELDS
+    return query_primitives.is_heavy_field(field)
 
 
 def _to_number(value: object) -> float | None:
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, int | float):
-        return float(value)
-    text = str(value).strip()
-    if not text:
-        return None
-    text = text.replace(",", "")
-    match = re.search(r"-?\d+(?:\.\d+)?", text)
-    if not match:
-        return None
-    try:
-        return float(match.group(0))
-    except ValueError:
-        return None
+    return query_primitives.to_number(value)
 
 
 def _loose_equal(left: object, right: object) -> bool:
-    left_number = _to_number(left)
-    right_number = _to_number(right)
-    if left_number is not None and right_number is not None:
-        return left_number == right_number
-    return left == right or str(left) == str(right)
+    return query_primitives.loose_equal(left, right)
 
 
 def _match_one(value: object, operator: str, expected: object, *, exists: bool) -> bool:
-    if operator == "exists":
-        return exists if bool(expected) else not exists
-    if not exists:
-        return operator == "ne" and expected is not None
-    if operator == "eq":
-        return _loose_equal(value, expected)
-    if operator == "ne":
-        return not _loose_equal(value, expected)
-    if operator == "in":
-        return any(_loose_equal(value, item) for item in _normalize_tool_list(expected if isinstance(expected, Sequence) and not isinstance(expected, str) else [expected]))
-    if operator == "not_in":
-        return not any(_loose_equal(value, item) for item in _normalize_tool_list(expected if isinstance(expected, Sequence) and not isinstance(expected, str) else [expected]))
-    if operator == "contains":
-        return str(expected).casefold() in str(value).casefold()
-    if operator == "startswith":
-        return str(value).casefold().startswith(str(expected).casefold())
-    if operator == "endswith":
-        return str(value).casefold().endswith(str(expected).casefold())
-    if operator == "regex":
-        try:
-            return bool(re.search(str(expected), str(value)))
-        except re.error:
-            return False
-    if operator in {"gt", "gte", "lt", "lte"}:
-        left_number = _to_number(value)
-        right_number = _to_number(expected)
-        if left_number is None or right_number is None:
-            return False
-        if operator == "gt":
-            return left_number > right_number
-        if operator == "gte":
-            return left_number >= right_number
-        if operator == "lt":
-            return left_number < right_number
-        return left_number <= right_number
-    if operator == "wildcard":
-        return fnmatch.fnmatchcase(str(value), str(expected))
-    return False
+    return query_primitives.match_one(value, operator, expected, exists=exists)
 
 
 def _matches_where(node: dict, where: dict | None) -> bool:
-    for field, condition in _normalize_tool_dict(where).items():
-        value = _node_field(node, str(field))
-        exists = value is not _MISSING
-        if isinstance(condition, dict):
-            if not condition:
-                continue
-            if not all(_match_one(value, str(operator), expected, exists=exists) for operator, expected in condition.items()):
-                return False
-        elif not _match_one(value, "eq", condition, exists=exists):
-            return False
-    return True
+    return query_primitives.matches_where(node, where)
 
 
 def _natural_key(value: object) -> tuple:
-    if value is None or value is _MISSING:
-        return (1, "")
-    parts = re.split(r"(\d+)", str(value))
-    key: list[tuple[int, object]] = []
-    for part in parts:
-        if not part:
-            continue
-        if part.isdigit():
-            key.append((0, int(part)))
-        else:
-            key.append((1, part.casefold()))
-    return (0, tuple(key))
+    return query_primitives.natural_key(value)
 
 
 def _hashable_value(value: object) -> object:
-    if value is _MISSING:
-        return None
-    if isinstance(value, list | dict):
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
-    return value
+    return query_primitives.hashable_value(value)
 
 
 def _sort_value_key(value: object) -> tuple:
-    if value is None or value is _MISSING:
-        return (1, 0, "")
-    number = _to_number(value)
-    if number is not None:
-        return (0, 0, number)
-    return (0, 1, str(value).casefold())
+    return query_primitives.sort_value_key(value)
 
 
 def _sort_rows(rows: list[dict], order_by: Sequence | None) -> list[dict]:
-    specs = _normalize_tool_list(order_by)
-    if not specs:
-        return rows
-    ordered = list(rows)
-    for raw_spec in reversed(specs):
-        if isinstance(raw_spec, str):
-            spec = {"field": raw_spec}
-        elif isinstance(raw_spec, dict):
-            spec = raw_spec
-        else:
-            continue
-        field = str(spec.get("field") or "")
-        if not field:
-            continue
-        reverse = str(spec.get("direction", "asc")).lower() == "desc"
-        natural = bool(spec.get("natural", False))
-        ordered.sort(
-            key=lambda row: _natural_key(row.get(field)) if natural else _sort_value_key(row.get(field)),
-            reverse=reverse,
-        )
-    return ordered
+    return query_primitives.sort_rows(rows, order_by)
 
 
 def _sort_values(values: list[object], order: str = "asc") -> list[object]:
-    return sorted(values, key=_natural_key, reverse=str(order).lower() == "desc")
+    return query_primitives.sort_values(values, order)
 
 
 def _compact_sample_value(value: object) -> object:
-    if isinstance(value, list):
-        return {"type": "list", "length": len(value)}
-    if isinstance(value, dict):
-        return {"type": "object", "keys": sorted(str(key) for key in value)[:12]}
-    return value
+    return query_primitives.compact_sample_value(value)
 
 
 def _project_node(node: dict, fields: Sequence | None = None, *, include_heavy_fields: bool = False) -> dict:
-    selected_fields = _normalize_tool_list(fields) or _DEFAULT_NODE_FIELDS
-    row: dict[str, object] = {}
-    for field_obj in selected_fields:
-        field = str(field_obj)
-        if not include_heavy_fields and _is_heavy_field(field):
-            continue
-        value = _node_field(node, field)
-        if value is not _MISSING:
-            row[field.split(".", 1)[-1]] = value
-    return row
+    return query_primitives.project_node(node, fields, include_heavy_fields=include_heavy_fields)
 
 
 def _pack_nodes(pack_id: str, *, node_limit: int = 50000) -> tuple[dict, list[dict]]:
@@ -3966,6 +4150,121 @@ def mo_tool_manifest() -> str:
     """Return canonical mo_<domain>_<action> tool names and legacy aliases."""
 
     return _json(_tool_manifest_payload())
+
+
+@mcp.tool()
+def mo_snapshot_list() -> str:
+    """List canonical snapshot releases available to the current MCP scope."""
+
+    try:
+        if not _mcp_authorized():
+            raise CanonicalSnapshotToolError("unauthorized", "Invalid MCP user URL token.")
+        snapshots = []
+        for canonical_id, _, _ in _canonical_snapshot_manifests():
+            manifest, snapshot = _load_canonical_snapshot(canonical_id)
+            if _snapshot_is_visible(snapshot):
+                snapshots.append(_snapshot_summary(manifest, snapshot))
+        return _json({"status": "ok", "count": len(snapshots), "snapshots": snapshots})
+    except Exception as exc:
+        return _json(_snapshot_error_payload(exc))
+
+
+@mcp.tool()
+def mo_snapshot_status(canonical_id: str) -> str:
+    """Load and SHA-256 verify every included pack in one canonical snapshot."""
+
+    try:
+        if not _mcp_authorized():
+            raise CanonicalSnapshotToolError("unauthorized", "Invalid MCP user URL token.")
+        manifest, snapshot = _load_canonical_snapshot(canonical_id)
+        _require_snapshot_access(snapshot)
+        verification = _verify_canonical_snapshot(snapshot)
+        return _json(
+            {
+                "status": "ok",
+                "snapshot": _snapshot_summary(manifest, snapshot),
+                "verification": _snapshot_verification_payload(verification),
+            }
+        )
+    except Exception as exc:
+        return _json(_snapshot_error_payload(exc, canonical_id=canonical_id))
+
+
+@mcp.tool()
+def mo_snapshot_query(canonical_id: str, plan: dict) -> str:
+    """Execute an exact seven-field plan only after canonical snapshot SHA verification."""
+
+    try:
+        if not _mcp_authorized():
+            raise CanonicalSnapshotToolError("unauthorized", "Invalid MCP user URL token.")
+        canonical_plan = _exact_snapshot_query_plan(plan)
+        manifest, snapshot = _load_canonical_snapshot(canonical_id)
+        _require_snapshot_access(snapshot)
+
+        # This preflight hashes every included pack.  The orchestrator then
+        # verifies the same immutable snapshot again immediately before its
+        # deterministic full-scan execution; there is intentionally no MCP
+        # argument or internal call here that can disable either check.
+        verification = _verify_canonical_snapshot(snapshot)
+        execution = execute_structured_project_query(canonical_plan, snapshot)
+        if execution.verification.checked_pack_ids != verification.checked_pack_ids:
+            raise CanonicalSnapshotToolError(
+                "snapshot_verification_changed",
+                "Snapshot verification coverage changed before query execution.",
+            )
+
+        return _json(
+            {
+                "status": "ok",
+                "snapshot": _snapshot_summary(manifest, execution.snapshot),
+                "verification": _snapshot_verification_payload(execution.verification),
+                "plan": execution.plan.as_dict(),
+                "result": execution.result.as_dict(),
+            }
+        )
+    except Exception as exc:
+        return _json(_snapshot_error_payload(exc, canonical_id=canonical_id))
+
+
+@mcp.tool()
+def mo_snapshot_bundle_query(canonical_id: str, bundle: dict) -> str:
+    """Execute an exact plan bundle against one fully verified canonical snapshot."""
+
+    try:
+        if not _mcp_authorized():
+            raise CanonicalSnapshotToolError("unauthorized", "Invalid MCP user URL token.")
+
+        # Validate the complete bundle, including recursively forbidden pack
+        # and snapshot selectors, before any snapshot file is opened.
+        canonical_bundle = _exact_snapshot_query_bundle(bundle)
+        manifest, snapshot = _load_canonical_snapshot(canonical_id)
+        _require_snapshot_access(snapshot)
+
+        # Hash every included pack before execution. Each subplan hashes its
+        # selected packs again inside execute_query_bundle. A final full pass
+        # closes the mutation window before any result is returned.
+        before = _verify_canonical_snapshot(snapshot)
+        result = execute_query_bundle(canonical_bundle, snapshot)
+        after = _verify_canonical_snapshot(snapshot)
+        if before.checked_pack_ids != after.checked_pack_ids:
+            raise CanonicalSnapshotToolError(
+                "snapshot_verification_changed",
+                "Snapshot verification coverage changed during bundle execution.",
+            )
+        bindings = _snapshot_bundle_bindings(manifest, snapshot, result)
+
+        return _json(
+            {
+                "status": "ok",
+                "snapshot": _snapshot_summary(manifest, snapshot),
+                "verification": _snapshot_verification_payload(after),
+                "bundle": canonical_bundle,
+                "bindings": bindings,
+                "result": result.as_dict(),
+            }
+        )
+    except Exception as exc:
+        return _json(_snapshot_error_payload(exc, canonical_id=canonical_id))
 
 
 @mcp.tool()
