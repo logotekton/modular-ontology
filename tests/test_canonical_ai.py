@@ -36,7 +36,7 @@ def test_openai_planner_normalizes_boq_catalogue_to_exact_seven_field_plan() -> 
         "scope": {"source_sheet": "건축_품목집계(전체)", "work_category": "구조"},
         "filters": [],
         "group_by": ["specification"],
-        "metrics": [{"agg": "sum", "field": "quantity"}],
+        "metrics": [{"aggregation": "sum", "property": "quantity", "output": "total"}],
     }
     responses = _FakeResponses(raw)
     client = SimpleNamespace(responses=responses)

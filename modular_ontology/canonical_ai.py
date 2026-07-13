@@ -63,7 +63,8 @@ def _response_text(response: Any) -> str:
 
 
 def _normalise_filter(item: Mapping[str, Any], unit_aliases: Mapping[str, str]) -> dict[str, Any]:
-    field = _FIELD_ALIASES.get(str(item.get("field") or "").strip(), str(item.get("field") or "").strip())
+    raw_field = item.get("field") or item.get("property") or item.get("attribute")
+    field = _FIELD_ALIASES.get(str(raw_field or "").strip(), str(raw_field or "").strip())
     operator = str(item.get("operator") or item.get("op") or "eq").strip()
     value = item.get("value")
     if field == "normalized_unit" and isinstance(value, str):
@@ -72,10 +73,19 @@ def _normalise_filter(item: Mapping[str, Any], unit_aliases: Mapping[str, str]) 
 
 
 def _normalise_metric(item: Mapping[str, Any], question: str, group_by: list[str]) -> dict[str, Any]:
-    name = str(item.get("name") or item.get("agg") or "").strip()
-    field_value = item.get("field")
+    name = str(
+        item.get("name")
+        or item.get("agg")
+        or item.get("aggregation")
+        or item.get("operation")
+        or item.get("op")
+        or item.get("function")
+        or item.get("metric")
+        or ""
+    ).strip()
+    field_value = item.get("field") or item.get("property") or item.get("attribute")
     field = _FIELD_ALIASES.get(str(field_value).strip(), str(field_value).strip()) if field_value is not None else None
-    alias = item.get("alias") or item.get("as")
+    alias = item.get("alias") or item.get("as") or item.get("output_field") or item.get("output")
     is_claim = bool(_CLAIM_RE.search(question))
     if not alias:
         if name == "count_distinct" and field == "source_element_id":
@@ -212,7 +222,11 @@ def openai_plan_question(
         "or select a snapshot. Use scope for category/source_sheet/work_category when allowed. "
         "A physical Revit object count means count_distinct(source_element_id). A type count means "
         "count_distinct(type_name). Preserve exact Korean labels. Use the supplied catalogue to entity-link "
-        "named BOQ materials. For a claim question, plan only the actual aggregate; comparison happens later."
+        "named BOQ materials. For a claim question, plan only the actual aggregate; comparison happens later. "
+        "Each filter must use {field, operator, value}. Each metric must use "
+        "{name, field, alias}; for example a generic object count metric has name=count_distinct, "
+        "field=source_element_id, and a descriptive alias. Do not use agg, aggregation, operation, "
+        "function, property, as, or any alternative key names."
     )
     previous: str | None = None
     validation_error: str | None = None
