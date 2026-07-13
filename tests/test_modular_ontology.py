@@ -30,6 +30,7 @@ from modular_ontology.pack_index import (
     list_packs,
     list_projects,
     read_pack_document,
+    search_pack,
 )
 from modular_ontology.qa import answer_pack_question
 from modular_ontology.store import index_all_packs, search_documents
@@ -2842,6 +2843,58 @@ def test_common_project_pack_summary_exposes_category(tmp_path) -> None:
     assert pack["displayFilename"] == "standard-spec.zip"
     assert pack["commonCategory"] == "시방서"
     assert pack["commonScoped"] is True
+    assert pack["projectScoped"] is False
+
+
+def test_search_pack_reads_cloud_chunks_without_documents(tmp_path, monkeypatch) -> None:
+    from modular_ontology import pack_index
+    from modular_ontology.store import connect, index_pack, init_db
+
+    pack_path = tmp_path / "_Common__시방서__cloud-only.zip"
+    with zipfile.ZipFile(pack_path, "w") as zf:
+        zf.writestr(
+            "manifest.json",
+            json.dumps(
+                {
+                    "pack_id": "cloud-only-spec-pack",
+                    "entrypoints": {"chunks": "cloud/chunks.jsonl"},
+                    "counts": {"chunks": 1, "documents": 1},
+                }
+            ),
+        )
+        zf.writestr(
+            "cloud/chunks.jsonl",
+            json.dumps(
+                {
+                    "chunk_id": "chunk:kcs-41-30",
+                    "document_id": "document:kcs-41-30",
+                    "title": "KCS 41 30 콘크리트공사",
+                    "content": "콘크리트 타설 전 철근과 거푸집의 상태를 검사한다.",
+                    "source_url": "https://example.test/kcs-41-30",
+                    "metadata": {"standard_code": "KCS 41 30"},
+                },
+                ensure_ascii=False,
+            ),
+        )
+    monkeypatch.setattr(pack_index, "find_pack", lambda pack_id: pack_index.PackFile(pack_path))
+
+    matches = search_pack("cloud-only-spec-pack", "콘크리트", limit=3)
+
+    assert matches[0]["chunkId"] == "chunk:kcs-41-30"
+    assert matches[0]["source"] == "cloud-chunk"
+    assert "철근" in matches[0]["snippet"]
+
+    db_path = tmp_path / "cloud-chunks.sqlite3"
+    conn = connect(db_path)
+    init_db(conn)
+    indexed = index_pack(conn, pack_index.PackFile(pack_path))
+    conn.close()
+    indexed_matches = search_documents("cloud-only-spec-pack", "콘크리트", limit=3, db_path=db_path)
+
+    assert indexed["documents"] == 1
+    assert indexed_matches[0]["source"] == "sqlite-index"
+    assert indexed_matches[0]["chunkId"] == "chunk:kcs-41-30"
+    assert "철근" in indexed_matches[0]["snippet"]
 
 
 def test_project_folder_pack_summary_exposes_category(tmp_path) -> None:

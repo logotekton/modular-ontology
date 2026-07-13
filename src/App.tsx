@@ -2462,9 +2462,13 @@ function SyncView({
   onSyncAll: () => void;
 }) {
   const isAdmin = currentUser?.role === "admin";
-  const projectByPackId = new Map<string, string>();
+  const projectNamesByPackId = new Map<string, string[]>();
   projects.forEach((project) => {
-    project.packIds.forEach((packId) => projectByPackId.set(packId, project.name));
+    project.packIds.forEach((packId) => {
+      const names = projectNamesByPackId.get(packId) ?? [];
+      if (!names.includes(project.name)) names.push(project.name);
+      projectNamesByPackId.set(packId, names);
+    });
   });
 
   return (
@@ -2560,7 +2564,10 @@ function SyncView({
         </div>
         <div className="pack-table">
           {packs.map((pack) => {
-            const projectName = projectByPackId.get(pack.id) ?? "미지정";
+            const projectNames = projectNamesByPackId.get(pack.id) ?? [];
+            const projectName = pack.commonScoped
+              ? `공통 · ${numberLabel(projectNames.length)}개 프로젝트`
+              : projectNames.join(", ") || "미지정";
             return (
               <div
                 className={pack.id === selectedPackId ? "pack-table-row active" : "pack-table-row"}

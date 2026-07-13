@@ -224,6 +224,7 @@ def _title_from_drive_filename(filename: str) -> str | None:
 # (mtime, size) 서명 기반 메모이즈 — 한 번의 동기화가 unique_pack_files/index_pack/
 # list_packs 경로에서 같은 zip을 3회씩 재파싱하던 것을 제거한다.
 _SUMMARIZE_CACHE: dict[str, tuple[tuple[float, int], dict[str, Any]]] = {}
+_PACK_LOOKUP_CACHE: dict[str, PackFile] = {}
 
 
 def summarize_pack(pack: PackFile) -> dict[str, Any]:
@@ -293,7 +294,7 @@ def _summarize_pack_uncached(pack: PackFile) -> dict[str, Any]:
             "format": manifest.get("format", "ontology-pack"),
             "description": manifest.get("description") or _extract_readme(zf),
             "source": source,
-            "projectScoped": "__" in pack.path.name,
+            "projectScoped": bool(drive_scope and drive_scope != "_Common"),
             "sizeBytes": pack.path.stat().st_size,
             "validationStatus": validation,
             "counts": {
@@ -412,12 +413,24 @@ def _db_pack_summary(pack_id: str, db_path: Path = DB_PATH) -> dict[str, Any] | 
 
 
 def find_pack(pack_id: str) -> PackFile:
+    cached = _PACK_LOOKUP_CACHE.get(pack_id)
+    if cached is not None and cached.path.exists():
+        try:
+            summary_id = str(summarize_pack(cached)["id"])
+        except Exception:
+            summary_id = cached.id
+        if pack_id in {cached.id, cached.path.name, summary_id}:
+            return cached
+        _PACK_LOOKUP_CACHE.pop(pack_id, None)
+
     for pack in unique_pack_files():
         summary_id = pack.id
         try:
             summary_id = summarize_pack(pack)["id"]
         except Exception:
             pass
+        for alias in {pack.id, pack.path.name, str(summary_id)}:
+            _PACK_LOOKUP_CACHE[alias] = pack
         if pack.id == pack_id or pack.path.name == pack_id or summary_id == pack_id:
             return pack
     raise FileNotFoundError(pack_id)
@@ -1372,6 +1385,55 @@ def search_pack(pack_id: str, query: str, limit: int = 8) -> list[dict[str, Any]
                     },
                 )
             )
+        if "cloud/chunks.jsonl" in zf.namelist():
+            for raw_line in zf.read("cloud/chunks.jsonl").decode("utf-8-sig", errors="replace").splitlines():
+                if not raw_line.strip():
+                    continue
+                try:
+                    chunk = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(chunk, dict):
+                    continue
+                content = str(chunk.get("content") or chunk.get("text") or "")
+                chunk_id = str(chunk.get("chunk_id") or chunk.get("id") or "").strip()
+                title = str(chunk.get("title") or chunk.get("heading") or chunk_id or "Evidence chunk")
+                metadata = chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else {}
+                haystack = " ".join(
+                    [
+                        content,
+                        title,
+                        chunk_id,
+                        str(chunk.get("document_id") or chunk.get("parent_document_id") or ""),
+                        json.dumps(metadata, ensure_ascii=False),
+                    ]
+                ).lower()
+                score = score_terms(haystack, terms)
+                if score <= 0:
+                    continue
+                hit = first_term_hit(content.lower(), terms)
+                if hit < 0:
+                    hit = 0
+                start = max(0, hit - 120)
+                end = min(len(content), hit + 260)
+                scored.append(
+                    (
+                        score,
+                        {
+                            "path": f"cloud/chunks.jsonl#{chunk_id}" if chunk_id else "cloud/chunks.jsonl",
+                            "title": title,
+                            "snippet": re.sub(r"\s+", " ", content[start:end]).strip(),
+                            "score": round(score, 3),
+                            "source": "cloud-chunk",
+                            "chunkId": chunk_id or None,
+                            "documentId": chunk.get("document_id") or chunk.get("parent_document_id"),
+                            "sourceUrl": chunk.get("source_url"),
+                            "sourceRef": chunk.get("source_ref"),
+                            "compactSourceRefs": chunk.get("compact_source_refs"),
+                            "metadata": metadata,
+                        },
+                    )
+                )
     scored.sort(key=lambda item: item[0], reverse=True)
     return [item[1] for item in scored[:limit]]
 

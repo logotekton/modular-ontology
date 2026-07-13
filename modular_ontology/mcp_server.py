@@ -37,7 +37,7 @@ from .pack_index import (
 )
 from .qa import answer_pack_question
 from .source_anchor import anchors_from_chunk, coverage as source_anchor_coverage
-from .store import connect as connect_index_db, init_db as init_index_db
+from .store import connect as connect_index_db, init_db as init_index_db, search_documents as search_indexed_documents
 
 
 try:
@@ -2730,13 +2730,12 @@ def _project_search_payload(project_id: str, search_text: str, limit_per_pack: i
         if pack_id in packs_by_id and _pack_is_visible(pack_id)
     ]
     unique_pack_ids = list(dict.fromkeys(pack_ids))
-    results = [
-        {
-            "pack": packs_by_id[pack_id],
-            "matches": search_pack_evidence(pack_id, search_text, limit=max(0, limit_per_pack)),
-        }
-        for pack_id in unique_pack_ids
-    ]
+    results = []
+    for pack_id in unique_pack_ids:
+        matches = search_indexed_documents(pack_id, search_text, limit=max(0, limit_per_pack))
+        if not matches:
+            matches = search_pack_evidence(pack_id, search_text, limit=max(0, limit_per_pack))
+        results.append({"pack": packs_by_id[pack_id], "matches": matches})
     return {
         "projectId": project_id or None,
         "query": search_text,

@@ -120,6 +120,7 @@ def _index_documents(conn: sqlite3.Connection, pack: PackFile, pack_id: str) -> 
     count = 0
     with zipfile.ZipFile(pack.path) as zf:
         with conn:
+            conn.execute("DELETE FROM documents WHERE pack_id = ?", (pack_id,))
             for info in zf.infolist():
                 if not (info.filename.startswith("documents/") and info.filename.endswith(".md")):
                     continue
@@ -134,6 +135,29 @@ def _index_documents(conn: sqlite3.Connection, pack: PackFile, pack_id: str) -> 
                     (pack_id, info.filename, title, body),
                 )
                 count += 1
+            if "cloud/chunks.jsonl" in zf.namelist():
+                for raw_line in zf.read("cloud/chunks.jsonl").decode("utf-8-sig", errors="replace").splitlines():
+                    if not raw_line.strip():
+                        continue
+                    try:
+                        chunk = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(chunk, dict):
+                        continue
+                    chunk_id = str(chunk.get("chunk_id") or chunk.get("id") or "").strip()
+                    body = str(chunk.get("content") or chunk.get("text") or "")
+                    title = str(chunk.get("title") or chunk.get("heading") or chunk_id or "Evidence chunk")
+                    path = f"cloud/chunks.jsonl#{chunk_id}" if chunk_id else f"cloud/chunks.jsonl#{count + 1}"
+                    conn.execute(
+                        """
+                        INSERT INTO documents (pack_id, path, title, body)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(pack_id, path) DO UPDATE SET title = excluded.title, body = excluded.body
+                        """,
+                        (pack_id, path, title, body),
+                    )
+                    count += 1
     return count
 
 
@@ -231,8 +255,10 @@ def search_documents(pack_id: str, query: str, limit: int = 8, db_path: Path | N
     scored: list[tuple[float, dict[str, Any]]] = []
     for row in rows:
         body = row["body"] or ""
+        path = str(row["path"] or "")
+        chunk_id = path.split("#", 1)[1] if path.startswith("cloud/chunks.jsonl#") and "#" in path else None
         lower = body.lower()
-        score = score_terms(lower + " " + str(row["title"]).lower() + " " + str(row["path"]).lower(), terms)
+        score = score_terms(lower + " " + str(row["title"]).lower() + " " + path.lower(), terms)
         if score <= 0:
             continue
         hit = first_term_hit(lower, terms)
@@ -244,11 +270,12 @@ def search_documents(pack_id: str, query: str, limit: int = 8, db_path: Path | N
             (
                 score,
                 {
-                    "path": row["path"],
+                    "path": path,
                     "title": row["title"],
                     "snippet": re.sub(r"\s+", " ", body[start:end]).strip(),
                     "score": round(score, 3),
                     "source": "sqlite-index",
+                    "chunkId": chunk_id,
                 },
             )
         )
