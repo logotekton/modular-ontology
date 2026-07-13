@@ -12,6 +12,14 @@ CANONICAL_ID = "YEOJU-CANONICAL-20260710-092149-R1"
 INTERNAL_SNAPSHOT_ID = "snapshot-2987d484bb28afb3d8047f98"
 
 
+def test_mcp_token_is_read_from_full_mounted_request_path(monkeypatch) -> None:
+    request = type("Request", (), {"path_params": {}, "query_params": {}, "url": type("Url", (), {"path": "/mcp/mom_test_token"})(), "scope": {}})()
+    context = type("Context", (), {"request_context": type("RequestContext", (), {"request": request})()})()
+    monkeypatch.setattr(mcp_server.mcp, "get_context", lambda: context)
+
+    assert mcp_server._request_mcp_token() == "mom_test_token"
+
+
 def _a01_plan() -> dict:
     return {
         "project_id": "yeoju",

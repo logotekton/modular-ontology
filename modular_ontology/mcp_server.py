@@ -246,6 +246,11 @@ def _request_mcp_token() -> str:
             token = str(query_params.get("token", "")).strip()
     if not token:
         path = getattr(getattr(request, "url", None), "path", "") or getattr(request, "scope", {}).get("path", "")
+        mounted_prefix = "/mcp/"
+        if mounted_prefix in path:
+            token = path.split(mounted_prefix, 1)[1].split("/", 1)[0].strip()
+    if not token:
+        path = getattr(getattr(request, "url", None), "path", "") or getattr(request, "scope", {}).get("path", "")
         prefix = str(mcp.settings.streamable_http_path).split("{", 1)[0].rstrip("/") + "/"
         if path.startswith(prefix):
             token = path[len(prefix) :].split("/", 1)[0].strip()
