@@ -89,6 +89,7 @@ PUBLIC_MCP_BASE_URL = f"https://{PUBLIC_MCP_DOMAIN}"
 PUBLIC_MCP_URL = f"{PUBLIC_MCP_BASE_URL}/mcp"
 VERCEL_MCP_HOSTS = (
     f"{PUBLIC_MCP_DOMAIN},"
+    "*.vercel.app,"
     "modular-ontology.vercel.app,"
     "modular-ontology-ythongs-projects.vercel.app,"
     "modular-ontology-ghddudxor12-8502-ythongs-projects.vercel.app"

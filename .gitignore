@@ -36,3 +36,4 @@ original file/
 *.pdf
 
 .vercel
+.env*.local
