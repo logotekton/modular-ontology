@@ -1812,7 +1812,7 @@ def test_mcp_user_url_regenerate_rejects_unpersisted_token(monkeypatch, tmp_path
         "company": user.company,
         "role": user.role,
     }
-    mtimes = iter((1, 2))
+    mtimes = iter((1, 1))
     monkeypatch.setattr(app_module, "MCP_TOKENS_FILE", tmp_path / "mcp_tokens.json")
     monkeypatch.setattr(app_module, "get_user_by_token", lambda token: user)
     monkeypatch.setattr(app_module, "google_drive_sync_enabled", lambda: True)
@@ -1855,7 +1855,7 @@ def test_mcp_user_url_regenerate_returns_only_verified_token(monkeypatch, tmp_pa
         "company": user.company,
         "role": user.role,
     }
-    mtimes = iter((1, 2))
+    mtimes = iter((1, 1))
     monkeypatch.setattr(app_module, "MCP_TOKENS_FILE", tmp_path / "mcp_tokens.json")
     monkeypatch.setattr(app_module, "get_user_by_token", lambda token: user)
     monkeypatch.setattr(app_module, "google_drive_sync_enabled", lambda: True)

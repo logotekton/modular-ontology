@@ -1841,7 +1841,7 @@ def _mcp_status_payload(request: Request, authorization: str | None, *, regenera
             "company": token_record["company"],
             "role": token_record["role"],
         }
-        if token_file_changed:
+        if regenerate_user_token or token_file_changed:
             token_write_back = _persist_and_verify_mcp_token(token_record)
     return {
         "status": "ready",
