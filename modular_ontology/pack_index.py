@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import os
 import re
 import sqlite3
 import zipfile
@@ -11,7 +10,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from .config import DB_PATH, LEGACY_STRUCTURED_PACKS_DIR, PACKS_DIR, ROOT, USE_STRUCTURED_DATA_DIR
+from .config import (
+    DATA_DIR,
+    DATABASE_FOLDER,
+    DB_PATH,
+    EPHEMERAL_STORAGE,
+    LEGACY_STRUCTURED_PACKS_DIR,
+    PACKS_DIR,
+    PROJECTS_FOLDER,
+    ROOT,
+    USE_STRUCTURED_DATA_DIR,
+)
 
 UPLOAD_DIR = PACKS_DIR
 
@@ -316,14 +325,60 @@ def _extract_readme(zf: zipfile.ZipFile) -> str:
 
 
 def list_packs() -> list[dict[str, Any]]:
+    registry_summaries: list[dict[str, Any]] = []
+    if EPHEMERAL_STORAGE:
+        _sync_registry_from_drive()
+        registry_summaries = _registry_pack_summaries()
     packs = unique_pack_files()
     if packs:
-        return [summarize_pack(pack) for pack in packs]
+        direct_summaries = [summarize_pack(pack) for pack in packs]
+        if not EPHEMERAL_STORAGE:
+            return direct_summaries
+        return _merge_pack_summaries(registry_summaries, direct_summaries)
+    if registry_summaries:
+        return registry_summaries
     summaries = _db_pack_summaries()
     if summaries:
         return summaries
+    registry_summaries = _registry_pack_summaries()
+    if registry_summaries:
+        return registry_summaries
     _sync_registry_from_drive()
-    return _db_pack_summaries()
+    registry_summaries = _registry_pack_summaries()
+    return registry_summaries or _db_pack_summaries()
+
+
+def _pack_registry_path() -> Path:
+    from .google_drive_sync import PACK_REGISTRY_FILENAME
+
+    return DATA_DIR / DATABASE_FOLDER / PACK_REGISTRY_FILENAME
+
+
+def _registry_payload() -> dict[str, Any]:
+    try:
+        payload = json.loads(_pack_registry_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _registry_pack_summaries() -> list[dict[str, Any]]:
+    packs = _registry_payload().get("packs")
+    if not isinstance(packs, list):
+        return []
+    return [copy.deepcopy(pack) for pack in packs if isinstance(pack, dict) and pack.get("id")]
+
+
+def _merge_pack_summaries(
+    registry_summaries: list[dict[str, Any]],
+    direct_summaries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged = {str(summary["id"]): summary for summary in registry_summaries if summary.get("id")}
+    for summary in direct_summaries:
+        pack_id = str(summary.get("id") or "").strip()
+        if pack_id:
+            merged[pack_id] = summary
+    return sorted(merged.values(), key=lambda item: (str(item.get("title") or "").casefold(), str(item.get("id") or "")))
 
 
 def _sync_registry_from_drive() -> None:
@@ -433,6 +488,17 @@ def find_pack(pack_id: str) -> PackFile:
             _PACK_LOOKUP_CACHE[alias] = pack
         if pack.id == pack_id or pack.path.name == pack_id or summary_id == pack_id:
             return pack
+    try:
+        from .google_drive_sync import fetch_pack_file_from_drive
+
+        fetched = PackFile(fetch_pack_file_from_drive(pack_id))
+        summary_id = str(summarize_pack(fetched)["id"])
+        for alias in {fetched.id, fetched.path.name, summary_id}:
+            _PACK_LOOKUP_CACHE[alias] = fetched
+        if pack_id in {fetched.id, fetched.path.name, summary_id}:
+            return fetched
+    except (FileNotFoundError, OSError, RuntimeError, ValueError, zipfile.BadZipFile):
+        pass
     raise FileNotFoundError(pack_id)
 
 
@@ -1348,7 +1414,93 @@ def list_projects() -> list[dict[str, Any]]:
     packs = list_packs()
     from .project_store import list_projects as list_stored_projects
 
-    return list_stored_projects(packs)
+    if EPHEMERAL_STORAGE:
+        registry_projects = _registry_projects(packs)
+        if registry_projects:
+            return registry_projects
+    try:
+        stored_projects = list_stored_projects(packs)
+    except sqlite3.Error:
+        stored_projects = []
+    return stored_projects or _registry_projects(packs)
+
+
+def _registry_projects(packs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    from .google_drive_sync import (
+        PROJECT_FOLDERS_FILENAME,
+        PROJECT_PACK_LINKS_FILENAME,
+    )
+
+    payload = _registry_payload()
+    raw_projects = payload.get("projects")
+    registry_projects = [project for project in raw_projects if isinstance(project, dict)] if isinstance(raw_projects, list) else []
+    by_folder_id = {
+        str(project.get("driveFolderId")): project
+        for project in registry_projects
+        if project.get("driveFolderId")
+    }
+    by_project_id = {
+        str(project.get("id")): project
+        for project in registry_projects
+        if project.get("id")
+    }
+
+    folders_path = DATA_DIR / PROJECTS_FOLDER / PROJECT_FOLDERS_FILENAME
+    links_path = DATA_DIR / PROJECTS_FOLDER / PROJECT_PACK_LINKS_FILENAME
+    try:
+        raw_folders = json.loads(folders_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw_folders = []
+    try:
+        raw_links = json.loads(links_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw_links = {}
+    folders = [folder for folder in raw_folders if isinstance(folder, dict)] if isinstance(raw_folders, list) else []
+    links = raw_links if isinstance(raw_links, dict) else {}
+    valid_pack_ids = {str(pack.get("id")) for pack in packs if pack.get("id")}
+
+    project_rows: list[dict[str, Any]] = []
+    if folders:
+        for folder in folders:
+            project_id = str(folder.get("projectId") or "").strip()
+            if not project_id:
+                continue
+            source = by_folder_id.get(str(folder.get("folderId") or "")) or by_project_id.get(project_id) or {}
+            project_rows.append(
+                {
+                    **source,
+                    "id": project_id,
+                    "name": str(folder.get("name") or project_id),
+                    "driveFolderId": str(folder.get("folderId") or source.get("driveFolderId") or ""),
+                    "packIds": links.get(project_id, source.get("packIds", [])),
+                }
+            )
+    else:
+        project_rows = [dict(project) for project in registry_projects]
+
+    projects: list[dict[str, Any]] = []
+    for project in project_rows:
+        pack_ids = project.get("packIds")
+        projects.append(
+            {
+                "id": str(project.get("id") or ""),
+                "name": str(project.get("name") or project.get("id") or ""),
+                "company": str(project.get("company") or ""),
+                "manager": str(project.get("manager") or ""),
+                "discipline": str(project.get("discipline") or ""),
+                "description": str(project.get("description") or ""),
+                "role": str(project.get("role") or "Admin"),
+                "driveFolderId": str(project.get("driveFolderId") or ""),
+                "packIds": [
+                    str(pack_id)
+                    for pack_id in pack_ids
+                    if str(pack_id) in valid_pack_ids
+                ]
+                if isinstance(pack_ids, list)
+                else [],
+            }
+        )
+    return projects
 
 
 def search_pack(pack_id: str, query: str, limit: int = 8) -> list[dict[str, Any]]:

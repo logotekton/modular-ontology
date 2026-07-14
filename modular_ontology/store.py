@@ -11,7 +11,6 @@ from .config import DB_PATH
 from .pack_index import (
     PackFile,
     build_graph_from_pack,
-    discover_pack_files,
     first_term_hit,
     query_terms,
     score_terms,
@@ -86,7 +85,18 @@ def index_all_packs(db_path: Path | None = None) -> dict[str, Any]:
         indexed = []
         for pack in unique_pack_files():
             indexed.append(index_pack(conn, pack))
-        return {"status": "indexed", "packs": indexed, "stats": index_stats(conn)}
+        active_pack_ids = {str(pack["id"]) for pack in indexed}
+        stored_pack_ids = {str(row[0]) for row in conn.execute("SELECT id FROM packs").fetchall()}
+        removed_pack_ids = sorted(stored_pack_ids - active_pack_ids)
+        if removed_pack_ids:
+            with conn:
+                conn.executemany("DELETE FROM packs WHERE id = ?", [(pack_id,) for pack_id in removed_pack_ids])
+        return {
+            "status": "indexed",
+            "packs": indexed,
+            "removedPacks": removed_pack_ids,
+            "stats": index_stats(conn),
+        }
     finally:
         conn.close()
 

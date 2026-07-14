@@ -16,6 +16,7 @@ import uuid
 import zipfile
 import io
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 import requests
 from dataclasses import dataclass
@@ -27,10 +28,12 @@ from .config import (
     DATA_DIR,
     DATABASE_FOLDER,
     DB_PATH,
+    EPHEMERAL_STORAGE,
     IFC_MODELS_FOLDER,
     LEGACY_ONTOLOGY_PACKS_FOLDER,
     MCP_TOKENS_FILE,
     ONTOLOGY_PACKS_FOLDER,
+    PACKS_DIR,
     PROJECTS_FOLDER,
     env,
 )
@@ -45,6 +48,7 @@ RESUMABLE_UPLOAD_THRESHOLD = 5 * 1024 * 1024
 RESUMABLE_UPLOAD_CHUNK_SIZE = 16 * 1024 * 1024  # must be a multiple of 256 KiB
 DATABASE_FILENAME = "modular_ontology.sqlite3"
 LEGACY_DATABASE_FILENAME = "mod" + "dular_" + "graph.sqlite3"
+PACK_REGISTRY_FILENAME = "pack_registry.json"
 PROJECT_IFC_FOLDER = "ifc-models"
 PROJECT_PACKS_FOLDER = "ontology-packs"
 PROJECT_README_FILENAME = "README.md"
@@ -55,6 +59,7 @@ PROJECT_FOLDERS_FILENAME = ".drive-project-folders.json"
 DRIVE_FILE_CACHE_FILENAME = ".google-drive-file-cache.json"
 PROJECT_SYNC_MARKER_FOLDER = ".google-drive-project-sync"
 _DB_SYNC_LOCK = threading.Lock()
+_PACK_CACHE_LOCK = threading.Lock()
 
 # Drive가 지수 백오프 재시도를 요구하는 일시적 오류 (429 rate limit, 5xx)
 _RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
@@ -752,6 +757,190 @@ def write_back_database_file(*, client: GoogleDriveClient | None = None) -> dict
         )
 
 
+def load_pack_registry(*, data_dir: Path = DATA_DIR) -> dict[str, Any]:
+    path = data_dir / DATABASE_FOLDER / PACK_REGISTRY_FILENAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def build_pack_registry(*, data_dir: Path = DATA_DIR) -> Path:
+    from .pack_index import list_packs, summarize_pack, unique_pack_files
+    from .project_store import list_projects as list_stored_projects
+
+    packs = list_packs()
+    projects = list_stored_projects(packs)
+    file_cache = _load_drive_file_cache(data_dir)
+    pack_files_by_id: dict[str, Path] = {}
+    for pack in unique_pack_files():
+        try:
+            pack_files_by_id[str(summarize_pack(pack)["id"])] = pack.path
+        except Exception:
+            continue
+
+    registry_packs: list[dict[str, Any]] = []
+    for summary in packs:
+        pack_id = str(summary.get("id") or "").strip()
+        if not pack_id:
+            continue
+        registry_summary = dict(summary)
+        pack_path = pack_files_by_id.get(pack_id)
+        signature = (
+            file_cache.get(_drive_cache_key(data_dir, pack_path))
+            if pack_path is not None
+            else None
+        )
+        if isinstance(signature, dict) and signature.get("id"):
+            registry_summary["drive"] = {
+                "fileId": str(signature["id"]),
+                "name": str(signature.get("name") or registry_summary.get("displayFilename") or ""),
+                "modifiedTime": str(signature.get("modifiedTime") or ""),
+                "sizeBytes": signature.get("size"),
+                "cachePath": _drive_cache_key(data_dir, pack_path),
+            }
+        registry_packs.append(registry_summary)
+
+    db_stat = DB_PATH.stat() if DB_PATH.exists() else None
+    registry = {
+        "version": 1,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "sourceDb": {
+            "sizeBytes": db_stat.st_size if db_stat else 0,
+            "modifiedTime": datetime.fromtimestamp(db_stat.st_mtime, timezone.utc).isoformat() if db_stat else "",
+        },
+        "projects": projects,
+        "commonPackIds": _read_project_pack_links(data_dir).get(COMMON_PROJECT_PACK_LINKS_KEY, []),
+        "packs": registry_packs,
+    }
+    path = data_dir / DATABASE_FOLDER / PACK_REGISTRY_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.tmp")
+    temp.write_text(json.dumps(registry, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp, path)
+    return path
+
+
+def write_back_pack_registry_file(
+    *,
+    data_dir: Path = DATA_DIR,
+    client: GoogleDriveClient | None = None,
+) -> dict[str, Any]:
+    source = build_pack_registry(data_dir=data_dir)
+    return write_back_google_drive_file(
+        source,
+        [DATABASE_FOLDER],
+        client=client,
+        name=PACK_REGISTRY_FILENAME,
+        mime_type="application/json; charset=utf-8",
+    )
+
+
+def fetch_pack_file_from_drive(
+    pack_id: str,
+    *,
+    client: GoogleDriveClient | None = None,
+    data_dir: Path = DATA_DIR,
+    packs_dir: Path = PACKS_DIR,
+) -> Path:
+    registry = load_pack_registry(data_dir=data_dir)
+    registry_packs = registry.get("packs")
+    if not isinstance(registry_packs, list):
+        raise FileNotFoundError(f"Pack registry is unavailable: {pack_id}")
+    entry = next(
+        (
+            item
+            for item in registry_packs
+            if isinstance(item, dict) and str(item.get("id") or "").strip() == pack_id
+        ),
+        None,
+    )
+    if not isinstance(entry, dict):
+        raise FileNotFoundError(pack_id)
+    drive = entry.get("drive")
+    if not isinstance(drive, dict) or not drive.get("fileId"):
+        raise FileNotFoundError(f"Pack has no Drive file mapping: {pack_id}")
+
+    filename = _safe_drive_filename(
+        str(entry.get("filename") or drive.get("name") or f"{pack_id}.zip")
+    )
+    if not filename.lower().endswith(".zip"):
+        filename = f"{filename}.zip"
+    target = packs_dir / filename
+    size_value = drive.get("sizeBytes")
+    try:
+        incoming_size = max(0, int(size_value or entry.get("sizeBytes") or 0))
+    except (TypeError, ValueError):
+        incoming_size = 0
+    drive_item = DriveItem(
+        id=str(drive["fileId"]),
+        name=str(drive.get("name") or filename),
+        mime_type="application/zip",
+        modified_time=str(drive.get("modifiedTime") or ""),
+        size=incoming_size or None,
+    )
+
+    with _PACK_CACHE_LOCK:
+        file_cache = _load_drive_file_cache(data_dir)
+        if (
+            target.exists()
+            and _pack_id_from_zip(target) == pack_id
+            and _drive_file_is_unchanged(drive_item, target, data_dir=data_dir, file_cache=file_cache)
+        ):
+            target.touch()
+            return target
+        target.unlink(missing_ok=True)
+        _ensure_pack_cache_budget(packs_dir, incoming_size, keep=target)
+
+        client = client or GoogleDriveClient.from_env()
+        client.download_file(str(drive["fileId"]), target)
+        actual_pack_id = _pack_id_from_zip(target)
+        if actual_pack_id != pack_id:
+            target.unlink(missing_ok=True)
+            raise ValueError(f"Downloaded pack id mismatch: expected {pack_id}, got {actual_pack_id}")
+
+        _remember_drive_file(
+            drive_item,
+            target,
+            data_dir=data_dir,
+            file_cache=file_cache,
+        )
+        _write_drive_file_cache(data_dir, file_cache)
+        return target
+
+
+def _ensure_pack_cache_budget(packs_dir: Path, incoming_size: int, *, keep: Path) -> None:
+    configured = env("MODULAR_ONTOLOGY_PACK_CACHE_MAX_BYTES")
+    if configured is None and not EPHEMERAL_STORAGE:
+        return
+    try:
+        limit = max(0, int(str(configured or 300 * 1024 * 1024)))
+    except ValueError as exc:
+        raise ValueError(f"Invalid MODULAR_ONTOLOGY_PACK_CACHE_MAX_BYTES: {configured}") from exc
+    if limit <= 0:
+        return
+    if incoming_size > limit:
+        raise OSError(f"Pack size {incoming_size} exceeds runtime pack cache limit {limit}.")
+
+    packs_dir.mkdir(parents=True, exist_ok=True)
+    candidates = [path for path in packs_dir.glob("*.zip") if path != keep]
+    total = sum(path.stat().st_size for path in candidates if path.exists())
+    if total + incoming_size <= limit:
+        return
+    for path in sorted(candidates, key=lambda item: item.stat().st_mtime):
+        try:
+            size = path.stat().st_size
+            path.unlink()
+            total -= size
+        except OSError:
+            continue
+        if total + incoming_size <= limit:
+            return
+    if total + incoming_size > limit:
+        raise OSError(f"Runtime pack cache cannot free enough space for {keep.name}.")
+
+
 def write_back_pack_file(
     pack_path: Path,
     *,
@@ -1014,6 +1203,7 @@ def sync_google_drive_registry_files(
     root_folder_id: str | None = None,
     data_dir: Path = DATA_DIR,
     force: bool = False,
+    include_database: bool | None = None,
 ) -> dict[str, Any]:
     root_folder_id = root_folder_id or str(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "")).strip()
     if not root_folder_id:
@@ -1028,6 +1218,14 @@ def sync_google_drive_registry_files(
                 return {"status": "cached", **previous}
         except (OSError, ValueError, json.JSONDecodeError):
             pass
+
+    if include_database is None:
+        configured = env("MODULAR_ONTOLOGY_REGISTRY_SYNC_INCLUDE_DB")
+        include_database = (
+            str(configured).strip().lower() in {"1", "true", "yes", "on"}
+            if configured is not None
+            else not EPHEMERAL_STORAGE
+        )
 
     client = client or GoogleDriveClient.from_env()
     root = _children_by_name(client, root_folder_id)
@@ -1056,15 +1254,38 @@ def sync_google_drive_registry_files(
     database = root.get(DATABASE_FOLDER)
     if database and database.is_folder:
         downloaded.extend(
-            _download_database_file(
+            _download_named_files(
                 client,
                 database.id,
                 data_dir / DATABASE_FOLDER,
+                {PACK_REGISTRY_FILENAME},
                 data_dir=data_dir,
                 file_cache=file_cache,
                 skipped=skipped,
             )
         )
+        if include_database:
+            max_db_bytes: int | None = None
+            raw_max_db_bytes = env("MODULAR_ONTOLOGY_MAX_DB_DOWNLOAD_BYTES")
+            if raw_max_db_bytes:
+                try:
+                    max_db_bytes = max(0, int(str(raw_max_db_bytes))) or None
+                except ValueError:
+                    warnings.append(f"Invalid MODULAR_ONTOLOGY_MAX_DB_DOWNLOAD_BYTES: {raw_max_db_bytes}")
+            downloaded.extend(
+                _download_database_file(
+                    client,
+                    database.id,
+                    data_dir / DATABASE_FOLDER,
+                    data_dir=data_dir,
+                    file_cache=file_cache,
+                    skipped=skipped,
+                    warnings=warnings,
+                    max_bytes=max_db_bytes,
+                )
+            )
+        else:
+            skipped.append(str(data_dir / DATABASE_FOLDER / DATABASE_FILENAME))
     else:
         missing.append(DATABASE_FOLDER)
 
@@ -1084,7 +1305,9 @@ def sync_google_drive_registry_files(
 
     projects = root.get(PROJECTS_FOLDER)
     if projects and projects.is_folder:
-        _write_project_folders(data_dir, _project_folder_records(client, projects.id, warnings=warnings))
+        project_folders = _project_folder_records(client, projects.id, warnings=warnings)
+        _write_project_folders(data_dir, project_folders)
+        _hydrate_project_pack_links_from_registry(data_dir, project_folders)
         downloaded.extend(
             _download_project_ifc_metadata_files(
                 client,
@@ -1107,6 +1330,7 @@ def sync_google_drive_registry_files(
         "missing": missing,
         "warnings": warnings,
         "scope": "registry",
+        "databaseIncluded": include_database,
     }
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1135,6 +1359,49 @@ def _project_folder_records(
             }
         )
     return project_folders
+
+
+def _hydrate_project_pack_links_from_registry(
+    data_dir: Path,
+    project_folders: list[dict[str, str]],
+) -> None:
+    registry = load_pack_registry(data_dir=data_dir)
+    registry_projects = registry.get("projects")
+    if not isinstance(registry_projects, list):
+        return
+
+    by_folder_id = {
+        str(project.get("driveFolderId")): project
+        for project in registry_projects
+        if isinstance(project, dict) and project.get("driveFolderId")
+    }
+    by_project_id = {
+        str(project.get("id")): project
+        for project in registry_projects
+        if isinstance(project, dict) and project.get("id")
+    }
+    links: dict[str, list[str]] = {}
+    common_pack_ids = registry.get("commonPackIds")
+    if isinstance(common_pack_ids, list):
+        links[COMMON_PROJECT_PACK_LINKS_KEY] = [
+            str(pack_id).strip() for pack_id in common_pack_ids if str(pack_id).strip()
+        ]
+
+    for folder in project_folders:
+        project_id = str(folder.get("projectId") or "").strip()
+        if not project_id:
+            continue
+        registry_project = by_folder_id.get(str(folder.get("folderId") or "")) or by_project_id.get(project_id)
+        if not isinstance(registry_project, dict):
+            links[project_id] = []
+            continue
+        pack_ids = registry_project.get("packIds")
+        links[project_id] = (
+            [str(pack_id).strip() for pack_id in pack_ids if str(pack_id).strip()]
+            if isinstance(pack_ids, list)
+            else []
+        )
+    _write_project_pack_links(data_dir, links)
 
 
 def _download_project_ifc_metadata_files(
@@ -1232,6 +1499,8 @@ def _download_database_file(
     data_dir: Path | None = None,
     file_cache: dict[str, dict[str, Any]] | None = None,
     skipped: list[str] | None = None,
+    warnings: list[str] | None = None,
+    max_bytes: int | None = None,
 ) -> list[str]:
     children = [item for item in client.list_children(folder_id) if not item.is_folder]
     source = next((item for item in children if item.name == DATABASE_FILENAME), None)
@@ -1240,6 +1509,14 @@ def _download_database_file(
     if not source:
         return []
     target = target_dir / DATABASE_FILENAME
+    if max_bytes is not None and source.size is not None and source.size > max_bytes:
+        if skipped is not None:
+            skipped.append(str(target))
+        if warnings is not None:
+            warnings.append(
+                f"Skipped {DATABASE_FILENAME}: Drive file size {source.size} exceeds limit {max_bytes}."
+            )
+        return []
     if data_dir is not None and file_cache is not None and _drive_file_is_unchanged(source, target, data_dir=data_dir, file_cache=file_cache):
         if skipped is not None:
             skipped.append(str(target))

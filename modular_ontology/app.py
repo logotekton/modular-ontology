@@ -42,7 +42,6 @@ from .auth import (
 from .config import EPHEMERAL_STORAGE, DATA_DIR, IFC_MODELS_FOLDER, MCP_REMOTE_FILE, MCP_TOKENS_FILE, PROJECTS_FOLDER, ROOT, env
 from .canonical_ai import CanonicalPlannerError, build_canonical_answer, openai_plan_question
 from .google_drive_sync import (
-    COMMON_PROJECT_ID,
     COMMON_PROJECT_PACK_LINKS_KEY,
     PROJECT_FOLDERS_FILENAME,
     PROJECT_PACK_LINKS_FILENAME,
@@ -60,6 +59,7 @@ from .google_drive_sync import (
     write_back_ifc_metadata_file,
     write_back_mcp_tokens_file,
     write_back_pack_file,
+    write_back_pack_registry_file,
     write_back_users_file,
 )
 from .mcp_server import (
@@ -344,6 +344,7 @@ def run_google_drive_write_back(
             result = write_back_users_file()
         elif kind == "database":
             result = write_back_database_file()
+            result["registry"] = write_back_pack_registry_file()
         elif kind == "mcp_tokens":
             result = write_back_mcp_tokens_file()
         elif kind == "pack" and path:
