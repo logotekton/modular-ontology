@@ -1422,7 +1422,50 @@ def list_projects() -> list[dict[str, Any]]:
         stored_projects = list_stored_projects(packs)
     except sqlite3.Error:
         stored_projects = []
-    return stored_projects or _registry_projects(packs)
+    projects = stored_projects or _registry_projects(packs)
+    common_pack_ids = _common_pack_ids(packs)
+    if not common_pack_ids:
+        return projects
+    return [
+        {
+            **project,
+            "packIds": list(dict.fromkeys([*common_pack_ids, *project.get("packIds", [])])),
+        }
+        for project in projects
+    ]
+
+
+def _common_pack_ids(
+    packs: list[dict[str, Any]],
+    *,
+    payload: dict[str, Any] | None = None,
+    links: dict[str, Any] | None = None,
+) -> list[str]:
+    from .google_drive_sync import COMMON_PROJECT_PACK_LINKS_KEY, PROJECT_PACK_LINKS_FILENAME
+
+    registry_payload = payload if payload is not None else _registry_payload()
+    if links is None:
+        links_path = DATA_DIR / PROJECTS_FOLDER / PROJECT_PACK_LINKS_FILENAME
+        try:
+            raw_links = json.loads(links_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw_links = {}
+        project_links = raw_links if isinstance(raw_links, dict) else {}
+    else:
+        project_links = links
+
+    candidates = [
+        *project_links.get(COMMON_PROJECT_PACK_LINKS_KEY, []),
+        *registry_payload.get("commonPackIds", []),
+    ]
+    valid_pack_ids = {str(pack.get("id")) for pack in packs if pack.get("id")}
+    return list(
+        dict.fromkeys(
+            str(pack_id)
+            for pack_id in candidates
+            if str(pack_id) in valid_pack_ids
+        )
+    )
 
 
 def _registry_projects(packs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1458,6 +1501,7 @@ def _registry_projects(packs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     folders = [folder for folder in raw_folders if isinstance(folder, dict)] if isinstance(raw_folders, list) else []
     links = raw_links if isinstance(raw_links, dict) else {}
     valid_pack_ids = {str(pack.get("id")) for pack in packs if pack.get("id")}
+    common_pack_ids = _common_pack_ids(packs, payload=payload, links=links)
 
     project_rows: list[dict[str, Any]] = []
     if folders:
@@ -1481,6 +1525,22 @@ def _registry_projects(packs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     projects: list[dict[str, Any]] = []
     for project in project_rows:
         pack_ids = project.get("packIds")
+        effective_pack_ids = (
+            list(
+                dict.fromkeys(
+                    [
+                        *common_pack_ids,
+                        *(
+                            str(pack_id)
+                            for pack_id in pack_ids
+                            if str(pack_id) in valid_pack_ids
+                        ),
+                    ]
+                )
+            )
+            if isinstance(pack_ids, list)
+            else common_pack_ids
+        )
         projects.append(
             {
                 "id": str(project.get("id") or ""),
@@ -1491,13 +1551,7 @@ def _registry_projects(packs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "description": str(project.get("description") or ""),
                 "role": str(project.get("role") or "Admin"),
                 "driveFolderId": str(project.get("driveFolderId") or ""),
-                "packIds": [
-                    str(pack_id)
-                    for pack_id in pack_ids
-                    if str(pack_id) in valid_pack_ids
-                ]
-                if isinstance(pack_ids, list)
-                else [],
+                "packIds": effective_pack_ids,
             }
         )
     return projects

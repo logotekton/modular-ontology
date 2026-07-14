@@ -337,6 +337,48 @@ def test_pack_index_reads_registry_without_sqlite(monkeypatch, tmp_path) -> None
     ]
 
 
+def test_pack_index_applies_registry_common_packs_to_every_project(monkeypatch) -> None:
+    from modular_ontology import pack_index
+
+    monkeypatch.setattr(
+        pack_index,
+        "_registry_payload",
+        lambda: {
+            "commonPackIds": ["common-pack", "missing-pack"],
+            "projects": [
+                {"id": "project-a", "name": "Project A", "packIds": ["project-pack", "common-pack"]},
+                {"id": "project-b", "name": "Project B", "packIds": []},
+            ],
+        },
+    )
+    monkeypatch.setattr(pack_index, "DATA_DIR", Path("does-not-exist"))
+
+    projects = pack_index._registry_projects([{"id": "project-pack"}, {"id": "common-pack"}])
+
+    assert projects[0]["packIds"] == ["common-pack", "project-pack"]
+    assert projects[1]["packIds"] == ["common-pack"]
+
+
+def test_pack_index_applies_common_marker_to_stored_projects(monkeypatch, tmp_path) -> None:
+    from modular_ontology import pack_index, project_store
+
+    links_path = tmp_path / "02_Projects" / ".drive-project-pack-links.json"
+    links_path.parent.mkdir(parents=True, exist_ok=True)
+    links_path.write_text(json.dumps({"__common__": ["common-pack"]}), encoding="utf-8")
+    monkeypatch.setattr(pack_index, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(pack_index, "EPHEMERAL_STORAGE", False)
+    monkeypatch.setattr(pack_index, "list_packs", lambda: [{"id": "project-pack"}, {"id": "common-pack"}])
+    monkeypatch.setattr(
+        project_store,
+        "list_projects",
+        lambda _packs: [{"id": "project-a", "name": "Project A", "packIds": ["project-pack"]}],
+    )
+
+    projects = pack_index.list_projects()
+
+    assert projects[0]["packIds"] == ["common-pack", "project-pack"]
+
+
 def test_build_pack_registry_includes_drive_file_mapping(monkeypatch, tmp_path) -> None:
     from modular_ontology import pack_index, project_store
 
@@ -375,6 +417,34 @@ def test_build_pack_registry_includes_drive_file_mapping(monkeypatch, tmp_path) 
     assert registry["commonPackIds"] == ["common-pack"]
     assert registry["projects"][0]["packIds"] == ["pack-a"]
     assert registry["packs"][0]["drive"]["fileId"] == "drive-pack-a"
+
+
+def test_build_pack_registry_merges_valid_common_packs_into_projects(monkeypatch, tmp_path) -> None:
+    from modular_ontology import pack_index, project_store
+
+    links_path = tmp_path / "02_Projects" / ".drive-project-pack-links.json"
+    links_path.parent.mkdir(parents=True, exist_ok=True)
+    links_path.write_text(
+        json.dumps({"__common__": ["common-pack", "missing-pack"]}),
+        encoding="utf-8",
+    )
+    summaries = [
+        {"id": "project-pack", "filename": "project-pack.zip", "counts": {}},
+        {"id": "common-pack", "filename": "common-pack.zip", "counts": {}},
+    ]
+    monkeypatch.setattr(pack_index, "list_packs", lambda: summaries)
+    monkeypatch.setattr(pack_index, "unique_pack_files", lambda: [])
+    monkeypatch.setattr(
+        project_store,
+        "list_projects",
+        lambda _packs: [{"id": "project-a", "name": "Project A", "packIds": ["project-pack"]}],
+    )
+
+    registry_path = build_pack_registry(data_dir=tmp_path)
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+
+    assert registry["commonPackIds"] == ["common-pack", "missing-pack"]
+    assert registry["projects"][0]["packIds"] == ["common-pack", "project-pack"]
 
 
 def test_fetch_pack_file_from_drive_downloads_only_requested_pack(tmp_path) -> None:

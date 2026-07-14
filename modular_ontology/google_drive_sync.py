@@ -803,6 +803,37 @@ def build_pack_registry(*, data_dir: Path = DATA_DIR) -> Path:
         registry_packs.append(registry_summary)
 
     db_stat = DB_PATH.stat() if DB_PATH.exists() else None
+    project_pack_links = _read_project_pack_links(data_dir)
+    valid_pack_ids = {str(pack.get("id")) for pack in registry_packs if pack.get("id")}
+    common_pack_ids = project_pack_links.get(COMMON_PROJECT_PACK_LINKS_KEY, [])
+    valid_common_pack_ids = [
+        pack_id
+        for pack_id in common_pack_ids
+        if pack_id in valid_pack_ids
+    ]
+    effective_projects = []
+    for project in projects:
+        project_pack_ids = project.get("packIds")
+        effective_projects.append(
+            {
+                **project,
+                "packIds": list(
+                    dict.fromkeys(
+                        [
+                            *valid_common_pack_ids,
+                            *(
+                                str(pack_id)
+                                for pack_id in project_pack_ids
+                                if str(pack_id) in valid_pack_ids
+                            ),
+                        ]
+                    )
+                )
+                if isinstance(project_pack_ids, list)
+                else list(valid_common_pack_ids),
+            }
+        )
+
     registry = {
         "version": 1,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
@@ -810,8 +841,8 @@ def build_pack_registry(*, data_dir: Path = DATA_DIR) -> Path:
             "sizeBytes": db_stat.st_size if db_stat else 0,
             "modifiedTime": datetime.fromtimestamp(db_stat.st_mtime, timezone.utc).isoformat() if db_stat else "",
         },
-        "projects": projects,
-        "commonPackIds": _read_project_pack_links(data_dir).get(COMMON_PROJECT_PACK_LINKS_KEY, []),
+        "projects": effective_projects,
+        "commonPackIds": common_pack_ids,
         "packs": registry_packs,
     }
     path = data_dir / DATABASE_FOLDER / PACK_REGISTRY_FILENAME
