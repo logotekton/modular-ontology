@@ -1841,6 +1841,42 @@ def test_project_ask_returns_ranked_client_synthesis_evidence_without_openai(mon
     assert payload["evidence"][0]["signals"] == {"lexical": 3.0}
 
 
+def test_project_ask_removes_redundant_project_scope_words(monkeypatch) -> None:
+    projects = {"경기도-모듈러-공동주택": {"id": "경기도-모듈러-공동주택", "packIds": []}}
+    captured: list[str] = []
+    monkeypatch.setattr(mcp_server, "_visible_project_by_id", lambda: projects)
+
+    def fake_search(project_id, search_text, limit_per_pack=3):
+        captured.append(search_text)
+        return {
+            "results": [],
+            "retrieval": {
+                "mode": "bm25",
+                "scannedPacks": 0,
+                "indexedPacks": 0,
+                "fallbackPacks": 0,
+                "candidateCount": 0,
+                "partial": False,
+                "skippedFallbackPacks": 0,
+                "dbMs": 0.0,
+                "fallbackMs": 0.0,
+                "elapsedMs": 0.0,
+            },
+        }
+
+    monkeypatch.setattr(mcp_server, "_fast_project_search_payload", fake_search)
+
+    payload = json.loads(
+        mcp_server.mo_project_ask(
+            "경기도-모듈러-공동주택",
+            "모듈러 공동주택의 화장실 면적은 얼마인가?",
+        )
+    )
+
+    assert captured == ["화장실 면적은"]
+    assert payload["status"] == "no_answer"
+
+
 def test_project_ask_no_answer_and_manifest_guidance(monkeypatch) -> None:
     projects = {"sample-project": {"id": "sample-project", "packIds": []}}
     monkeypatch.setattr(mcp_server, "_visible_project_by_id", lambda: projects)

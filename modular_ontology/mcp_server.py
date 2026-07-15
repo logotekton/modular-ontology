@@ -3024,6 +3024,29 @@ def _project_pack_projection(pack: dict) -> dict:
     }
 
 
+def _project_question_search_text(project_id: str, question: str) -> str:
+    """Remove project-scope words and question boilerplate before retrieval."""
+
+    cleaned = question.strip()
+    for token in re.findall(r"[0-9A-Za-z가-힣]{2,}", project_id):
+        cleaned = re.sub(re.escape(token), " ", cleaned, flags=re.IGNORECASE)
+    for phrase in (
+        "얼마인가요",
+        "얼마인가",
+        "얼마야",
+        "무엇인가요",
+        "무엇인가",
+        "무엇이야",
+        "알려주세요",
+        "알려줘",
+    ):
+        cleaned = cleaned.replace(phrase, " ")
+    cleaned = re.sub(r"^[\s,.;:!?？]*(?:의|에서|에)\s+", "", cleaned)
+    cleaned = re.sub(r"[?？]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned if len(cleaned) >= 2 else question.strip()
+
+
 def _legacy_project_search_payload(project_id: str, search_text: str, limit_per_pack: int = 3) -> dict:
     packs_by_id, unique_pack_ids = _project_search_scope(project_id)
     results = []
@@ -3183,7 +3206,11 @@ def _project_tool_response(tool: str, project_id: str, payload: dict) -> str:
 def _project_ask_payload(project_id: str, question: str, top_k: int = 8) -> dict:
     started = time.perf_counter()
     bounded_top_k = max(1, min(20, int(top_k)))
-    search_payload = _fast_project_search_payload(project_id, question, limit_per_pack=3)
+    search_payload = _fast_project_search_payload(
+        project_id,
+        _project_question_search_text(project_id, question),
+        limit_per_pack=3,
+    )
     candidates = []
     for result in search_payload["results"]:
         pack = result["pack"]
