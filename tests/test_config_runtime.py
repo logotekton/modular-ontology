@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from modular_ontology.config import is_ephemeral_runtime
-from modular_ontology import store
+from modular_ontology import project_store, store
 
 
 def test_ephemeral_runtime_detects_vercel_and_lambda_environment() -> None:
@@ -28,6 +28,16 @@ def test_ephemeral_sqlite_connection_uses_memory_journal(monkeypatch, tmp_path: 
     monkeypatch.setattr(store, "EPHEMERAL_STORAGE", True)
 
     conn = store.connect(tmp_path / "runtime.sqlite3")
+    try:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "memory"
+    finally:
+        conn.close()
+
+
+def test_ephemeral_project_connection_uses_memory_journal(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(project_store, "EPHEMERAL_STORAGE", True)
+
+    conn = project_store.connect(tmp_path / "projects.sqlite3")
     try:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "memory"
     finally:
