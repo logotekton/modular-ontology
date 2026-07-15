@@ -121,20 +121,46 @@ def _ensure_bm25_schema(conn: sqlite3.Connection) -> bool:
         return False
 
 
-def index_all_packs(db_path: Path | None = None) -> dict[str, Any]:
+def index_all_packs(
+    db_path: Path | None = None,
+    *,
+    prune_missing: bool = False,
+) -> dict[str, Any]:
     conn = connect(db_path)
     try:
         init_db(conn)
         indexed = []
         for pack in unique_pack_files():
             indexed.append(index_pack(conn, pack))
+        pruned_pack_ids: list[str] = []
+        if prune_missing:
+            active_pack_ids = {str(item["id"]) for item in indexed}
+            stale_rows = conn.execute("SELECT id FROM packs ORDER BY id").fetchall()
+            pruned_pack_ids = [str(row["id"]) for row in stale_rows if str(row["id"]) not in active_pack_ids]
+            if pruned_pack_ids:
+                project_links_exist = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'project_packs'"
+                ).fetchone() is not None
+                bm25_available = _ensure_bm25_schema(conn)
+                with conn:
+                    for pack_id in pruned_pack_ids:
+                        if bm25_available:
+                            _delete_bm25_pack_rows(conn, pack_id)
+                        if project_links_exist:
+                            conn.execute("DELETE FROM project_packs WHERE pack_id = ?", (pack_id,))
+                        conn.execute("DELETE FROM packs WHERE id = ?", (pack_id,))
         if _ensure_bm25_schema(conn):
             with conn:
                 conn.execute("INSERT INTO documents_bm25(documents_bm25) VALUES ('optimize')")
             invalidate_index_caches(_connection_db_path(conn))
         stats: dict[str, Any] = index_stats(conn)
         stats["bm25"] = bm25_index_status(db_path, ttl_seconds=0)
-        return {"status": "indexed", "packs": indexed, "stats": stats}
+        return {
+            "status": "indexed",
+            "packs": indexed,
+            "prunedPackIds": pruned_pack_ids,
+            "stats": stats,
+        }
     finally:
         conn.close()
 

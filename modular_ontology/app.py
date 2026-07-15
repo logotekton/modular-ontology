@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
 import shlex
@@ -96,25 +97,131 @@ IFC_UPLOAD_DIR = DATA_DIR / IFC_MODELS_FOLDER
 PUBLIC_MCP_DOMAIN = str(env("MODULAR_ONTOLOGY_PUBLIC_MCP_DOMAIN", "modular-ontology.xyz"))
 PUBLIC_MCP_BASE_URL = f"https://{PUBLIC_MCP_DOMAIN}"
 PUBLIC_MCP_URL = f"{PUBLIC_MCP_BASE_URL}/mcp"
-VERCEL_MCP_HOSTS = (
-    f"{PUBLIC_MCP_DOMAIN},"
-    "modular-ontology.vercel.app,"
-    "modular-ontology-ythongs-projects.vercel.app,"
-    "modular-ontology-ghddudxor12-8502-ythongs-projects.vercel.app"
+_FIXED_MCP_ALLOWED_HOSTS = (
+    PUBLIC_MCP_DOMAIN,
+    "modular-ontology.vercel.app",
+    "modular-ontology-ythongs-projects.vercel.app",
+    "modular-ontology-ghddudxor12-8502-ythongs-projects.vercel.app",
 )
+_VERCEL_RUNTIME_HOST_ENV_NAMES = (
+    "VERCEL_URL",
+    "VERCEL_BRANCH_URL",
+    "VERCEL_PROJECT_PRODUCTION_URL",
+)
+_DEFAULT_PROJECT_GRAPH_MAX_PACKS = 16
+
+
+def _project_graph_max_packs() -> int:
+    raw = env("MODULAR_ONTOLOGY_PROJECT_GRAPH_MAX_PACKS", str(_DEFAULT_PROJECT_GRAPH_MAX_PACKS))
+    try:
+        value = int(str(raw))
+    except (TypeError, ValueError):
+        value = _DEFAULT_PROJECT_GRAPH_MAX_PACKS
+    return max(1, min(value, 100))
+
+
+def _default_project_graph_pack_ids(project_pack_ids: list[str], limit: int) -> list[str]:
+    """Prefer project-specific packs and keep a bounded cold Drive fan-out."""
+
+    summaries = {str(pack.get("id") or ""): pack for pack in list_packs()}
+    project_specific = [
+        pack_id
+        for pack_id in project_pack_ids
+        if not bool(summaries.get(pack_id, {}).get("commonScoped"))
+    ]
+    project_specific_ids = set(project_specific)
+    common = [pack_id for pack_id in project_pack_ids if pack_id not in project_specific_ids]
+    if len(project_specific) >= limit:
+        return project_specific[-limit:]
+    remaining = limit - len(project_specific)
+    return [*project_specific, *common[-remaining:]]
+
+
+def _normalize_mcp_allowed_host(value: Any) -> str | None:
+    """Convert an allowlist value or URL to the exact Host form understood by MCP."""
+    raw = str(value or "").strip()
+    if not raw or any(ord(character) < 32 for character in raw):
+        return None
+
+    wildcard_port = raw.endswith(":*") and "://" not in raw
+    if wildcard_port:
+        raw = raw[:-2]
+    if "*" in raw:
+        # MCP supports only an exact host or an exact host with a wildcard port.
+        return None
+
+    try:
+        parsed = urlsplit(raw if "://" in raw else f"//{raw}")
+    except ValueError:
+        return None
+    if parsed.scheme and parsed.scheme.lower() not in {"http", "https"}:
+        return None
+    if not parsed.netloc or parsed.username is not None or parsed.password is not None:
+        return None
+    try:
+        hostname = (parsed.hostname or "").rstrip(".").lower()
+        port = parsed.port
+    except ValueError:
+        return None
+    if not hostname or any(character.isspace() or character in "%/?#@," for character in hostname):
+        return None
+    try:
+        hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None
+    if ":" in hostname:
+        try:
+            ipaddress.IPv6Address(hostname)
+        except ValueError:
+            return None
+    else:
+        labels = hostname.split(".")
+        if len(hostname) > 253 or any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or any(not (character.isalnum() or character == "-") for character in label)
+            for label in labels
+        ):
+            return None
+
+    normalized = f"[{hostname}]" if ":" in hostname else hostname
+    default_port = (parsed.scheme.lower() == "https" and port == 443) or (
+        parsed.scheme.lower() == "http" and port == 80
+    )
+    if port is not None and not default_port:
+        normalized = f"{normalized}:{port}"
+    if wildcard_port:
+        normalized = f"{normalized}:*"
+    return normalized
+
+
+def _build_mcp_allowed_hosts() -> list[str]:
+    candidates: list[Any] = [
+        *_FIXED_MCP_ALLOWED_HOSTS,
+        *(os.environ.get(name) for name in _VERCEL_RUNTIME_HOST_ENV_NAMES),
+        *(str(env("MODULAR_ONTOLOGY_MCP_ALLOWED_HOSTS") or "").split(",")),
+        "127.0.0.1:*",
+        "localhost:*",
+        "[::1]:*",
+        "testserver",
+    ]
+    allowed_hosts: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = _normalize_mcp_allowed_host(candidate)
+        if normalized and normalized not in seen:
+            allowed_hosts.append(normalized)
+            seen.add(normalized)
+    return allowed_hosts
+
 
 configure_mcp_server(
     host="127.0.0.1",
     port=8011,
     path="/{mcp_token}",
-    allowed_hosts=[
-        host
-        for host in (
-            env("MODULAR_ONTOLOGY_MCP_ALLOWED_HOSTS")
-            or f"{VERCEL_MCP_HOSTS},127.0.0.1:*,localhost:*,[::1]:*,testserver"
-        ).split(",")
-        if host.strip()
-    ],
+    allowed_hosts=_build_mcp_allowed_hosts(),
     allowed_origins=[
         origin
         for origin in (
@@ -536,21 +643,30 @@ def _ifc_project_folder(metadata_path: Path) -> str:
 
 
 def _ensure_ifc_local_files(metadata_path: Path, metadata: dict[str, Any]) -> None:
-    """Lazily restore the model file (and its XKT sibling) from Drive if they are not on local disk."""
+    """Lazily restore only the XKT asset required by the browser viewer."""
     if not google_drive_sync_enabled():
         return
     model_path = _model_file_path(metadata_path, metadata)
-    wanted: list[str] = []
-    if not model_path.exists():
-        wanted.append(model_path.name)
-    if model_path.suffix.lower() != ".xkt" and not _candidate_xkt_path(model_path, metadata):
-        wanted.append(model_path.with_suffix(".xkt").name)
-    if not wanted:
+    if _candidate_xkt_path(model_path, metadata):
         return
+    if model_path.suffix.lower() == ".xkt":
+        xkt_filename = model_path.name
+    else:
+        recorded = str(metadata.get("xktPath") or "").strip()
+        recorded_name = Path(recorded.replace("\\", "/")).name if recorded else ""
+        xkt_filename = (
+            recorded_name
+            if Path(recorded_name).suffix.lower() == ".xkt"
+            else model_path.with_suffix(".xkt").name
+        )
     try:
-        restore_ifc_files_from_drive(_ifc_project_folder(metadata_path), wanted, model_path.parent)
-    except Exception:
-        return
+        restore_ifc_files_from_drive(
+            _ifc_project_folder(metadata_path),
+            [xkt_filename],
+            model_path.parent,
+        )
+    except Exception as exc:
+        raise RuntimeError("XKT asset could not be restored from Google Drive.") from exc
 
 
 def _candidate_xkt_path(model_path: Path, metadata: dict[str, Any]) -> Path | None:
@@ -559,6 +675,9 @@ def _candidate_xkt_path(model_path: Path, metadata: dict[str, Any]) -> Path | No
         path = Path(recorded)
         if path.exists():
             return path
+        restored_path = model_path.parent / Path(recorded.replace("\\", "/")).name
+        if restored_path.exists():
+            return restored_path
     if model_path.suffix.lower() == ".xkt" and model_path.exists():
         return model_path
     sibling = model_path.with_suffix(".xkt")
@@ -1458,8 +1577,13 @@ def reindex(full: bool = False, authorization: str | None = Header(default=None)
             if drive_projects.get("accessRenamed") or drive_projects.get("accessRemoved"):
                 result["usersWriteBack"] = require_google_drive_write_back(run_google_drive_write_back("users"))
         return result
-    require_google_drive_sync(run_google_drive_sync(force=True))
-    result = index_all_packs()
+    full_sync = require_google_drive_sync(run_google_drive_sync(force=True))
+    if full_sync.get("status") != "synced" or full_sync.get("missing") or full_sync.get("warnings"):
+        raise HTTPException(
+            status_code=502,
+            detail="Full Drive sync was incomplete; refusing to prune the local ontology index.",
+        )
+    result = index_all_packs(prune_missing=True)
     result["driveProjects"] = _apply_drive_project_folders()
     result["projectPackLinks"] = _apply_drive_project_pack_links()
     result["projects"] = list_projects()
@@ -1480,6 +1604,8 @@ def graph(
     ensure_pack_access(pack_id, current_user(authorization))
     try:
         return build_graph(pack_id=pack_id, max_nodes=max_nodes, max_edges=max_edges)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Pack not found: {pack_id}") from None
 
@@ -1501,20 +1627,42 @@ def project_graph(
         for pack_id in (pack_ids or "").split(",")
         if pack_id.strip()
     ]
-    active_pack_ids = requested_pack_ids or project_pack_ids
+    pack_limit = _project_graph_max_packs()
+    if len(requested_pack_ids) > pack_limit:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"A project graph can load at most {pack_limit} packs per request. "
+                "Select fewer packs to keep lazy graph loading within the serverless time budget."
+            ),
+        )
+    active_pack_ids = requested_pack_ids or _default_project_graph_pack_ids(project_pack_ids, pack_limit)
+    selection_truncated = not requested_pack_ids and len(project_pack_ids) > len(active_pack_ids)
     invalid_pack_ids = [pack_id for pack_id in active_pack_ids if pack_id not in project_pack_ids]
     if invalid_pack_ids:
         raise HTTPException(status_code=400, detail=f"Packs are not linked to this project: {', '.join(invalid_pack_ids)}")
     for pack_id in active_pack_ids:
         ensure_pack_access(pack_id, user)
     try:
-        return build_multi_pack_graph(
+        result = build_multi_pack_graph(
             active_pack_ids,
             title=project["name"],
             project=project,
             max_nodes=max_nodes,
             max_edges=max_edges,
         )
+        diagnostics = result.setdefault("diagnostics", {})
+        diagnostics.update(
+            {
+                "projectPackSelectionTruncated": selection_truncated,
+                "projectPacksAvailable": len(project_pack_ids),
+                "projectPacksLoaded": len(active_pack_ids),
+                "projectGraphPackLimit": pack_limit,
+            }
+        )
+        return result
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"Pack not found: {exc}") from None
 
@@ -1659,7 +1807,10 @@ def ifc_models(authorization: str | None = Header(default=None)) -> list[dict[st
 @app.get("/api/ifc/model-viewer/manifest")
 def ifc_model_viewer_manifest(model_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     metadata_path, raw_metadata, public_metadata = _ensure_ifc_model_access(model_id, authorization)
-    _ensure_ifc_local_files(metadata_path, raw_metadata)
+    try:
+        _ensure_ifc_local_files(metadata_path, raw_metadata)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     model_path = _model_file_path(metadata_path, raw_metadata)
     xkt_path = _candidate_xkt_path(model_path, raw_metadata)
     status = "ready" if xkt_path else str(raw_metadata.get("viewerStatus") or "pending-xkt")
@@ -1682,7 +1833,10 @@ def ifc_model_viewer_manifest(model_id: str, authorization: str | None = Header(
 @app.get("/api/ifc/model-viewer/asset")
 def ifc_model_viewer_asset(model_id: str, authorization: str | None = Header(default=None)) -> FileResponse:
     metadata_path, raw_metadata, _public_metadata = _ensure_ifc_model_access(model_id, authorization)
-    _ensure_ifc_local_files(metadata_path, raw_metadata)
+    try:
+        _ensure_ifc_local_files(metadata_path, raw_metadata)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     xkt_path = _candidate_xkt_path(_model_file_path(metadata_path, raw_metadata), raw_metadata)
     if not xkt_path or not xkt_path.exists():
         raise HTTPException(status_code=404, detail="XKT asset is not available for this model.")

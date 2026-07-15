@@ -11,6 +11,7 @@ from modular_ontology.pack_index import PackFile, query_terms, search_tokens
 from modular_ontology.store import (
     bm25_index_status,
     connect,
+    index_all_packs,
     index_pack,
     init_db,
     pack_ids_with_documents,
@@ -169,6 +170,29 @@ def test_index_pack_invalidates_indexed_pack_cache(tmp_path: Path) -> None:
     conn.close()
 
     assert pack_ids_with_documents(db_path) == frozenset({"pack-a", "pack-b"})
+
+
+def test_index_all_packs_can_prune_records_missing_from_authoritative_drive_cache(monkeypatch, tmp_path: Path) -> None:
+    db_path = tmp_path / "index.sqlite3"
+    active_pack = _write_pack(tmp_path / "active.zip", pack_id="active-pack")
+    stale_pack = _write_pack(tmp_path / "stale.zip", pack_id="stale-pack")
+    conn = connect(db_path)
+    init_db(conn)
+    index_pack(conn, active_pack)
+    index_pack(conn, stale_pack)
+    conn.close()
+    monkeypatch.setattr("modular_ontology.store.unique_pack_files", lambda: [active_pack])
+
+    result = index_all_packs(db_path, prune_missing=True)
+
+    assert result["prunedPackIds"] == ["stale-pack"]
+    conn = connect(db_path)
+    try:
+        assert [row[0] for row in conn.execute("SELECT id FROM packs ORDER BY id")] == ["active-pack"]
+        assert conn.execute("SELECT COUNT(*) FROM documents WHERE pack_id = 'stale-pack'").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM documents_bm25").fetchone()[0] == 1
+    finally:
+        conn.close()
 
 
 def test_search_tokens_preserve_frequency_while_query_terms_remain_unique() -> None:

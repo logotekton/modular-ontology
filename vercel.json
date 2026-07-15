@@ -4,7 +4,7 @@
   "functions": {
     "api/**/*.py": {
       "maxDuration": 300,
-      "includeFiles": "node_modules/{@xeokit/**,@loaders.gl/**,@math.gl/**,web-ifc/**,commander/**,pako/**,laz-perf/**,draco3d/**,ktx-parse/**,texture-compressor/**,pngjs/**,web-streams-polyfill/**}",
+      "includeFiles": "{snapshots/**,canonical_packs/**,node_modules/{@xeokit/**,@loaders.gl/**,@math.gl/**,web-ifc/**,commander/**,pako/**,laz-perf/**,draco3d/**,ktx-parse/**,texture-compressor/**,pngjs/**,web-streams-polyfill/**}}",
       "excludeFiles": "{tests/**,__tests__/**,**/*.test.py,fixtures/**,__fixtures__/**,testdata/**,sample-data/**,docs/**,manus_harness/**,scripts/**,tools/**,google_drive_staging/**,backups/**,original file/**,dist/**}"
     }
   },

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sqlite3
 import sys
 import urllib.error
 import zipfile
@@ -2670,6 +2671,30 @@ def test_admin_reindex_api_requires_admin_session(monkeypatch, tmp_path) -> None
 
 
 def test_google_drive_sync_downloads_runtime_storage(tmp_path) -> None:
+    source_database = tmp_path / "source.sqlite3"
+    conn = sqlite3.connect(source_database)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE packs (id TEXT PRIMARY KEY);
+            CREATE TABLE projects (id TEXT PRIMARY KEY);
+            CREATE TABLE project_packs (project_id TEXT, pack_id TEXT);
+            INSERT INTO packs VALUES ('sample-pack');
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    registry = {
+        "version": 1,
+        "projects": [],
+        "commonPackIds": [],
+        "packs": [{"id": "sample-pack", "drive": {"fileId": "pack"}}],
+    }
+    pack_stream = io.BytesIO()
+    with zipfile.ZipFile(pack_stream, "w") as zf:
+        zf.writestr("manifest.json", json.dumps({"pack_id": "sample-pack"}))
+
     class FakeDriveClient:
         children = {
             "root": [
@@ -2682,7 +2707,10 @@ def test_google_drive_sync_downloads_runtime_storage(tmp_path) -> None:
                 DriveItem("mcp", "mcp_remote.json", "application/json"),
                 DriveItem("mcp_tokens", "mcp_tokens.json", "application/json"),
             ],
-            "database": [DriveItem("db", "modular_ontology.sqlite3", "application/octet-stream")],
+            "database": [
+                DriveItem("registry", "pack_registry.json", "application/json"),
+                DriveItem("db", "modular_ontology.sqlite3", "application/octet-stream"),
+            ],
             "packs": [DriveItem("indexed", "indexed", "application/vnd.google-apps.folder")],
             "indexed": [
                 DriveItem("pack", "sample-pack.zip", "application/x-zip-compressed"),
@@ -2694,8 +2722,9 @@ def test_google_drive_sync_downloads_runtime_storage(tmp_path) -> None:
             "users": b'{"users":[]}',
             "mcp": b'{"publicUrl":""}',
             "mcp_tokens": b'{"tokens":[]}',
-            "db": b"sqlite-bytes",
-            "pack": b"zip-bytes",
+            "registry": json.dumps(registry).encode("utf-8"),
+            "db": source_database.read_bytes(),
+            "pack": pack_stream.getvalue(),
         }
 
         def list_children(self, folder_id):
@@ -2716,8 +2745,8 @@ def test_google_drive_sync_downloads_runtime_storage(tmp_path) -> None:
     assert (tmp_path / "00_Admin" / "users.json").read_text(encoding="utf-8") == '{"users":[]}'
     assert (tmp_path / "00_Admin" / "mcp_remote.json").exists()
     assert (tmp_path / "00_Admin" / "mcp_tokens.json").exists()
-    assert (tmp_path / "01_Database" / "modular_ontology.sqlite3").read_bytes() == b"sqlite-bytes"
-    assert (tmp_path / "04_Ontology_Packs" / "indexed" / "sample-pack.zip").read_bytes() == b"zip-bytes"
+    assert (tmp_path / "01_Database" / "modular_ontology.sqlite3").read_bytes() == source_database.read_bytes()
+    assert (tmp_path / "04_Ontology_Packs" / "indexed" / "sample-pack.zip").read_bytes() == pack_stream.getvalue()
     assert not (tmp_path / "04_Ontology_Packs" / "indexed" / "README.md").exists()
 
 
@@ -3401,9 +3430,20 @@ def test_google_drive_sync_updates_project_metadata_when_xkt_is_added(tmp_path) 
 
 
 def test_google_drive_sync_prunes_removed_project_ifc_metadata(tmp_path) -> None:
+    registry = {
+        "version": 1,
+        "projects": [{"id": "samcheok-building-b", "driveFolderId": "project", "packIds": []}],
+        "commonPackIds": [],
+        "packs": [{"id": "inventory-anchor", "drive": {"fileId": "anchor-file"}}],
+    }
+
     class FakeDriveClient:
         children = {
-            "root": [DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder")],
+            "root": [
+                DriveItem("database", "01_Database", "application/vnd.google-apps.folder"),
+                DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder"),
+            ],
+            "database": [DriveItem("registry", "pack_registry.json", "application/json")],
             "projects-root": [DriveItem("project", "samcheok-building-b", "application/vnd.google-apps.folder")],
             "project": [DriveItem("ifc-folder", "ifc-models", "application/vnd.google-apps.folder")],
             "ifc-folder": [DriveItem("ifc", "sample.ifc", "application/octet-stream", "2026-06-11T00:00:00Z", 1200)],
@@ -3413,7 +3453,9 @@ def test_google_drive_sync_prunes_removed_project_ifc_metadata(tmp_path) -> None
             return self.children.get(folder_id, [])
 
         def download_file(self, file_id, target):
-            raise AssertionError("manual IFC registration should not download raw model files")
+            assert file_id == "registry"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(registry), encoding="utf-8")
 
     fake_client = FakeDriveClient()
     sync_google_drive_storage(client=fake_client, root_folder_id="root", data_dir=tmp_path, force=True)
@@ -3427,9 +3469,20 @@ def test_google_drive_sync_prunes_removed_project_ifc_metadata(tmp_path) -> None
 
 
 def test_google_drive_sync_prunes_deleted_project_assets(tmp_path) -> None:
+    registry = {
+        "version": 1,
+        "projects": [{"id": "active-project", "driveFolderId": "active-project", "packIds": []}],
+        "commonPackIds": [],
+        "packs": [{"id": "inventory-anchor", "drive": {"fileId": "anchor-file"}}],
+    }
+
     class FakeDriveClient:
         children = {
-            "root": [DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder")],
+            "root": [
+                DriveItem("database", "01_Database", "application/vnd.google-apps.folder"),
+                DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder"),
+            ],
+            "database": [DriveItem("registry", "pack_registry.json", "application/json")],
             "projects-root": [DriveItem("active-project", "active-project", "application/vnd.google-apps.folder")],
             "active-project": [DriveItem("ifc-folder", "ifc-models", "application/vnd.google-apps.folder")],
             "ifc-folder": [],
@@ -3439,7 +3492,9 @@ def test_google_drive_sync_prunes_deleted_project_assets(tmp_path) -> None:
             return self.children.get(folder_id, [])
 
         def download_file(self, file_id, target):
-            raise AssertionError("No files should be downloaded")
+            assert file_id == "registry"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(registry), encoding="utf-8")
 
     deleted_metadata_dir = tmp_path / "03_IFC_Models" / "deleted-project" / "metadata"
     deleted_metadata_dir.mkdir(parents=True)
@@ -3470,6 +3525,26 @@ def test_google_drive_sync_prunes_deleted_project_assets(tmp_path) -> None:
 
 def test_google_drive_sync_downloads_legacy_database_filename(tmp_path) -> None:
     legacy_db_name = "mod" + "dular_" + "graph.sqlite3"
+    source_database = tmp_path / "legacy-source.sqlite3"
+    conn = sqlite3.connect(source_database)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE packs (id TEXT PRIMARY KEY);
+            CREATE TABLE projects (id TEXT PRIMARY KEY);
+            CREATE TABLE project_packs (project_id TEXT, pack_id TEXT);
+            INSERT INTO packs VALUES ('inventory-anchor');
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    registry = {
+        "version": 1,
+        "projects": [],
+        "commonPackIds": [],
+        "packs": [{"id": "inventory-anchor", "drive": {"fileId": "anchor-file"}}],
+    }
 
     class FakeDriveClient:
         children = {
@@ -3479,7 +3554,10 @@ def test_google_drive_sync_downloads_legacy_database_filename(tmp_path) -> None:
                 DriveItem("packs", "04_Ontology_Packs", "application/vnd.google-apps.folder"),
             ],
             "admin": [],
-            "database": [DriveItem("db", legacy_db_name, "application/octet-stream")],
+            "database": [
+                DriveItem("registry", "pack_registry.json", "application/json"),
+                DriveItem("db", legacy_db_name, "application/octet-stream"),
+            ],
             "packs": [],
         }
 
@@ -3488,7 +3566,10 @@ def test_google_drive_sync_downloads_legacy_database_filename(tmp_path) -> None:
 
         def download_file(self, file_id, target):
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(b"legacy-sqlite-bytes")
+            if file_id == "registry":
+                target.write_text(json.dumps(registry), encoding="utf-8")
+            else:
+                target.write_bytes(source_database.read_bytes())
 
     result = sync_google_drive_storage(
         client=FakeDriveClient(),
@@ -3498,7 +3579,7 @@ def test_google_drive_sync_downloads_legacy_database_filename(tmp_path) -> None:
     )
 
     assert result["status"] == "synced"
-    assert (tmp_path / "01_Database" / "modular_ontology.sqlite3").read_bytes() == b"legacy-sqlite-bytes"
+    assert (tmp_path / "01_Database" / "modular_ontology.sqlite3").read_bytes() == source_database.read_bytes()
 
 
 def test_new_env_helper_reads_legacy_prefix(monkeypatch) -> None:

@@ -10,7 +10,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from .config import DB_PATH, LEGACY_STRUCTURED_PACKS_DIR, PACKS_DIR, ROOT, USE_STRUCTURED_DATA_DIR
+from .config import (
+    DATA_DIR,
+    DATABASE_FOLDER,
+    DB_PATH,
+    EPHEMERAL_STORAGE,
+    LEGACY_STRUCTURED_PACKS_DIR,
+    PACKS_DIR,
+    PROJECTS_FOLDER,
+    ROOT,
+    USE_STRUCTURED_DATA_DIR,
+)
 
 UPLOAD_DIR = PACKS_DIR
 
@@ -226,6 +236,28 @@ _SUMMARIZE_CACHE: dict[str, tuple[tuple[float, int], dict[str, Any]]] = {}
 _PACK_LOOKUP_CACHE: dict[str, PackFile] = {}
 
 
+class _LazySharedDriveClient:
+    """Create one Drive client only if this graph request has a cache miss.
+
+    A project graph can span many lazy pack ZIPs.  Creating a client inside
+    every ``find_pack`` call also creates fresh service-account credentials,
+    which turns one graph request into one OAuth refresh per pack on a cold
+    serverless worker.  This small proxy keeps the normal local-cache path
+    free of Drive setup while sharing one authenticated client across all
+    misses in the request.
+    """
+
+    def __init__(self) -> None:
+        self._client: Any | None = None
+
+    def download_file(self, file_id: str, target: Path) -> None:
+        if self._client is None:
+            from .google_drive_sync import GoogleDriveClient
+
+            self._client = GoogleDriveClient.from_env()
+        self._client.download_file(file_id, target)
+
+
 def summarize_pack(pack: PackFile) -> dict[str, Any]:
     try:
         stat = pack.path.stat()
@@ -264,9 +296,24 @@ def _summarize_pack_uncached(pack: PackFile) -> dict[str, Any]:
                 "chunks",
             )
         )
-        node_count = counts.get("nodes") or _count_lines(zf, graph_nodes_path) or derived_node_count
-        edge_count = counts.get("edges") or _count_lines(zf, graph_edges_path) or _count_lines(zf, "backdata/jsonl/edges.jsonl")
-        document_count = counts.get("documents") or len([name for name in names if name.startswith("documents/") and name.endswith(".md")])
+        # An explicit zero is meaningful for relationship-only shards.  Using
+        # ``or`` here used to turn ``nodes: 0`` into ``chunks + documents`` and
+        # made those shards look like they contained thousands of graph nodes.
+        node_count = (
+            int(counts.get("nodes") or 0)
+            if "nodes" in counts
+            else _count_lines(zf, graph_nodes_path) or derived_node_count
+        )
+        edge_count = (
+            int(counts.get("edges") or 0)
+            if "edges" in counts
+            else _count_lines(zf, graph_edges_path) or _count_lines(zf, "backdata/jsonl/edges.jsonl")
+        )
+        document_count = (
+            int(counts.get("documents") or 0)
+            if "documents" in counts
+            else len([name for name in names if name.startswith("documents/") and name.endswith(".md")])
+        )
 
         pack_id = str(manifest.get("pack_id") or pack.id)
         source_key = pack_id.lower()
@@ -315,14 +362,63 @@ def _extract_readme(zf: zipfile.ZipFile) -> str:
 
 
 def list_packs() -> list[dict[str, Any]]:
+    registry_summaries: list[dict[str, Any]] = []
+    if EPHEMERAL_STORAGE:
+        _sync_registry_from_drive()
+        registry_summaries = _registry_pack_summaries()
     packs = unique_pack_files()
     if packs:
-        return [summarize_pack(pack) for pack in packs]
+        direct_summaries = [summarize_pack(pack) for pack in packs]
+        if not EPHEMERAL_STORAGE:
+            return direct_summaries
+        return _merge_pack_summaries(registry_summaries, direct_summaries)
+    if registry_summaries:
+        return registry_summaries
     summaries = _db_pack_summaries()
     if summaries:
         return summaries
+    registry_summaries = _registry_pack_summaries()
+    if registry_summaries:
+        return registry_summaries
     _sync_registry_from_drive()
-    return _db_pack_summaries()
+    registry_summaries = _registry_pack_summaries()
+    return registry_summaries or _db_pack_summaries()
+
+
+def _pack_registry_path() -> Path:
+    from .google_drive_sync import PACK_REGISTRY_FILENAME
+
+    return DATA_DIR / DATABASE_FOLDER / PACK_REGISTRY_FILENAME
+
+
+def _registry_payload() -> dict[str, Any]:
+    try:
+        payload = json.loads(_pack_registry_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _registry_pack_summaries() -> list[dict[str, Any]]:
+    packs = _registry_payload().get("packs")
+    if not isinstance(packs, list):
+        return []
+    return [copy.deepcopy(pack) for pack in packs if isinstance(pack, dict) and pack.get("id")]
+
+
+def _merge_pack_summaries(
+    registry_summaries: list[dict[str, Any]],
+    direct_summaries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged = {str(summary["id"]): summary for summary in registry_summaries if summary.get("id")}
+    for summary in direct_summaries:
+        pack_id = str(summary.get("id") or "").strip()
+        if pack_id:
+            merged[pack_id] = summary
+    return sorted(
+        merged.values(),
+        key=lambda item: (str(item.get("title") or "").casefold(), str(item.get("id") or "")),
+    )
 
 
 def _sync_registry_from_drive() -> None:
@@ -411,7 +507,7 @@ def _db_pack_summary(pack_id: str, db_path: Path = DB_PATH) -> dict[str, Any] | 
     return _pack_summary_from_db_row(row) if row else None
 
 
-def find_pack(pack_id: str) -> PackFile:
+def find_pack(pack_id: str, *, drive_client: Any | None = None) -> PackFile:
     cached = _PACK_LOOKUP_CACHE.get(pack_id)
     if cached is not None and cached.path.exists():
         try:
@@ -432,6 +528,21 @@ def find_pack(pack_id: str) -> PackFile:
             _PACK_LOOKUP_CACHE[alias] = pack
         if pack.id == pack_id or pack.path.name == pack_id or summary_id == pack_id:
             return pack
+    try:
+        from .google_drive_sync import fetch_pack_file_from_drive
+
+        fetched = PackFile(fetch_pack_file_from_drive(pack_id, client=drive_client))
+        summary_id = str(summarize_pack(fetched)["id"])
+        for alias in {fetched.id, fetched.path.name, summary_id}:
+            _PACK_LOOKUP_CACHE[alias] = fetched
+        if pack_id in {fetched.id, fetched.path.name, summary_id}:
+            return fetched
+    except FileNotFoundError:
+        pass
+    except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as exc:
+        raise RuntimeError(
+            f"Ontology pack {pack_id!r} could not be restored from Google Drive."
+        ) from exc
     raise FileNotFoundError(pack_id)
 
 
@@ -967,6 +1078,14 @@ def build_graph(pack_id: str, max_nodes: int = 900, max_edges: int = 1600) -> di
     except FileNotFoundError:
         graph = _build_graph_from_db(pack_id, max_nodes=max_nodes, max_edges=max_edges)
         if graph:
+            expected_counts = graph.get("pack", {}).get("counts", {})
+            actual_stats = graph.get("stats", {})
+            expected_graph_items = int(expected_counts.get("nodes") or 0) + int(expected_counts.get("edges") or 0)
+            actual_graph_items = int(actual_stats.get("totalNodes") or 0) + int(actual_stats.get("totalEdges") or 0)
+            if EPHEMERAL_STORAGE and expected_graph_items > 0 and actual_graph_items == 0:
+                raise RuntimeError(
+                    f"Graph payload for pack {pack_id!r} could not be restored from Drive."
+                )
             return graph
         raise
 
@@ -1076,6 +1195,305 @@ def _build_graph_from_db(pack_id: str, max_nodes: int = 900, max_edges: int = 16
     }
 
 
+@dataclass(frozen=True)
+class _MultiPackNodeCandidate:
+    pack_id: str
+    pack_order: int
+    original_id: str
+    merged_id: str
+    pack_title: str
+    payload: bytes
+
+
+_MULTI_PACK_MAX_VISIBLE_NODES = 1_000
+_MULTI_PACK_MAX_VISIBLE_EDGES = 2_000
+_MULTI_PACK_MAX_SCANNED_NODES = 50_000
+_MULTI_PACK_MAX_SCANNED_EDGES_PER_PACK = 20_000
+# Vercel Functions reject response bodies above 4.5 MB. Keep a safety margin for
+# response headers and the framework serializer, then trim unusually large node
+# properties deterministically if the count limits alone are not sufficient.
+_MULTI_PACK_MAX_RESPONSE_BYTES = 4_000_000
+
+
+def _fair_limits(keys: list[str], total: int) -> dict[str, int]:
+    """Split a hard result/scan budget deterministically across pack ids."""
+    if not keys:
+        return {}
+    base, remainder = divmod(max(0, total), len(keys))
+    return {key: base + (1 if index < remainder else 0) for index, key in enumerate(keys)}
+
+
+def _capacity_aware_fair_limits(
+    keys: list[str],
+    total: int,
+    capacities: dict[str, int],
+) -> dict[str, int]:
+    """Reassign unused fair shares from small shards to larger shards."""
+
+    ordered_keys = list(dict.fromkeys(keys))
+    limits = {key: 0 for key in ordered_keys}
+    remaining = max(0, int(total))
+    active = ordered_keys
+    while active and remaining > 0:
+        share = max(1, remaining // len(active))
+        next_active: list[str] = []
+        progressed = False
+        for key in active:
+            # Unknown or under-reported manifest counts must not starve a real
+            # payload shard, so they retain access to the remaining hard budget.
+            raw_capacity = int(capacities.get(key, 0) or 0)
+            capacity = raw_capacity if raw_capacity > 0 else total
+            available = max(0, capacity - limits[key])
+            allocation = min(share, available, remaining)
+            if allocation:
+                limits[key] += allocation
+                remaining -= allocation
+                progressed = True
+            if limits[key] < capacity and remaining > 0:
+                next_active.append(key)
+        if not progressed:
+            break
+        active = next_active
+    return limits
+
+
+def _multi_pack_entrypoints(zf: zipfile.ZipFile) -> tuple[str, str]:
+    manifest = _read_json(zf, "manifest.json") or {}
+    entrypoints = manifest.get("entrypoints") if isinstance(manifest.get("entrypoints"), dict) else {}
+    return (
+        str(entrypoints.get("nodes") or "graph/nodes.jsonl"),
+        str(entrypoints.get("edges") or "graph/edges.jsonl"),
+    )
+
+
+def _multi_pack_payload_flags(pack: PackFile) -> tuple[bool, bool]:
+    """Return actual (node, edge) payload presence, not manifest-derived counts."""
+    with zipfile.ZipFile(pack.path) as zf:
+        names = set(zf.namelist())
+        nodes_path, edges_path = _multi_pack_entrypoints(zf)
+        has_nodes = nodes_path in names and zf.getinfo(nodes_path).file_size > 0
+        has_edges = edges_path in names and zf.getinfo(edges_path).file_size > 0
+        if not has_nodes:
+            has_nodes = any(
+                path in names and zf.getinfo(path).file_size > 0
+                for path in (
+                    "backdata/jsonl/module_types.jsonl",
+                    "backdata/jsonl/modules.jsonl",
+                    "backdata/jsonl/materials.jsonl",
+                    "backdata/jsonl/sections.jsonl",
+                    "backdata/jsonl/assemblies.jsonl",
+                    "backdata/jsonl/single_parts.jsonl",
+                )
+            )
+        if not has_edges:
+            has_edges = "backdata/jsonl/edges.jsonl" in names and zf.getinfo("backdata/jsonl/edges.jsonl").file_size > 0
+        return has_nodes, has_edges
+
+
+def _iter_jsonl_payloads(
+    zf: zipfile.ZipFile,
+    name: str,
+    limit: int,
+) -> Iterable[tuple[dict[str, Any], bytes]]:
+    if name not in zf.namelist() or limit <= 0:
+        return
+    with zf.open(name) as stream:
+        count = 0
+        for raw in stream:
+            if count >= limit:
+                break
+            line = raw.decode("utf-8-sig", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            yield obj, line.encode("utf-8")
+            count += 1
+
+
+def _iter_multi_pack_nodes(pack: PackFile, limit: int) -> Iterable[tuple[dict[str, Any], bytes]]:
+    if limit <= 0:
+        return
+    with zipfile.ZipFile(pack.path) as zf:
+        names = set(zf.namelist())
+        nodes_path, _ = _multi_pack_entrypoints(zf)
+        if nodes_path in names:
+            yield from _iter_jsonl_payloads(zf, nodes_path, limit)
+            return
+
+        remaining = limit
+        for path in (
+            "backdata/jsonl/module_types.jsonl",
+            "backdata/jsonl/modules.jsonl",
+            "backdata/jsonl/materials.jsonl",
+            "backdata/jsonl/sections.jsonl",
+            "backdata/jsonl/assemblies.jsonl",
+            "backdata/jsonl/single_parts.jsonl",
+        ):
+            for obj, payload in _iter_jsonl_payloads(zf, path, remaining):
+                yield obj, payload
+                remaining -= 1
+                if remaining <= 0:
+                    return
+
+
+def _iter_multi_pack_edges(pack: PackFile, limit: int) -> Iterable[dict[str, Any]]:
+    if limit <= 0:
+        return
+    with zipfile.ZipFile(pack.path) as zf:
+        names = set(zf.namelist())
+        _, edges_path = _multi_pack_entrypoints(zf)
+        if edges_path in names:
+            yield from _iter_jsonl(zf, edges_path, limit)
+            return
+        yield from _iter_jsonl(zf, "backdata/jsonl/edges.jsonl", limit)
+
+
+def _raw_node_id(obj: dict[str, Any]) -> str:
+    value = obj.get("id") or obj.get("module_id") or obj.get("name")
+    return "" if value is None else str(value).strip()
+
+
+def _compact_json_bytes(payload: object) -> int:
+    return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _refresh_visible_graph_stats(payload: dict[str, Any]) -> None:
+    nodes = payload.get("nodes") if isinstance(payload.get("nodes"), list) else []
+    edges = payload.get("edges") if isinstance(payload.get("edges"), list) else []
+    stats = payload.setdefault("stats", {})
+    stats["visibleNodes"] = len(nodes)
+    stats["visibleEdges"] = len(edges)
+
+    node_pack_ids: dict[str, str] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        properties = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        node_pack_ids[str(node.get("id") or "")] = str(
+            node.get("packId") or node.get("pack_id") or properties.get("pack_id") or ""
+        )
+    visible_cross_pack_edges = 0
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        edge_pack_id = str(edge.get("packId") or edge.get("pack_id") or "")
+        source_pack_id = node_pack_ids.get(edge_endpoint_id(edge.get("source", "")), "")
+        target_pack_id = node_pack_ids.get(edge_endpoint_id(edge.get("target", "")), "")
+        if (
+            edge_pack_id != source_pack_id
+            or edge_pack_id != target_pack_id
+            or source_pack_id != target_pack_id
+        ):
+            visible_cross_pack_edges += 1
+    diagnostics = payload.setdefault("diagnostics", {})
+    diagnostics["crossPackEdges"] = visible_cross_pack_edges
+    diagnostics["visibleCrossPackEdges"] = visible_cross_pack_edges
+
+
+def _compact_multi_pack_metadata(payload: dict[str, Any]) -> None:
+    """Drop bulky optional summaries before refusing an oversized response."""
+
+    compact_packs: list[dict[str, Any]] = []
+    for pack in payload.get("packs", []):
+        if not isinstance(pack, dict):
+            continue
+        compact_packs.append(
+            {
+                "id": str(pack.get("id") or "")[:512],
+                "title": str(pack.get("title") or pack.get("displayName") or "")[:512],
+                "displayName": str(pack.get("displayName") or "")[:512],
+                "source": str(pack.get("source") or "")[:256],
+                "counts": pack.get("counts") if isinstance(pack.get("counts"), dict) else {},
+            }
+        )
+    payload["packs"] = compact_packs
+    project = payload.get("project")
+    if isinstance(project, dict):
+        payload["project"] = {
+            key: str(project.get(key) or "")[:512]
+            for key in ("id", "name", "company", "manager", "discipline")
+            if project.get(key) is not None
+        }
+    diagnostics = payload.setdefault("diagnostics", {})
+    diagnostics["metadataCompacted"] = True
+    diagnostics["ambiguousEndpoints"] = list(diagnostics.get("ambiguousEndpoints") or [])[:5]
+
+
+def _fit_multi_pack_response_budget(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep graph JSON below the serverless response limit without dangling edges."""
+
+    diagnostics = payload.setdefault("diagnostics", {})
+    diagnostics.update(
+        {
+            "responseBudgetBytes": _MULTI_PACK_MAX_RESPONSE_BYTES,
+            "responseTruncated": False,
+            "responseBytes": 0,
+        }
+    )
+    response_bytes = _compact_json_bytes(payload)
+    while response_bytes > _MULTI_PACK_MAX_RESPONSE_BYTES and payload.get("nodes"):
+        nodes = payload["nodes"]
+        ratio = min(0.9, (_MULTI_PACK_MAX_RESPONSE_BYTES / response_bytes) * 0.95)
+        keep_count = max(0, int(len(nodes) * ratio))
+        if keep_count >= len(nodes):
+            keep_count = len(nodes) - 1
+        payload["nodes"] = nodes[:keep_count]
+        visible_node_ids = {str(node.get("id") or "") for node in payload["nodes"]}
+        payload["edges"] = [
+            edge
+            for edge in payload.get("edges", [])
+            if edge_endpoint_id(edge.get("source", "")) in visible_node_ids
+            and edge_endpoint_id(edge.get("target", "")) in visible_node_ids
+        ]
+        _refresh_visible_graph_stats(payload)
+        diagnostics["responseTruncated"] = True
+        response_bytes = _compact_json_bytes(payload)
+
+    if response_bytes > _MULTI_PACK_MAX_RESPONSE_BYTES:
+        _compact_multi_pack_metadata(payload)
+        diagnostics["responseTruncated"] = True
+        response_bytes = _compact_json_bytes(payload)
+
+    diagnostics["responseBytes"] = response_bytes
+    # Recording the byte count can add a handful of digits. Recalculate once so
+    # the diagnostic describes the returned payload and preserve the hard bound.
+    final_bytes = _compact_json_bytes(payload)
+    diagnostics["responseBytes"] = final_bytes
+    if final_bytes > _MULTI_PACK_MAX_RESPONSE_BYTES and payload.get("nodes"):
+        payload["nodes"] = payload["nodes"][:-1]
+        visible_node_ids = {str(node.get("id") or "") for node in payload["nodes"]}
+        payload["edges"] = [
+            edge
+            for edge in payload.get("edges", [])
+            if edge_endpoint_id(edge.get("source", "")) in visible_node_ids
+            and edge_endpoint_id(edge.get("target", "")) in visible_node_ids
+        ]
+        _refresh_visible_graph_stats(payload)
+        diagnostics["responseTruncated"] = True
+        diagnostics["responseBytes"] = _compact_json_bytes(payload)
+    if _compact_json_bytes(payload) > _MULTI_PACK_MAX_RESPONSE_BYTES:
+        raise RuntimeError(
+            "Project graph metadata exceeds the safe serverless response budget."
+        )
+    return payload
+
+
+def _edge_endpoint_pack_hint(endpoint: Any, edge: dict[str, Any], role: str) -> str:
+    if isinstance(endpoint, dict):
+        for key in ("packId", "pack_id", "pack"):
+            if endpoint.get(key):
+                return str(endpoint[key])
+    properties = edge.get("properties") if isinstance(edge.get("properties"), dict) else {}
+    for container in (edge, properties):
+        for key in (f"{role}PackId", f"{role}_pack_id", f"{role}Pack", f"{role}_pack"):
+            if container.get(key):
+                return str(container[key])
+    return ""
+
+
 def build_multi_pack_graph(
     pack_ids: list[str],
     *,
@@ -1084,7 +1502,39 @@ def build_multi_pack_graph(
     max_nodes: int = 900,
     max_edges: int = 1600,
 ) -> dict[str, Any]:
+    """Build a project graph in two passes across the selected pack ZIPs.
+
+    Pass one indexes namespaced nodes from every node-bearing shard. Pass two
+    resolves every scanned raw edge against that global endpoint index. This is
+    deliberately separate from ``build_graph``: a relationship shard can have
+    zero nodes and still connect nodes owned by other selected packs.
+    """
     active_pack_ids = [pack_id for pack_id in dict.fromkeys(pack_ids) if pack_id]
+    requested_max_nodes = max(0, int(max_nodes))
+    requested_max_edges = max(0, int(max_edges))
+    max_nodes = min(requested_max_nodes, _MULTI_PACK_MAX_VISIBLE_NODES)
+    max_edges = min(requested_max_edges, _MULTI_PACK_MAX_VISIBLE_EDGES)
+    empty_diagnostics = {
+        "mode": "zip-two-pass",
+        "requestedMaxNodes": requested_max_nodes,
+        "requestedMaxEdges": requested_max_edges,
+        "appliedMaxNodes": max_nodes,
+        "appliedMaxEdges": max_edges,
+        "nodeScanBudget": 0,
+        "edgeScanBudget": 0,
+        "scannedNodes": 0,
+        "scannedEdges": 0,
+        "duplicateNodes": 0,
+        "unresolvedEdges": 0,
+        "nodeLimitedEdges": 0,
+        "ambiguousEndpointCount": 0,
+        "ambiguousResolutionCount": 0,
+        "ambiguousEndpoints": [],
+        "crossPackEdges": 0,
+        "visibleCrossPackEdges": 0,
+        "nodeScanTruncated": False,
+        "edgeScanTruncated": False,
+    }
     if not active_pack_ids:
         return {
             "pack": {
@@ -1101,57 +1551,286 @@ def build_multi_pack_graph(
             "nodes": [],
             "edges": [],
             "stats": {"visibleNodes": 0, "visibleEdges": 0, "totalNodes": 0, "totalEdges": 0},
+            "diagnostics": empty_diagnostics,
         }
 
-    per_pack_nodes = max(1, max_nodes // len(active_pack_ids))
-    per_pack_edges = max(1, max_edges // len(active_pack_ids))
-    merged_nodes: list[dict[str, Any]] = []
-    merged_edges: list[dict[str, Any]] = []
-    pack_summaries: list[dict[str, Any]] = []
-    total_nodes = 0
-    total_edges = 0
+    sources: list[tuple[str, PackFile, dict[str, Any], bool, bool]] = []
+    seen_summary_ids: set[str] = set()
+    drive_client = _LazySharedDriveClient()
+    for requested_id in active_pack_ids:
+        pack = find_pack(requested_id, drive_client=drive_client)
+        summary = summarize_pack(pack)
+        summary_id = str(summary["id"])
+        if summary_id in seen_summary_ids:
+            continue
+        seen_summary_ids.add(summary_id)
+        has_nodes, has_edges = _multi_pack_payload_flags(pack)
+        sources.append((summary_id, pack, summary, has_nodes, has_edges))
 
-    for pack_id in active_pack_ids:
-        graph = build_graph(pack_id, max_nodes=per_pack_nodes, max_edges=per_pack_edges)
-        summary = graph["pack"]
-        pack_summaries.append(summary)
-        total_nodes += int(graph["stats"].get("totalNodes") or 0)
-        total_edges += int(graph["stats"].get("totalEdges") or 0)
-        node_id_map: dict[str, str] = {}
-        for node in graph["nodes"]:
-            original_id = str(node["id"])
-            merged_id = f"{summary['id']}::{original_id}"
-            node_id_map[original_id] = merged_id
-            properties = node.get("properties") if isinstance(node.get("properties"), dict) else {}
-            merged_nodes.append(
-                {
-                    **node,
-                    "id": merged_id,
-                    "properties": {
-                        **properties,
-                        "original_id": original_id,
-                        "pack_id": summary["id"],
-                        "pack_title": summary["title"],
-                    },
-                }
-            )
-        for index, edge in enumerate(graph["edges"]):
-            source = edge_endpoint_id(edge.get("source", ""))
-            target = edge_endpoint_id(edge.get("target", ""))
-            if source not in node_id_map or target not in node_id_map:
+    pack_summaries = [summary for _, _, summary, _, _ in sources]
+    total_nodes = sum(int(summary.get("counts", {}).get("nodes") or 0) for summary in pack_summaries)
+    total_edges = sum(int(summary.get("counts", {}).get("edges") or 0) for summary in pack_summaries)
+    document_count = sum(int(summary.get("counts", {}).get("documents") or 0) for summary in pack_summaries)
+    node_source_ids = [pack_id for pack_id, _, _, has_nodes, _ in sources if has_nodes]
+    edge_source_ids = [pack_id for pack_id, _, _, _, has_edges in sources if has_edges]
+
+    # Scan more nodes than can be displayed so relationship shards can select
+    # connected endpoints, while keeping memory bounded on very large projects.
+    node_scan_budget = min(
+        _MULTI_PACK_MAX_SCANNED_NODES,
+        max(max_nodes, max_nodes * 32, len(node_source_ids) * 64),
+    ) if max_nodes else 0
+    node_capacities = {
+        pack_id: int(summary.get("counts", {}).get("nodes") or 0)
+        for pack_id, _, summary, has_nodes, _ in sources
+        if has_nodes
+    }
+    node_scan_limits = _capacity_aware_fair_limits(
+        node_source_ids,
+        node_scan_budget,
+        node_capacities,
+    )
+    visible_node_limits = _fair_limits(node_source_ids, max_nodes)
+    candidates_by_original: dict[str, list[_MultiPackNodeCandidate]] = {}
+    candidates_by_merged: dict[str, _MultiPackNodeCandidate] = {}
+    candidate_order: list[_MultiPackNodeCandidate] = []
+    scanned_nodes_by_pack: dict[str, int] = {}
+    duplicate_nodes = 0
+
+    # Pass 1: collect the selected ZIPs' nodes before inspecting any edge.
+    for pack_order, (pack_id, pack, summary, has_nodes, _) in enumerate(sources):
+        if not has_nodes:
+            continue
+        scanned = 0
+        for obj, payload in _iter_multi_pack_nodes(pack, node_scan_limits.get(pack_id, 0)):
+            scanned += 1
+            original_id = _raw_node_id(obj)
+            if not original_id:
                 continue
+            merged_id = f"{pack_id}::{original_id}"
+            if merged_id in candidates_by_merged:
+                duplicate_nodes += 1
+                continue
+            # Keeping tens of thousands of nested property dicts is expensive
+            # on a serverless worker. Store compact bytes and only materialize
+            # the at-most ``max_nodes`` records that survive edge selection.
+            candidate = _MultiPackNodeCandidate(
+                pack_id,
+                pack_order,
+                original_id,
+                merged_id,
+                str(summary["title"]),
+                payload,
+            )
+            candidates_by_merged[merged_id] = candidate
+            candidates_by_original.setdefault(original_id, []).append(candidate)
+            candidate_order.append(candidate)
+        scanned_nodes_by_pack[pack_id] = scanned
+
+    selected_nodes: dict[str, _MultiPackNodeCandidate] = {}
+    selected_nodes_by_pack = {pack_id: 0 for pack_id in node_source_ids}
+    merged_edges: list[dict[str, Any]] = []
+    merged_edge_ids: set[str] = set()
+    ambiguous_keys: set[tuple[str, str]] = set()
+    ambiguous_examples: list[dict[str, Any]] = []
+    ambiguous_resolution_count = 0
+    unresolved_edges = 0
+    node_limited_edges = 0
+    visible_cross_pack_edges = 0
+    scanned_edges_by_pack: dict[str, int] = {}
+
+    def resolve_endpoint(endpoint: Any, edge: dict[str, Any], role: str, edge_pack_id: str) -> _MultiPackNodeCandidate | None:
+        nonlocal ambiguous_resolution_count
+        endpoint_id = edge_endpoint_id(endpoint).strip()
+        if not endpoint_id:
+            return None
+        exact = candidates_by_merged.get(endpoint_id)
+        if exact:
+            return exact
+        candidates = candidates_by_original.get(endpoint_id, [])
+        if not candidates:
+            return None
+        hint = _edge_endpoint_pack_hint(endpoint, edge, role)
+        if hint:
+            hinted = [candidate for candidate in candidates if candidate.pack_id == hint]
+            if hinted:
+                return hinted[0]
+        local = [candidate for candidate in candidates if candidate.pack_id == edge_pack_id]
+        if local:
+            return local[0]
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # Input pack order, then namespaced id, is the stable tie breaker. The
+        # ambiguity is surfaced rather than silently collapsing node identity.
+        selected = min(candidates, key=lambda candidate: (candidate.pack_order, candidate.merged_id))
+        ambiguous_resolution_count += 1
+        ambiguity_key = (edge_pack_id, endpoint_id)
+        if ambiguity_key not in ambiguous_keys:
+            ambiguous_keys.add(ambiguity_key)
+            if len(ambiguous_examples) < 20:
+                ambiguous_examples.append(
+                    {
+                        "edgePackId": edge_pack_id,
+                        "endpointId": endpoint_id,
+                        "candidateNodeIds": [candidate.merged_id for candidate in candidates[:8]],
+                        "selectedNodeId": selected.merged_id,
+                    }
+                )
+        return selected
+
+    def select_edge_nodes(source: _MultiPackNodeCandidate, target: _MultiPackNodeCandidate) -> bool:
+        additions = {
+            candidate.merged_id: candidate
+            for candidate in (source, target)
+            if candidate.merged_id not in selected_nodes
+        }
+        if len(selected_nodes) + len(additions) > max_nodes:
+            return False
+        additions_by_pack: dict[str, int] = {}
+        for candidate in additions.values():
+            additions_by_pack[candidate.pack_id] = additions_by_pack.get(candidate.pack_id, 0) + 1
+        for pack_id, count in additions_by_pack.items():
+            if selected_nodes_by_pack.get(pack_id, 0) + count > visible_node_limits.get(pack_id, 0):
+                return False
+        for candidate in additions.values():
+            selected_nodes[candidate.merged_id] = candidate
+            selected_nodes_by_pack[candidate.pack_id] = selected_nodes_by_pack.get(candidate.pack_id, 0) + 1
+        return True
+
+    # Pass 2: scan raw edges after the global node index exists. A fair output
+    # quota prevents an early large shard from consuming the entire edge limit.
+    edge_capacities = {
+        pack_id: int(summary.get("counts", {}).get("edges") or 0)
+        for pack_id, _, summary, _, has_edges in sources
+        if has_edges
+    }
+    visible_edge_limits = _capacity_aware_fair_limits(
+        edge_source_ids,
+        max_edges,
+        edge_capacities,
+    )
+    for pack_id, pack, _, _, has_edges in sources:
+        if not has_edges:
+            continue
+        visible_edge_limit = visible_edge_limits.get(pack_id, 0)
+        if visible_edge_limit <= 0:
+            continue
+        scan_limit = min(
+            _MULTI_PACK_MAX_SCANNED_EDGES_PER_PACK,
+            max(256, visible_edge_limit * 32),
+        )
+        accepted = 0
+        scanned = 0
+        for edge_index, raw_edge in enumerate(_iter_multi_pack_edges(pack, scan_limit)):
+            scanned += 1
+            source_endpoint = raw_edge.get("source", raw_edge.get("from", ""))
+            target_endpoint = raw_edge.get("target", raw_edge.get("to", ""))
+            source_id = edge_endpoint_id(source_endpoint).strip()
+            target_id = edge_endpoint_id(target_endpoint).strip()
+            source = resolve_endpoint(source_endpoint, raw_edge, "source", pack_id)
+            target = resolve_endpoint(target_endpoint, raw_edge, "target", pack_id)
+            if not source or not target:
+                unresolved_edges += 1
+                continue
+            if not select_edge_nodes(source, target):
+                node_limited_edges += 1
+                continue
+            relation = str(raw_edge.get("relation") or "related_to")
+            edge = _edge(source_id, target_id, relation, pack_id, raw_edge)
+            raw_edge_id = str(raw_edge.get("id") or edge["id"])
+            merged_edge_id = f"{pack_id}::{raw_edge_id}"
+            if merged_edge_id in merged_edge_ids:
+                merged_edge_id = f"{merged_edge_id}::{edge_index}"
+            merged_edge_ids.add(merged_edge_id)
             merged_edges.append(
                 {
                     **edge,
-                    "id": f"{summary['id']}::{edge.get('id') or index}",
-                    "source": node_id_map[source],
-                    "target": node_id_map[target],
-                    "packId": summary["id"],
+                    "id": merged_edge_id,
+                    "source": source.merged_id,
+                    "target": target.merged_id,
+                    "packId": pack_id,
                 }
             )
+            if pack_id != source.pack_id or pack_id != target.pack_id or source.pack_id != target.pack_id:
+                visible_cross_pack_edges += 1
+            accepted += 1
+            if accepted >= visible_edge_limit or len(merged_edges) >= max_edges:
+                break
+        scanned_edges_by_pack[pack_id] = scanned
+        if len(merged_edges) >= max_edges:
+            break
 
-    document_count = sum(int(pack.get("counts", {}).get("documents") or 0) for pack in pack_summaries)
-    return {
+    # Preserve useful isolated nodes too. First honour each pack's fair share,
+    # then use any genuinely unused global slots in deterministic source order.
+    for candidate in candidate_order:
+        if len(selected_nodes) >= max_nodes:
+            break
+        if candidate.merged_id in selected_nodes:
+            continue
+        if selected_nodes_by_pack.get(candidate.pack_id, 0) >= visible_node_limits.get(candidate.pack_id, 0):
+            continue
+        selected_nodes[candidate.merged_id] = candidate
+        selected_nodes_by_pack[candidate.pack_id] = selected_nodes_by_pack.get(candidate.pack_id, 0) + 1
+    for candidate in candidate_order:
+        if len(selected_nodes) >= max_nodes:
+            break
+        if candidate.merged_id not in selected_nodes:
+            selected_nodes[candidate.merged_id] = candidate
+
+    merged_nodes: list[dict[str, Any]] = []
+    for candidate in selected_nodes.values():
+        obj = json.loads(candidate.payload)
+        raw_node = _node(candidate.original_id, obj, candidate.pack_id)
+        properties = raw_node.get("properties") if isinstance(raw_node.get("properties"), dict) else {}
+        merged_nodes.append(
+            {
+                **raw_node,
+                "id": candidate.merged_id,
+                "properties": {
+                    **properties,
+                    "original_id": candidate.original_id,
+                    "pack_id": candidate.pack_id,
+                    "pack_title": candidate.pack_title,
+                },
+            }
+        )
+    node_scan_truncated = any(
+        int(summary.get("counts", {}).get("nodes") or 0) > scanned_nodes_by_pack.get(pack_id, 0)
+        for pack_id, _, summary, has_nodes, _ in sources
+        if has_nodes
+    )
+    edge_scan_truncated = any(
+        int(summary.get("counts", {}).get("edges") or 0) > scanned_edges_by_pack.get(pack_id, 0)
+        for pack_id, _, summary, _, has_edges in sources
+        if has_edges
+    )
+    diagnostics = {
+        "mode": "zip-two-pass",
+        "requestedMaxNodes": requested_max_nodes,
+        "requestedMaxEdges": requested_max_edges,
+        "appliedMaxNodes": max_nodes,
+        "appliedMaxEdges": max_edges,
+        "nodeScanBudget": node_scan_budget,
+        "edgeScanBudget": sum(
+            min(_MULTI_PACK_MAX_SCANNED_EDGES_PER_PACK, max(256, visible_limit * 32))
+            for visible_limit in visible_edge_limits.values()
+            if visible_limit > 0
+        ),
+        "scannedNodes": sum(scanned_nodes_by_pack.values()),
+        "scannedEdges": sum(scanned_edges_by_pack.values()),
+        "duplicateNodes": duplicate_nodes,
+        "unresolvedEdges": unresolved_edges,
+        "nodeLimitedEdges": node_limited_edges,
+        "ambiguousEndpointCount": len(ambiguous_keys),
+        "ambiguousResolutionCount": ambiguous_resolution_count,
+        "ambiguousEndpoints": ambiguous_examples,
+        "crossPackEdges": visible_cross_pack_edges,
+        "visibleCrossPackEdges": visible_cross_pack_edges,
+        "nodeScanTruncated": node_scan_truncated,
+        "edgeScanTruncated": edge_scan_truncated,
+    }
+    return _fit_multi_pack_response_budget({
         "pack": {
             "id": project.get("id", "project") if project else "project",
             "title": title,
@@ -1171,7 +1850,9 @@ def build_multi_pack_graph(
             "totalNodes": total_nodes,
             "totalEdges": total_edges,
         },
-    }
+        "diagnostics": diagnostics,
+        "source": "zip-two-pass",
+    })
 
 
 def list_nodes(pack_id: str, node_type: str | None = None, limit: int = 100) -> dict[str, Any]:
@@ -1257,8 +1938,12 @@ def get_node_context(pack_id: str, node_id: str, limit: int = 50) -> dict[str, A
     }
 
 
-def edge_endpoint_id(endpoint: str | dict[str, Any]) -> str:
-    return endpoint if isinstance(endpoint, str) else str(endpoint.get("id", ""))
+def edge_endpoint_id(endpoint: Any) -> str:
+    if isinstance(endpoint, str):
+        return endpoint
+    if isinstance(endpoint, dict):
+        return str(endpoint.get("id", ""))
+    return "" if endpoint is None else str(endpoint)
 
 
 def build_graph_from_pack(pack: PackFile, max_nodes: int = 900, max_edges: int = 1600) -> dict[str, Any]:
@@ -1345,7 +2030,148 @@ def list_projects() -> list[dict[str, Any]]:
     packs = list_packs()
     from .project_store import list_projects as list_stored_projects
 
-    return list_stored_projects(packs)
+    if EPHEMERAL_STORAGE:
+        registry_projects = _registry_projects(packs)
+        if registry_projects:
+            return registry_projects
+    try:
+        stored_projects = list_stored_projects(packs)
+    except sqlite3.Error:
+        stored_projects = []
+    projects = stored_projects or _registry_projects(packs)
+    common_pack_ids = _common_pack_ids(packs)
+    if not common_pack_ids:
+        return projects
+    return [
+        {
+            **project,
+            "packIds": list(dict.fromkeys([*common_pack_ids, *project.get("packIds", [])])),
+        }
+        for project in projects
+    ]
+
+
+def _common_pack_ids(
+    packs: list[dict[str, Any]],
+    *,
+    payload: dict[str, Any] | None = None,
+    links: dict[str, Any] | None = None,
+) -> list[str]:
+    from .google_drive_sync import COMMON_PROJECT_PACK_LINKS_KEY, PROJECT_PACK_LINKS_FILENAME
+
+    registry_payload = payload if payload is not None else _registry_payload()
+    if links is None:
+        links_path = DATA_DIR / PROJECTS_FOLDER / PROJECT_PACK_LINKS_FILENAME
+        try:
+            raw_links = json.loads(links_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw_links = {}
+        project_links = raw_links if isinstance(raw_links, dict) else {}
+    else:
+        project_links = links
+
+    candidates = [
+        *project_links.get(COMMON_PROJECT_PACK_LINKS_KEY, []),
+        *registry_payload.get("commonPackIds", []),
+    ]
+    valid_pack_ids = {str(pack.get("id")) for pack in packs if pack.get("id")}
+    return list(
+        dict.fromkeys(
+            str(pack_id)
+            for pack_id in candidates
+            if str(pack_id) in valid_pack_ids
+        )
+    )
+
+
+def _registry_projects(packs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    from .google_drive_sync import PROJECT_FOLDERS_FILENAME, PROJECT_PACK_LINKS_FILENAME
+
+    payload = _registry_payload()
+    raw_projects = payload.get("projects")
+    registry_projects = (
+        [project for project in raw_projects if isinstance(project, dict)]
+        if isinstance(raw_projects, list)
+        else []
+    )
+    by_folder_id = {
+        str(project.get("driveFolderId")): project
+        for project in registry_projects
+        if project.get("driveFolderId")
+    }
+    by_project_id = {
+        str(project.get("id")): project
+        for project in registry_projects
+        if project.get("id")
+    }
+
+    folders_path = DATA_DIR / PROJECTS_FOLDER / PROJECT_FOLDERS_FILENAME
+    links_path = DATA_DIR / PROJECTS_FOLDER / PROJECT_PACK_LINKS_FILENAME
+    try:
+        raw_folders = json.loads(folders_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw_folders = []
+    try:
+        raw_links = json.loads(links_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw_links = {}
+    folders = [folder for folder in raw_folders if isinstance(folder, dict)] if isinstance(raw_folders, list) else []
+    links = raw_links if isinstance(raw_links, dict) else {}
+    valid_pack_ids = {str(pack.get("id")) for pack in packs if pack.get("id")}
+    common_pack_ids = _common_pack_ids(packs, payload=payload, links=links)
+
+    project_rows: list[dict[str, Any]] = []
+    if folders:
+        for folder in folders:
+            project_id = str(folder.get("projectId") or "").strip()
+            if not project_id:
+                continue
+            source = by_folder_id.get(str(folder.get("folderId") or "")) or by_project_id.get(project_id) or {}
+            project_rows.append(
+                {
+                    **source,
+                    "id": project_id,
+                    "name": str(folder.get("name") or project_id),
+                    "driveFolderId": str(folder.get("folderId") or source.get("driveFolderId") or ""),
+                    "packIds": links.get(project_id, source.get("packIds", [])),
+                }
+            )
+    else:
+        project_rows = [dict(project) for project in registry_projects]
+
+    projects: list[dict[str, Any]] = []
+    for project in project_rows:
+        pack_ids = project.get("packIds")
+        effective_pack_ids = (
+            list(
+                dict.fromkeys(
+                    [
+                        *common_pack_ids,
+                        *(
+                            str(pack_id)
+                            for pack_id in pack_ids
+                            if str(pack_id) in valid_pack_ids
+                        ),
+                    ]
+                )
+            )
+            if isinstance(pack_ids, list)
+            else common_pack_ids
+        )
+        projects.append(
+            {
+                "id": str(project.get("id") or ""),
+                "name": str(project.get("name") or project.get("id") or ""),
+                "company": str(project.get("company") or ""),
+                "manager": str(project.get("manager") or ""),
+                "discipline": str(project.get("discipline") or ""),
+                "description": str(project.get("description") or ""),
+                "role": str(project.get("role") or "Admin"),
+                "driveFolderId": str(project.get("driveFolderId") or ""),
+                "packIds": effective_pack_ids,
+            }
+        )
+    return projects
 
 
 def search_pack(pack_id: str, query: str, limit: int = 8) -> list[dict[str, Any]]:
