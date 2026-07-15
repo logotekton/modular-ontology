@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import mimetypes
 import os
@@ -27,12 +28,19 @@ from .config import (
     DATA_DIR,
     DATABASE_FOLDER,
     DB_PATH,
+    EPHEMERAL_STORAGE,
     IFC_MODELS_FOLDER,
     LEGACY_ONTOLOGY_PACKS_FOLDER,
     MCP_TOKENS_FILE,
     ONTOLOGY_PACKS_FOLDER,
     PROJECTS_FOLDER,
     env,
+)
+from .query_snapshot import (
+    QUERY_DATABASE_FILENAME,
+    build_query_database,
+    compress_query_database,
+    validate_query_database,
 )
 
 DRIVE_API = "https://www.googleapis.com/drive/v3"
@@ -152,6 +160,8 @@ class GoogleDriveClient:
         self._access_token = access_token
         # 요청 시점마다 유효 토큰을 반환 — 1시간 이상 걸리는 동기화 중 만료 대응
         self._token_provider = token_provider
+        self._provider_token_cache: tuple[float, str] | None = None
+        self._list_connection_primed = False
 
     @classmethod
     def from_env(cls) -> "GoogleDriveClient":
@@ -188,7 +198,16 @@ class GoogleDriveClient:
             }
             if page_token:
                 params["pageToken"] = page_token
-            payload = self._request_json("files", params)
+            if not self._list_connection_primed:
+                payload = self._request_json_fresh("files", params)
+                self._list_connection_primed = True
+            else:
+                try:
+                    payload = self._request_json("files", params)
+                except urllib.error.HTTPError as exc:
+                    if exc.code != 404:
+                        raise
+                    payload = self._request_json_fresh("files", params)
             for raw in payload.get("files", []):
                 items.append(
                     DriveItem(
@@ -217,6 +236,26 @@ class GoogleDriveClient:
                         break
                     stream.write(chunk)
         os.replace(temp, target)
+
+    def download_gzip_file(self, file_id: str, target: Path) -> None:
+        """Stream a gzip-compressed Drive file directly into its uncompressed target."""
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        params = {"alt": "media", "supportsAllDrives": "true"}
+        url = self._url(f"files/{file_id}", params)
+        request = urllib.request.Request(url, headers=self._headers())
+        temp = target.with_name(f".{target.name}.tmp")
+        temp.unlink(missing_ok=True)
+        try:
+            with _urlopen_with_retry(request, timeout=120) as response:
+                with gzip.GzipFile(fileobj=response, mode="rb") as compressed, temp.open("wb") as stream:
+                    shutil.copyfileobj(compressed, stream, length=1024 * 1024)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            validate_query_database(temp)
+            os.replace(temp, target)
+        finally:
+            temp.unlink(missing_ok=True)
 
     def update_file(self, file_id: str, source: Path, mime_type: str | None = None) -> dict[str, Any]:
         content_type = mime_type or _guess_mime_type(source)
@@ -372,6 +411,30 @@ class GoogleDriveClient:
         with _urlopen_with_retry(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
 
+    def _request_json_fresh(self, path: str, params: dict[str, str]) -> dict[str, Any]:
+        for attempt in range(4):
+            response = requests.get(
+                self._url(path, params),
+                headers=self._headers(),
+                timeout=30,
+            )
+            try:
+                if response.status_code < 300:
+                    return response.json()
+                error = urllib.error.HTTPError(
+                    response.url,
+                    response.status_code,
+                    response.reason or "",
+                    response.headers,
+                    io.BytesIO(response.content),
+                )
+                if response.status_code != 404 or attempt >= 3:
+                    raise error
+            finally:
+                response.close()
+            time.sleep(0.5 * (2**attempt))
+        raise RuntimeError("Unreachable Drive retry state")
+
     def _url(self, path: str, params: dict[str, str]) -> str:
         all_params = dict(params)
         if self.api_key:
@@ -383,7 +446,10 @@ class GoogleDriveClient:
 
     def _headers(self) -> dict[str, str]:
         if self._token_provider is not None:
-            return {"Authorization": f"Bearer {self._token_provider()}"}
+            now = time.monotonic()
+            if self._provider_token_cache is None or now - self._provider_token_cache[0] >= 3000:
+                self._provider_token_cache = (now, str(self._token_provider()))
+            return {"Authorization": f"Bearer {self._provider_token_cache[1]}"}
         if self._access_token:
             return {"Authorization": f"Bearer {self._access_token}"}
         return {}
@@ -740,16 +806,56 @@ def write_back_mcp_tokens_file(*, data_dir: Path = DATA_DIR, client: GoogleDrive
     )
 
 
+def _write_back_query_database_file(*, client: GoogleDriveClient | None = None) -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="modular-ontology-query-") as temp_dir:
+        query_db_path = Path(temp_dir) / QUERY_DATABASE_FILENAME.removesuffix(".gz")
+        query_gzip_path = Path(temp_dir) / QUERY_DATABASE_FILENAME
+        query_stats = build_query_database(DB_PATH, query_db_path)
+        compression = compress_query_database(query_db_path, query_gzip_path)
+        compact_result = write_back_google_drive_file(
+            query_gzip_path,
+            [DATABASE_FOLDER],
+            client=client,
+            name=QUERY_DATABASE_FILENAME,
+            mime_type="application/gzip",
+        )
+    compact_status = str(compact_result.get("status") or "unknown")
+    return {
+        "status": "synced" if compact_status in {"created", "updated", "written", "synced"} else compact_status,
+        "queryDatabase": compact_result,
+        "queryDatabaseStats": {**query_stats, **compression},
+    }
+
+
+def write_back_query_database_file(*, client: GoogleDriveClient | None = None) -> dict[str, Any]:
+    """Publish only the compact serverless MCP query snapshot."""
+
+    with _DB_SYNC_LOCK:
+        _checkpoint_sqlite(DB_PATH, truncate=True)
+        return _write_back_query_database_file(client=client)
+
+
 def write_back_database_file(*, client: GoogleDriveClient | None = None) -> dict[str, Any]:
     with _DB_SYNC_LOCK:
         _checkpoint_sqlite(DB_PATH, truncate=True)
-        return write_back_google_drive_file(
+        full_result = write_back_google_drive_file(
             DB_PATH,
             [DATABASE_FOLDER],
             client=client,
             name=DATABASE_FILENAME,
             mime_type="application/vnd.sqlite3",
         )
+        query_result = _write_back_query_database_file(client=client)
+        compact_result = query_result["queryDatabase"]
+        statuses = {str(full_result.get("status")), str(compact_result.get("status"))}
+        successful_statuses = {"created", "updated", "written", "synced"}
+        status = "synced" if statuses <= successful_statuses else "error"
+        return {
+            "status": status,
+            "database": full_result,
+            "queryDatabase": compact_result,
+            "queryDatabaseStats": query_result["queryDatabaseStats"],
+        }
 
 
 def write_back_pack_file(
@@ -1030,6 +1136,11 @@ def sync_google_drive_registry_files(
             pass
 
     client = client or GoogleDriveClient.from_env()
+    direct_result = _sync_serverless_registry_files_by_id(client, data_dir=data_dir)
+    if direct_result is not None:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps(direct_result, ensure_ascii=False, indent=2), encoding="utf-8")
+        return direct_result
     root = _children_by_name(client, root_folder_id)
     downloaded: list[str] = []
     skipped: list[str] = []
@@ -1111,6 +1222,55 @@ def sync_google_drive_registry_files(
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
+
+
+def _sync_serverless_registry_files_by_id(
+    client: GoogleDriveClient,
+    *,
+    data_dir: Path,
+) -> dict[str, Any] | None:
+    """Restore the minimal Vercel registry without traversing shared Drive folders."""
+
+    if not EPHEMERAL_STORAGE:
+        return None
+    query_database_file_id = str(env("MODULAR_ONTOLOGY_QUERY_DATABASE_FILE_ID", "") or "").strip()
+    if not query_database_file_id:
+        return None
+
+    downloaded: list[str] = []
+    warnings: list[str] = []
+    database_target = data_dir / DATABASE_FOLDER / DATABASE_FILENAME
+    client.download_gzip_file(query_database_file_id, database_target)
+    downloaded.append(str(database_target))
+
+    direct_files = (
+        (
+            "MODULAR_ONTOLOGY_USERS_FILE_ID",
+            data_dir / ADMIN_FOLDER / "users.json",
+        ),
+        (
+            "MODULAR_ONTOLOGY_MCP_TOKENS_FILE_ID",
+            data_dir / ADMIN_FOLDER / "mcp_tokens.json",
+        ),
+    )
+    for env_name, target in direct_files:
+        file_id = str(env(env_name, "") or "").strip()
+        if not file_id:
+            warnings.append(f"{env_name} is not set")
+            continue
+        client.download_file(file_id, target)
+        downloaded.append(str(target))
+
+    return {
+        "status": "synced",
+        "synced_at": time.time(),
+        "downloaded": downloaded,
+        "skipped": [],
+        "missing": [],
+        "warnings": warnings,
+        "scope": "registry",
+        "mode": "direct-file-ids",
+    }
 
 
 def _project_folder_records(
@@ -1232,20 +1392,34 @@ def _download_database_file(
     data_dir: Path | None = None,
     file_cache: dict[str, dict[str, Any]] | None = None,
     skipped: list[str] | None = None,
+    prefer_compact: bool | None = None,
 ) -> list[str]:
     children = [item for item in client.list_children(folder_id) if not item.is_folder]
-    source = next((item for item in children if item.name == DATABASE_FILENAME), None)
-    if not source:
-        source = next((item for item in children if item.name == LEGACY_DATABASE_FILENAME), None)
+    prefer_compact = EPHEMERAL_STORAGE if prefer_compact is None else prefer_compact
+    if prefer_compact:
+        source = next((item for item in children if item.name == QUERY_DATABASE_FILENAME), None)
+        if not source:
+            raise RuntimeError(
+                f"{QUERY_DATABASE_FILENAME} is missing from {DATABASE_FOLDER}; "
+                "run a local database write-back before deploying the serverless MCP."
+            )
+    else:
+        source = next((item for item in children if item.name == DATABASE_FILENAME), None)
+        if not source:
+            source = next((item for item in children if item.name == LEGACY_DATABASE_FILENAME), None)
     if not source:
         return []
     target = target_dir / DATABASE_FILENAME
+    target.parent.mkdir(parents=True, exist_ok=True)
     if data_dir is not None and file_cache is not None and _drive_file_is_unchanged(source, target, data_dir=data_dir, file_cache=file_cache):
         if skipped is not None:
             skipped.append(str(target))
         return []
     staging = target.with_name(f".{target.name}.download")
-    client.download_file(source.id, staging)
+    if prefer_compact:
+        client.download_gzip_file(source.id, staging)
+    else:
+        client.download_file(source.id, staging)
     with _DB_SYNC_LOCK:
         _remove_sqlite_sidecars(target)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1964,9 +2138,10 @@ def _load_service_account_info() -> dict[str, Any] | None:
 
 def _gcloud_access_token() -> str:
     command = str(env("MODULAR_ONTOLOGY_GCLOUD_COMMAND", "gcloud"))
+    resolved_command = shutil.which(command) or command
     try:
         token = subprocess.check_output(
-            [command, "auth", "print-access-token"],
+            [resolved_command, "auth", "print-access-token"],
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=20,

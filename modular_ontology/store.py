@@ -128,6 +128,10 @@ def index_all_packs(db_path: Path | None = None) -> dict[str, Any]:
         indexed = []
         for pack in unique_pack_files():
             indexed.append(index_pack(conn, pack))
+        if _ensure_bm25_schema(conn):
+            with conn:
+                conn.execute("INSERT INTO documents_bm25(documents_bm25) VALUES ('optimize')")
+            invalidate_index_caches(_connection_db_path(conn))
         stats: dict[str, Any] = index_stats(conn)
         stats["bm25"] = bm25_index_status(db_path, ttl_seconds=0)
         return {"status": "indexed", "packs": indexed, "stats": stats}

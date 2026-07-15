@@ -39,7 +39,17 @@ from .auth import (
     set_user_company,
     set_user_role,
 )
-from .config import EPHEMERAL_STORAGE, DATA_DIR, IFC_MODELS_FOLDER, MCP_REMOTE_FILE, MCP_TOKENS_FILE, PROJECTS_FOLDER, ROOT, env
+from .config import (
+    DATA_DIR,
+    EPHEMERAL_STORAGE,
+    IFC_MODELS_FOLDER,
+    MCP_REMOTE_FILE,
+    MCP_TOKENS_FILE,
+    PROJECTS_FOLDER,
+    ROOT,
+    env,
+    is_ephemeral_runtime,
+)
 from .google_drive_sync import (
     COMMON_PROJECT_PACK_LINKS_KEY,
     PROJECT_FOLDERS_FILENAME,
@@ -248,7 +258,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def google_drive_sync_on_startup() -> bool:
-    default = not EPHEMERAL_STORAGE
+    default = not is_ephemeral_runtime()
     return google_drive_sync_enabled() and _env_flag("MODULAR_ONTOLOGY_SYNC_ON_STARTUP", default)
 
 
