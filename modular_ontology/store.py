@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from .config import DB_PATH
+from .config import DB_PATH, EPHEMERAL_STORAGE
 from .pack_index import (
     PackFile,
     build_graph_from_pack,
@@ -33,7 +33,14 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
+    journal_mode = "MEMORY" if EPHEMERAL_STORAGE else "WAL"
+    try:
+        conn.execute(f"PRAGMA journal_mode={journal_mode};")
+    except sqlite3.OperationalError as exc:
+        conn.close()
+        raise sqlite3.OperationalError(
+            f"{exc} (db_path={path}, ephemeral={EPHEMERAL_STORAGE}, journal_mode={journal_mode})"
+        ) from exc
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
