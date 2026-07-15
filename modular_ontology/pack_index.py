@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import os
 import re
 import sqlite3
 import zipfile
@@ -854,33 +853,31 @@ _QUERY_STOPWORDS = {
 }
 
 
+def search_tokens(text: str) -> list[str]:
+    """Tokenize text into searchable words and Hangul bigrams, preserving frequency."""
+
+    tokens: list[str] = []
+    for token in _QUERY_TOKEN_RE.findall(text.lower()):
+        if "가" <= token[0] <= "힣":  # Hangul run
+            if 2 <= len(token) <= 4 and token not in _QUERY_STOPWORDS:
+                tokens.append(token)
+            tokens.extend(token[i : i + 2] for i in range(len(token) - 1))
+        elif token.isdigit():
+            tokens.append(token)
+        elif len(token) >= 2 and token not in _QUERY_STOPWORDS:
+            tokens.append(token)
+    return tokens
+
+
 def query_terms(query: str) -> list[str]:
-    """Tokenize a query into searchable substrings.
+    """Tokenize a query into unique searchable substrings.
 
     ASCII/number words are kept whole; Hangul runs are kept whole (when short) and
     also split into character bigrams so morphological variants (조사 등) still match
     document text. Without this, substring search requires the whole phrase verbatim,
     which makes natural-language Korean questions return nothing.
     """
-    terms: list[str] = []
-    seen: set[str] = set()
-
-    def push(term: str) -> None:
-        if term and term not in seen:
-            seen.add(term)
-            terms.append(term)
-
-    for token in _QUERY_TOKEN_RE.findall(query.lower()):
-        if "가" <= token[0] <= "힣":  # Hangul run
-            if 2 <= len(token) <= 4 and token not in _QUERY_STOPWORDS:
-                push(token)
-            for i in range(len(token) - 1):
-                push(token[i : i + 2])
-        elif token.isdigit():
-            push(token)
-        elif len(token) >= 2 and token not in _QUERY_STOPWORDS:
-            push(token)
-    return terms
+    return list(dict.fromkeys(search_tokens(query)))
 
 
 def score_terms(text_lower: str, terms: list[str]) -> float:

@@ -4,6 +4,8 @@
 // 노드 상세 다이얼로그를 포함한다.
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { prepareGraph } from "./graph/prepareGraph";
+import type { PreparedEdge as SimEdge, PreparedNode as SimNode } from "./graph/prepareGraph";
 
 export type OgNode = {
   id: string;
@@ -20,25 +22,6 @@ export type OgEdge = {
   target: string | { id: string };
   relation?: string;
 };
-
-type SimNode<N> = {
-  id: string;
-  label: string;
-  type: string;
-  color: string;
-  props: Record<string, unknown>;
-  input: N;
-  degree: number;
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  fx: number | null;
-  fy: number | null;
-  r: number;
-};
-
-type SimEdge = { a: string; b: string; rel: string };
 
 type LegendEntry = { type: string; count: number; color: string };
 
@@ -92,10 +75,6 @@ const FALLBACK_PALETTE = [
   "#c0990e", "#67a7b8", "#ff6f6c", "#737373", "#a05fb8", "#84c980",
 ];
 const MAX_VISIBLE_DEFAULT = 4000;
-
-function endpointId(value: string | { id: string }): string {
-  return typeof value === "object" ? String(value.id) : String(value);
-}
 
 export function OntologyGraph<N extends OgNode, E extends OgEdge>({
   nodes,
@@ -154,47 +133,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       return FALLBACK_PALETTE[index % FALLBACK_PALETTE.length];
     };
 
-    const simNodes: SimNode<N>[] = [];
-    const byId = new Map<string, SimNode<N>>();
-    for (const input of nodes) {
-      const id = String(input.id);
-      if (byId.has(id)) continue;
-      const node: SimNode<N> = {
-        id,
-        label: input.label || id,
-        type: input.type || "node",
-        color: colorOf(input.type || "node", input.color),
-        props: input.properties ?? {},
-        input,
-        degree: 0,
-        x: 0,
-        y: 0,
-        vx: 0,
-        vy: 0,
-        fx: null,
-        fy: null,
-        r: 4,
-      };
-      byId.set(id, node);
-      simNodes.push(node);
-    }
-    const simEdges: SimEdge[] = [];
-    const adj = new Map<string, { id: string; rel: string; dir: string }[]>();
-    for (const node of simNodes) adj.set(node.id, []);
-    for (const edge of edges) {
-      const a = endpointId(edge.source);
-      const b = endpointId(edge.target);
-      if (a === b) continue;
-      const na = byId.get(a);
-      const nb = byId.get(b);
-      if (!na || !nb) continue;
-      const rel = edge.relation ?? "";
-      simEdges.push({ a, b, rel });
-      adj.get(a)!.push({ id: b, rel, dir: "→" });
-      adj.get(b)!.push({ id: a, rel, dir: "←" });
-      na.degree++;
-      nb.degree++;
-    }
+    const { simNodes, byId, simEdges, adj } = prepareGraph(nodes, edges, colorOf);
     for (const node of simNodes) node.r = 3.5 + Math.min(36, Math.sqrt(node.degree) * 1.6);
 
     // 골든앵글 나선 초기 배치 — 사전 레이아웃 계산 없이 바로 그리기 시작
@@ -266,6 +205,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
 
     const reheat = (value = 1) => {
       alpha = Math.max(alpha, value);
+      requestDraw();
     };
 
     /* ── 물리 (Barnes-Hut + 안정화 가드) ── */
@@ -423,6 +363,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       H = rect.height;
       canvas.width = Math.round(W * dpr);
       canvas.height = Math.round(H * dpr);
+      requestDraw();
     };
     const draw = () => {
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -544,11 +485,19 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       }
     };
     let raf = 0;
+    let redrawRequested = false;
+    const shouldSimulate = () => !engPaused && alpha >= 0.003 && vNodes.length > 0;
+    const requestDraw = () => {
+      redrawRequested = true;
+      if (!disposed && !raf) raf = requestAnimationFrame(frame);
+    };
     const frame = () => {
+      raf = 0;
       if (disposed) return;
+      redrawRequested = false;
       tick();
       draw();
-      raf = requestAnimationFrame(frame);
+      if (shouldSimulate() || redrawRequested) requestDraw();
     };
 
     /* ── 카메라 · 인터랙션 ── */
@@ -582,6 +531,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       cam.k = Math.min(2.5, Math.min((W - pad * 2) / Math.max(x1 - x0, 10), (H - pad * 2) / Math.max(y1 - y0, 10)));
       cam.x = W / 2 - ((x0 + x1) / 2) * cam.k;
       cam.y = H / 2 - ((y0 + y1) / 2) * cam.k;
+      requestDraw();
     };
     const fitView = () => fitTo(vNodes);
     const applyHighlight = (ids: string[] | null) => {
@@ -633,6 +583,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       }
       onDetail?.(node ? buildDetail(node) : null);
       onSelectNode?.(node ? node.input : null);
+      requestDraw();
     };
 
     const local = (ev: PointerEvent | WheelEvent | MouseEvent) => {
@@ -671,8 +622,13 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       } else if (panning) {
         cam.x += dx;
         cam.y += dy;
+        requestDraw();
       } else {
-        hovered = nodeAt(p.x, p.y);
+        const nextHovered = nodeAt(p.x, p.y);
+        if (hovered !== nextHovered) {
+          hovered = nextHovered;
+          requestDraw();
+        }
         canvas.style.cursor = hovered ? "pointer" : "grab";
       }
       px = p.x;
@@ -697,6 +653,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       cam.x = p.x - w.x * k2;
       cam.y = p.y - w.y * k2;
       cam.k = k2;
+      requestDraw();
     };
 
     canvas.addEventListener("pointerdown", onPointerDown);
@@ -734,6 +691,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       setPaused: (on) => {
         engPaused = on;
         if (!on) reheat(0.3);
+        requestDraw();
       },
       toggleType: (type) => {
         if (typeOff.has(type)) typeOff.delete(type);
@@ -777,7 +735,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
     rebuildVisible();
     reheat(1);
     const fitTimer = window.setTimeout(fitView, 600);
-    raf = requestAnimationFrame(frame);
+    requestDraw();
     // 헤드리스 검증/e2e용 디버그 훅 — 숨김 탭에서도 수동으로 프레임을 돌릴 수 있다
     (container as HTMLDivElement & { __og?: unknown }).__og = {
       pump: (frames = 1) => {

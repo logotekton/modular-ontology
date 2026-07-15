@@ -9,7 +9,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Literal
+from typing import Any, AsyncIterator, Callable, Literal
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
@@ -61,7 +61,7 @@ from .google_drive_sync import (
     write_back_pack_file,
     write_back_users_file,
 )
-from .mcp_server import TOOL_NAMES, configure_server as configure_mcp_server, mcp as remote_mcp
+from .mcp_server import configure_server as configure_mcp_server, mcp as remote_mcp
 from .mcp_tokens import (
     build_user_mcp_urls,
     ensure_mcp_token_for_user,
@@ -79,7 +79,7 @@ from .project_store import (
     update_project,
 )
 from .qa import answer_pack_question, validate_openai_api_key
-from .store import connect, index_all_packs, index_pack, index_stats, init_db
+from .store import bm25_index_status, connect, index_all_packs, index_pack, index_stats, init_db
 
 
 DIST_DIR = ROOT / "dist"
@@ -153,6 +153,31 @@ def _remember_scope_sync(scope: str, result: dict[str, Any]) -> None:
     }
 
 
+def _run_scoped_google_drive_sync(
+    scope: str,
+    sync_fn: Callable[[], dict[str, Any]],
+    *,
+    force: bool = False,
+    on_synced: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    if not google_drive_sync_enabled():
+        return {"enabled": False, "status": "disabled"}
+    try:
+        ttl = _sync_ttl_seconds(scope)
+        with _GOOGLE_DRIVE_SCOPE_SYNC_LOCK:
+            if not force:
+                cached = _cached_scope_sync(scope, ttl)
+                if cached:
+                    return cached
+            result = sync_fn()
+            _remember_scope_sync(scope, result)
+        if result.get("status") == "synced" and on_synced:
+            on_synced()
+        return {"enabled": True, **result}
+    except Exception as exc:
+        return {"enabled": True, "status": "error", "error": str(exc)}
+
+
 def _file_mtime_ns(path: Path) -> int | None:
     try:
         return path.stat().st_mtime_ns
@@ -194,39 +219,20 @@ def run_google_drive_registry_sync(force: bool = False) -> dict[str, Any]:
 
 
 def run_google_drive_users_sync(force: bool = False) -> dict[str, Any]:
-    if not google_drive_sync_enabled():
-        return {"enabled": False, "status": "disabled"}
-    try:
-        ttl = _sync_ttl_seconds("users")
-        with _GOOGLE_DRIVE_SCOPE_SYNC_LOCK:
-            if not force:
-                cached = _cached_scope_sync("users", ttl)
-                if cached:
-                    return cached
-            result = sync_google_drive_users_file()
-            _remember_scope_sync("users", result)
-        if result.get("status") == "synced":
-            invalidate_users_cache()
-        return {"enabled": True, **result}
-    except Exception as exc:
-        return {"enabled": True, "status": "error", "error": str(exc)}
+    return _run_scoped_google_drive_sync(
+        "users",
+        sync_google_drive_users_file,
+        force=force,
+        on_synced=invalidate_users_cache,
+    )
 
 
 def run_google_drive_mcp_tokens_sync(force: bool = False) -> dict[str, Any]:
-    if not google_drive_sync_enabled():
-        return {"enabled": False, "status": "disabled"}
-    try:
-        ttl = _sync_ttl_seconds("mcp_tokens")
-        with _GOOGLE_DRIVE_SCOPE_SYNC_LOCK:
-            if not force:
-                cached = _cached_scope_sync("mcp_tokens", ttl)
-                if cached:
-                    return cached
-            result = sync_google_drive_mcp_tokens_file()
-            _remember_scope_sync("mcp_tokens", result)
-        return {"enabled": True, **result}
-    except Exception as exc:
-        return {"enabled": True, "status": "error", "error": str(exc)}
+    return _run_scoped_google_drive_sync(
+        "mcp_tokens",
+        sync_google_drive_mcp_tokens_file,
+        force=force,
+    )
 
 
 def require_google_drive_sync(result: dict[str, Any]) -> dict[str, Any]:
@@ -1137,6 +1143,7 @@ def index_status(sync: bool = False) -> dict[str, Any]:
     stats["users"] = len(list_users())
     stats["projects"] = len(list_projects())
     stats["ifcModels"] = len(list_ifc_models())
+    stats["bm25"] = bm25_index_status()
     stats["storage"] = storage_runtime_status(storage_status)
     return stats
 
@@ -1858,7 +1865,8 @@ def _mcp_status_payload(request: Request, authorization: str | None, *, regenera
             "tokenWriteBack": token_write_back,
             "command": ".\\scripts\\run_remote_mcp.ps1",
         },
-        "tools": TOOL_NAMES,
+        "toolProfile": remote_mcp.tool_profile,
+        "tools": remote_mcp.visible_tool_names(),
     }
 
 

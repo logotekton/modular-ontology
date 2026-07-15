@@ -31,8 +31,8 @@ import type { LocalEdge, LocalNode, ParsedLocalPack } from "./localPacks";
 import { OntologyGraph } from "./OntologyGraph";
 import type { OgController, OgDetail } from "./OntologyGraph";
 import { AiChatPanel } from "./app/ai-chat/AiChatPanel";
+import { getJson, HttpError, request } from "./api/http";
 
-const API_BASE = "";
 const OPENAI_CHAT_MODEL = "gpt-4.1-mini";
 
 type Pack = {
@@ -424,12 +424,12 @@ function validationLabel(status?: string) {
   return status;
 }
 
-async function getJson<T>(path: string, token?: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-  });
-  if (!res.ok) throw new Error(await res.text());
-  return res.json() as Promise<T>;
+function httpErrorDetail(error: unknown, fallback: string) {
+  if (error instanceof HttpError && error.body && typeof error.body === "object") {
+    const detail = (error.body as { detail?: unknown }).detail;
+    if (typeof detail === "string" && detail) return detail;
+  }
+  return fallback;
 }
 
 function App() {
@@ -723,7 +723,7 @@ function App() {
       max_edges: "50000",
       pack_ids: activePackIds.join(","),
     });
-    getJson<GraphPayload>(`/api/projects/${encodeURIComponent(selectedProjectId)}/graph?${query.toString()}`, authToken)
+    getJson<GraphPayload>(`/api/projects/${encodeURIComponent(selectedProjectId)}/graph?${query.toString()}`, { token: authToken })
       .then((payload) => {
         if (!active) return;
         setGraph(payload);
@@ -740,7 +740,7 @@ function App() {
   async function refreshPublicStatus(token = authToken) {
     const tasks: Promise<unknown>[] = [getJson<IndexStats>("/api/index/status").then(setIndexStats)];
     if (token) {
-      tasks.push(getJson<McpStatus>("/api/mcp/status", token).then(setMcpStatus));
+      tasks.push(getJson<McpStatus>("/api/mcp/status", { token }).then(setMcpStatus));
     }
     await Promise.all(tasks);
   }
@@ -750,24 +750,20 @@ function App() {
       setUploadStatus("로그인 후 MCP URL을 재발급할 수 있습니다.");
       return;
     }
-    const res = await fetch("/api/mcp/user-url/regenerate", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${authToken}` },
-    });
-    if (!res.ok) {
-      setUploadStatus(await res.text());
-      return;
+    try {
+      const payload = await getJson<McpStatus>("/api/mcp/user-url/regenerate", { method: "POST", token: authToken });
+      setMcpStatus(payload);
+      setUploadStatus("MCP URL이 재발급되었습니다.");
+    } catch (error) {
+      setUploadStatus(error instanceof Error ? error.message : String(error));
     }
-    const payload = (await res.json()) as McpStatus;
-    setMcpStatus(payload);
-    setUploadStatus("MCP URL이 재발급되었습니다.");
   }
 
   async function refreshData(nextPackId?: string, token = authToken) {
     const [packData, projectData, ifcModelData] = await Promise.all([
-      getJson<Pack[]>("/api/packs", token),
-      getJson<Project[]>("/api/projects", token),
-      getJson<IfcModel[]>("/api/ifc/models", token).catch(() => []),
+      getJson<Pack[]>("/api/packs", { token }),
+      getJson<Project[]>("/api/projects", { token }),
+      getJson<IfcModel[]>("/api/ifc/models", { token }).catch(() => []),
     ]);
     setPacks(packData);
     setProjects(projectData);
@@ -792,8 +788,7 @@ function App() {
       setCurrentUser(null);
       return;
     }
-    const res = await fetch("/api/auth/me", { headers: { Authorization: `Bearer ${token}` } });
-    const payload = (await res.json()) as { authenticated: boolean; user: CurrentUser | null };
+    const payload = await getJson<{ authenticated: boolean; user: CurrentUser | null }>("/api/auth/me", { token });
     const user = payload.authenticated ? payload.user : null;
     setCurrentUser(user);
     if (user) {
@@ -806,17 +801,17 @@ function App() {
       setUploadStatus("이메일과 비밀번호를 입력하세요.");
       return;
     }
-    const res = await fetch("/api/auth/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: loginEmail, password: loginPassword }),
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "로그인 실패");
+    let payload: { token: string; user: CurrentUser };
+    try {
+      payload = await getJson("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: loginEmail, password: loginPassword }),
+      });
+    } catch (error) {
+      setUploadStatus(httpErrorDetail(error, "로그인 실패"));
       return;
     }
-    const payload = (await res.json()) as { token: string; user: CurrentUser };
     localStorage.setItem("modularOntologyToken", payload.token);
     skipNextSessionRefreshRef.current = payload.token;
     setAuthToken(payload.token);
@@ -833,14 +828,14 @@ function App() {
       setUploadStatus("회원가입에는 이메일과 비밀번호가 필요합니다.");
       return;
     }
-    const res = await fetch("/api/auth/register", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(signupForm),
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "회원가입 실패");
+    try {
+      await request("/api/auth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(signupForm),
+      });
+    } catch (error) {
+      setUploadStatus(httpErrorDetail(error, "회원가입 실패"));
       return;
     }
     setSignupForm({ name: "", company: "", email: "", password: "" });
@@ -850,31 +845,19 @@ function App() {
 
   async function fetchAdminUsers() {
     if (!authToken) return;
-    const res = await fetch("/api/admin/users", {
-      headers: { Authorization: `Bearer ${authToken}` },
-    });
-    if (!res.ok) throw new Error(await res.text());
-    const payload = (await res.json()) as { users: ManagedUser[] };
+    const payload = await getJson<{ users: ManagedUser[] }>("/api/admin/users", { token: authToken });
     setManagedUsers(payload.users);
   }
 
   async function fetchAdminCompanies() {
     if (!authToken) return;
-    const res = await fetch("/api/admin/companies", {
-      headers: { Authorization: `Bearer ${authToken}` },
-    });
-    if (!res.ok) throw new Error(await res.text());
-    const payload = (await res.json()) as { companies: string[] };
+    const payload = await getJson<{ companies: string[] }>("/api/admin/companies", { token: authToken });
     setCompanies(payload.companies);
   }
 
   async function fetchCompanyProjectAccess() {
     if (!authToken) return;
-    const res = await fetch("/api/admin/company-project-access", {
-      headers: { Authorization: `Bearer ${authToken}` },
-    });
-    if (!res.ok) throw new Error(await res.text());
-    const payload = (await res.json()) as { access: CompanyProjectAccess };
+    const payload = await getJson<{ access: CompanyProjectAccess }>("/api/admin/company-project-access", { token: authToken });
     setCompanyProjectAccess(payload.access);
   }
 
@@ -883,12 +866,14 @@ function App() {
   }
 
   async function approveManagedUser(email: string, role: "admin" | "member" = "member") {
-    const res = await fetch(`/api/admin/users/${encodeURIComponent(email)}/approve`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({ role }),
-    });
-    if (!res.ok) {
+    try {
+      await request(`/api/admin/users/${encodeURIComponent(email)}/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
+        body: JSON.stringify({ role }),
+      });
+    } catch {
       setUploadStatus("회원 승인 실패");
       return;
     }
@@ -897,12 +882,14 @@ function App() {
   }
 
   async function updateManagedUserRole(email: string, role: "admin" | "member") {
-    const res = await fetch(`/api/admin/users/${encodeURIComponent(email)}/role`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({ role }),
-    });
-    if (!res.ok) {
+    try {
+      await request(`/api/admin/users/${encodeURIComponent(email)}/role`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
+        body: JSON.stringify({ role }),
+      });
+    } catch {
       setUploadStatus("권한 변경 실패");
       return;
     }
@@ -911,12 +898,14 @@ function App() {
   }
 
   async function addManagedCompany(name: string) {
-    const res = await fetch("/api/admin/companies", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({ name }),
-    });
-    if (!res.ok) {
+    try {
+      await request("/api/admin/companies", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
+        body: JSON.stringify({ name }),
+      });
+    } catch {
       setUploadStatus("회사 추가 실패");
       return;
     }
@@ -925,12 +914,14 @@ function App() {
   }
 
   async function renameManagedCompany(name: string, newName: string) {
-    const res = await fetch("/api/admin/companies/rename", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({ name, new_name: newName }),
-    });
-    if (!res.ok) {
+    try {
+      await request("/api/admin/companies/rename", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
+        body: JSON.stringify({ name, new_name: newName }),
+      });
+    } catch {
       setUploadStatus("회사명 수정 실패");
       return;
     }
@@ -940,28 +931,25 @@ function App() {
 
   async function deleteManagedCompany(name: string, deleteUsers = false) {
     const query = deleteUsers ? "?delete_users=true" : "";
-    const res = await fetch(`/api/admin/companies/${encodeURIComponent(name)}${query}`, {
-      method: "DELETE",
-      headers: { Authorization: `Bearer ${authToken}` },
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "회사 삭제 실패");
+    let payload: { deletedUsers?: number };
+    try {
+      payload = await getJson(`/api/admin/companies/${encodeURIComponent(name)}${query}`, {
+        method: "DELETE",
+        token: authToken,
+      });
+    } catch (error) {
+      setUploadStatus(httpErrorDetail(error, "회사 삭제 실패"));
       return;
     }
     await refreshAdminDirectory();
-    const payload = (await res.json()) as { deletedUsers?: number };
     setUploadStatus(`${name} 회사를 삭제했습니다.${payload.deletedUsers ? ` 함께 삭제된 회원 ${payload.deletedUsers}명.` : ""}`);
   }
 
   async function deleteManagedUser(email: string) {
-    const res = await fetch(`/api/admin/users/${encodeURIComponent(email)}`, {
-      method: "DELETE",
-      headers: { Authorization: `Bearer ${authToken}` },
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "회원 삭제 실패");
+    try {
+      await request(`/api/admin/users/${encodeURIComponent(email)}`, { method: "DELETE", token: authToken });
+    } catch (error) {
+      setUploadStatus(httpErrorDetail(error, "회원 삭제 실패"));
       return;
     }
     await refreshAdminDirectory();
@@ -969,12 +957,14 @@ function App() {
   }
 
   async function moveManagedUserCompany(email: string, company: string) {
-    const res = await fetch(`/api/admin/users/${encodeURIComponent(email)}/company`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({ company }),
-    });
-    if (!res.ok) {
+    try {
+      await request(`/api/admin/users/${encodeURIComponent(email)}/company`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
+        body: JSON.stringify({ company }),
+      });
+    } catch {
       setUploadStatus("회원 회사 이동 실패");
       return;
     }
@@ -983,17 +973,18 @@ function App() {
   }
 
   async function updateCompanyProjectAccess(company: string, projectIds: string[]) {
-    const res = await fetch(`/api/admin/companies/${encodeURIComponent(company)}/projects`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({ project_ids: projectIds }),
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "프로젝트 접근권한 저장 실패");
+    let payload: { access: CompanyProjectAccess };
+    try {
+      payload = await getJson(`/api/admin/companies/${encodeURIComponent(company)}/projects`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
+        body: JSON.stringify({ project_ids: projectIds }),
+      });
+    } catch (error) {
+      setUploadStatus(httpErrorDetail(error, "프로젝트 접근권한 저장 실패"));
       return;
     }
-    const payload = (await res.json()) as { access: CompanyProjectAccess };
     setCompanyProjectAccess(payload.access);
     await refreshData(undefined, authToken);
     setUploadStatus(`${company} 회사의 프로젝트 접근권한을 저장했습니다.`);
@@ -1005,24 +996,25 @@ function App() {
       return null;
     }
     const isUpdate = Boolean(form.id);
-    const res = await fetch(isUpdate ? `/api/admin/projects/${encodeURIComponent(form.id || "")}` : "/api/admin/projects", {
-      method: isUpdate ? "PUT" : "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({
-        name: form.name,
-        company: form.company,
-        manager: form.manager,
-        discipline: form.discipline,
-        description: form.description,
-        pack_ids: form.packIds,
-      }),
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "프로젝트 저장 실패");
+    let payload: { project: Project };
+    try {
+      payload = await getJson(isUpdate ? `/api/admin/projects/${encodeURIComponent(form.id || "")}` : "/api/admin/projects", {
+        method: isUpdate ? "PUT" : "POST",
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
+        body: JSON.stringify({
+          name: form.name,
+          company: form.company,
+          manager: form.manager,
+          discipline: form.discipline,
+          description: form.description,
+          pack_ids: form.packIds,
+        }),
+      });
+    } catch (error) {
+      setUploadStatus(httpErrorDetail(error, "프로젝트 저장 실패"));
       return null;
     }
-    const payload = (await res.json()) as { project: Project };
     await refreshData(undefined, authToken);
     setSelectedProjectId(payload.project.id);
     setSelectedGraphPackIds([]);
@@ -1035,13 +1027,10 @@ function App() {
       setUploadStatus("관리자 세션이 필요합니다");
       return;
     }
-    const res = await fetch(`/api/admin/projects/${encodeURIComponent(projectId)}`, {
-      method: "DELETE",
-      headers: { Authorization: `Bearer ${authToken}` },
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "프로젝트 삭제 실패");
+    try {
+      await request(`/api/admin/projects/${encodeURIComponent(projectId)}`, { method: "DELETE", token: authToken });
+    } catch (error) {
+      setUploadStatus(httpErrorDetail(error, "프로젝트 삭제 실패"));
       return;
     }
     await refreshData(undefined, authToken);
@@ -1053,14 +1042,15 @@ function App() {
       setUploadStatus("관리자 세션이 필요합니다");
       return;
     }
-    const res = await fetch(`/api/admin/projects/${encodeURIComponent(projectId)}/packs`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({ pack_ids: packIds }),
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "팩 연결 저장 실패");
+    try {
+      await request(`/api/admin/projects/${encodeURIComponent(projectId)}/packs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
+        body: JSON.stringify({ pack_ids: packIds }),
+      });
+    } catch (error) {
+      setUploadStatus(httpErrorDetail(error, "팩 연결 저장 실패"));
       return;
     }
     await refreshData(undefined, authToken);
@@ -1068,10 +1058,7 @@ function App() {
   }
 
   async function logout() {
-    await fetch("/api/auth/logout", {
-      method: "POST",
-      headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
-    }).catch(() => undefined);
+    await request("/api/auth/logout", { method: "POST", token: authToken }).catch(() => undefined);
     localStorage.removeItem("modularOntologyToken");
     setAuthToken("");
     setCurrentUser(null);
@@ -1092,17 +1079,18 @@ function App() {
       setUploadStatus("관리자 세션이 필요합니다");
       return;
     }
-    const res = await fetch("/api/admin/ifc/models/link", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({ model_id: modelId, project_id: projectId }),
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "IFC 연결 저장 실패");
+    let payload: { models: IfcModel[] };
+    try {
+      payload = await getJson("/api/admin/ifc/models/link", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
+        body: JSON.stringify({ model_id: modelId, project_id: projectId }),
+      });
+    } catch (error) {
+      setUploadStatus(httpErrorDetail(error, "IFC 연결 저장 실패"));
       return;
     }
-    const payload = (await res.json()) as { models: IfcModel[] };
     setIfcModels(payload.models);
     setUploadStatus("IFC 연결 저장 완료");
   }
@@ -1189,19 +1177,15 @@ function App() {
     setOpenAiKeyStatus("testing");
     setOpenAiKeyMessage("");
     try {
-      const res = await fetch("/api/llm/openai/validate", {
+      const payload = await getJson<{ valid?: boolean; error?: string }>("/api/llm/openai/validate", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-        },
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
         body: JSON.stringify({
           openai_api_key: userOpenAiKey,
           openai_model: OPENAI_CHAT_MODEL,
         }),
       });
-      if (!res.ok) throw new Error(await res.text());
-      const payload = (await res.json()) as { valid?: boolean; error?: string };
       if (payload.valid) {
         setOpenAiKeyStatus("valid");
         setOpenAiKeyMessage("OpenAI key validated.");
@@ -1250,12 +1234,15 @@ function App() {
     setAiQuestion("");
     setAiLoading(true);
     try {
-      const res = await fetch("/api/query", {
+      const payload = await getJson<{
+        answer?: string;
+        evidence?: QueryEvidence[];
+        llmError?: string | null;
+        mode?: string;
+      }>("/api/query", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-        },
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
         body: JSON.stringify({
           pack_id: targetPackId,
           question,
@@ -1264,13 +1251,6 @@ function App() {
           openai_model: OPENAI_CHAT_MODEL,
         }),
       });
-      if (!res.ok) throw new Error(await res.text());
-      const payload = (await res.json()) as {
-        answer?: string;
-        evidence?: QueryEvidence[];
-        llmError?: string | null;
-        mode?: string;
-      };
       const fallbackAnswer = payload.answer || "답변을 생성하지 못했습니다.";
       const content = payload.llmError
         ? `${formatAiQueryWarning(payload.llmError)}\n\nFallback Graph RAG answer:\n${fallbackAnswer}`

@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import json
+import logging
 import re
+import time
 import zipfile
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 
 from .auth import get_company_project_access
-from .config import env
+from .config import ROOT, env
 from .mcp_tokens import get_mcp_token_record
 from .pack_index import (
     build_graph as read_graph,
@@ -36,12 +37,41 @@ from .pack_index import (
     score_terms,
 )
 from .qa import answer_pack_question
+from . import query_primitives
+from .project_query import ProjectQueryError, execute_structured_project_query
+from .query_contract import (
+    ContractIssue,
+    PLAN_BUNDLE_FIELDS,
+    PLAN_FIELDS,
+    PlanBundleContractError,
+    QueryContractError,
+    validate_plan_bundle,
+    validate_query_plan,
+)
+from .query_engine import QueryBundleResult, QueryExecutionError, execute_query_bundle
+from .snapshot_store import (
+    ProjectSnapshot,
+    SnapshotManifestError,
+    SnapshotVerification,
+    SnapshotVerificationError,
+    load_snapshot,
+    verify_snapshot,
+)
 from .source_anchor import anchors_from_chunk, coverage as source_anchor_coverage
-from .store import connect as connect_index_db, init_db as init_index_db, search_documents as search_indexed_documents
+from .store import (
+    bm25_index_status,
+    connect as connect_index_db,
+    init_db as init_index_db,
+    pack_ids_with_documents,
+    search_documents as search_indexed_documents,
+    search_documents_bm25_multi,
+    search_documents_multi,
+)
 
 
 try:
     from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp.exceptions import ToolError
     from mcp.server.transport_security import TransportSecuritySettings
 except Exception as exc:  # pragma: no cover - import-time operator hint
     raise SystemExit(
@@ -61,115 +91,136 @@ DEFAULT_ALLOWED_ORIGINS = str(env(
     "http://127.0.0.1:*,http://localhost:*,http://[::1]:*",
 ))
 
-TOOL_ALIASES = {
-    "copycrab_status": "mo_server_status",
-    "list_projects": "mo_project_list",
-    "list_packs": "mo_pack_list",
-    "search_packs": "mo_pack_search",
-    "list_sources": "mo_source_list",
-    "list_pack_documents": "mo_document_list",
-    "read_pack_document": "mo_document_read",
-    "read_chunk_by_id": "mo_chunk_read",
-    "search_pack": "mo_evidence_search",
-    "search_documents": "mo_evidence_search",
-    "query_quantity_facts": "mo_quantity_facts_query",
-    "search_drawing_text": "mo_drawing_text_search",
-    "extract_room_area_tags": "mo_room_area_tag_extract",
-    "extract_dimensions_from_view": "mo_dimensions_extract",
-    "calculate_area_from_dimensions": "mo_area_from_dimensions_calculate",
-    "extract_schedule_table": "mo_schedule_table_extract",
-    "dxf_entity_summary": "mo_dxf_entity_summary",
-    "dxf_entity_search": "mo_dxf_entity_search",
-    "dxf_text_search": "mo_dxf_text_search",
-    "dxf_dimension_search": "mo_dxf_dimension_search",
-    "dxf_layer_summary": "mo_dxf_layer_summary",
-    "dxf_bbox_query": "mo_dxf_bbox_query",
-    "query": "mo_question_answer",
-    "ask_pack_question": "mo_question_answer",
-    "get_graph": "mo_graph_get",
-    "list_nodes": "mo_node_list",
-    "search_nodes": "mo_node_search",
-    "get_node_context": "mo_node_context",
-    "list_edges": "mo_edge_list",
-    "list_modules": "mo_module_list",
-    "get_module": "mo_module_get",
-    "list_assembly_marks": "mo_assembly_list",
-    "get_assembly_mark": "mo_assembly_get",
-    "get_fasteners": "mo_fastener_summary",
-    "get_section_weight_index": "mo_section_weight_index",
-}
+_REMOVED_LEGACY_TOOL_NAMES = (
+    "copycrab_status",
+    "list_projects",
+    "list_packs",
+    "search_packs",
+    "list_sources",
+    "list_pack_documents",
+    "read_pack_document",
+    "read_chunk_by_id",
+    "search_pack",
+    "search_documents",
+    "query_quantity_facts",
+    "search_drawing_text",
+    "extract_room_area_tags",
+    "extract_dimensions_from_view",
+    "calculate_area_from_dimensions",
+    "extract_schedule_table",
+    "dxf_entity_summary",
+    "dxf_entity_search",
+    "dxf_text_search",
+    "dxf_dimension_search",
+    "dxf_layer_summary",
+    "dxf_bbox_query",
+    "query",
+    "ask_pack_question",
+    "get_graph",
+    "list_nodes",
+    "search_nodes",
+    "get_node_context",
+    "list_edges",
+    "list_modules",
+    "get_module",
+    "list_assembly_marks",
+    "get_assembly_mark",
+    "get_fasteners",
+    "get_section_weight_index",
+)
 
 TOOL_MANIFEST = [
-    {"name": "mo_server_status", "legacy": ["copycrab_status"], "domain": "server", "action": "status"},
-    {"name": "mo_tool_manifest", "legacy": [], "domain": "tool", "action": "manifest"},
-    {"name": "mo_ontology_manifest", "legacy": [], "domain": "ontology", "action": "manifest"},
-    {"name": "mo_project_list", "legacy": ["list_projects"], "domain": "project", "action": "list"},
-    {"name": "mo_project_overview", "legacy": [], "domain": "project", "action": "overview"},
-    {"name": "mo_project_pack_list", "legacy": [], "domain": "project_pack", "action": "list"},
-    {"name": "mo_project_search", "legacy": [], "domain": "project", "action": "search"},
-    {"name": "mo_pack_list", "legacy": ["list_packs"], "domain": "pack", "action": "list"},
-    {"name": "mo_pack_overview", "legacy": [], "domain": "pack", "action": "overview"},
-    {"name": "mo_pack_search", "legacy": ["search_packs"], "domain": "pack", "action": "search"},
-    {"name": "mo_pack_schema", "legacy": [], "domain": "pack", "action": "schema"},
-    {"name": "mo_source_list", "legacy": ["list_sources"], "domain": "source", "action": "list"},
-    {"name": "mo_document_list", "legacy": ["list_pack_documents"], "domain": "document", "action": "list"},
-    {"name": "mo_document_read", "legacy": ["read_pack_document"], "domain": "document", "action": "read"},
-    {"name": "mo_chunk_read", "legacy": ["read_chunk_by_id"], "domain": "chunk", "action": "read"},
-    {"name": "mo_evidence_search", "legacy": ["search_pack", "search_documents"], "domain": "evidence", "action": "search"},
-    {"name": "mo_evidence_trace", "legacy": [], "domain": "evidence", "action": "trace"},
-    {"name": "mo_anchor_resolve", "legacy": [], "domain": "anchor", "action": "resolve"},
-    {"name": "mo_anchor_coverage", "legacy": [], "domain": "anchor", "action": "coverage"},
-    {"name": "mo_drawing_text_search", "legacy": ["search_drawing_text"], "domain": "drawing_text", "action": "search"},
-    {"name": "mo_room_area_tag_extract", "legacy": ["extract_room_area_tags"], "domain": "room_area_tag", "action": "extract"},
-    {"name": "mo_dimensions_extract", "legacy": ["extract_dimensions_from_view"], "domain": "dimension", "action": "extract"},
+    {"name": "mo_server_status", "domain": "server", "action": "status"},
+    {"name": "mo_tool_manifest", "domain": "tool", "action": "manifest"},
+    {"name": "mo_snapshot_list", "domain": "snapshot", "action": "list"},
+    {"name": "mo_snapshot_status", "domain": "snapshot", "action": "status"},
+    {"name": "mo_snapshot_query", "domain": "snapshot", "action": "query"},
+    {"name": "mo_snapshot_bundle_query", "domain": "snapshot_bundle", "action": "query"},
+    {"name": "mo_ontology_manifest", "domain": "ontology", "action": "manifest"},
+    {"name": "mo_project_list", "domain": "project", "action": "list"},
+    {"name": "mo_project_overview", "domain": "project", "action": "overview"},
+    {"name": "mo_project_pack_list", "domain": "project_pack", "action": "list"},
+    {"name": "mo_project_search", "domain": "project", "action": "search"},
+    {"name": "mo_project_ask", "domain": "project", "action": "ask"},
+    {"name": "mo_pack_list", "domain": "pack", "action": "list"},
+    {"name": "mo_pack_overview", "domain": "pack", "action": "overview"},
+    {"name": "mo_pack_search", "domain": "pack", "action": "search"},
+    {"name": "mo_pack_schema", "domain": "pack", "action": "schema"},
+    {"name": "mo_source_list", "domain": "source", "action": "list"},
+    {"name": "mo_document_list", "domain": "document", "action": "list"},
+    {"name": "mo_document_read", "domain": "document", "action": "read"},
+    {"name": "mo_chunk_read", "domain": "chunk", "action": "read"},
+    {"name": "mo_evidence_search", "domain": "evidence", "action": "search"},
+    {"name": "mo_evidence_trace", "domain": "evidence", "action": "trace"},
+    {"name": "mo_anchor_resolve", "domain": "anchor", "action": "resolve"},
+    {"name": "mo_anchor_coverage", "domain": "anchor", "action": "coverage"},
+    {"name": "mo_drawing_text_search", "domain": "drawing_text", "action": "search"},
+    {"name": "mo_room_area_tag_extract", "domain": "room_area_tag", "action": "extract"},
+    {"name": "mo_dimensions_extract", "domain": "dimension", "action": "extract"},
     {
         "name": "mo_area_from_dimensions_calculate",
-        "legacy": ["calculate_area_from_dimensions"],
         "domain": "measurement",
         "action": "calculate_area_from_dimensions",
     },
-    {"name": "mo_schedule_table_extract", "legacy": ["extract_schedule_table"], "domain": "schedule_table", "action": "extract"},
-    {"name": "mo_dxf_entity_summary", "legacy": ["dxf_entity_summary"], "domain": "dxf_entity", "action": "summary"},
-    {"name": "mo_dxf_entity_search", "legacy": ["dxf_entity_search"], "domain": "dxf_entity", "action": "search"},
-    {"name": "mo_dxf_text_search", "legacy": ["dxf_text_search"], "domain": "dxf_text", "action": "search"},
-    {"name": "mo_dxf_dimension_search", "legacy": ["dxf_dimension_search"], "domain": "dxf_dimension", "action": "search"},
-    {"name": "mo_dxf_layer_summary", "legacy": ["dxf_layer_summary"], "domain": "dxf_layer", "action": "summary"},
-    {"name": "mo_dxf_bbox_query", "legacy": ["dxf_bbox_query"], "domain": "dxf_entity", "action": "bbox_query"},
-    {"name": "mo_question_answer", "legacy": ["query", "ask_pack_question"], "domain": "question", "action": "answer"},
-    {"name": "mo_graph_get", "legacy": ["get_graph"], "domain": "graph", "action": "get"},
-    {"name": "mo_node_type_list", "legacy": [], "domain": "node_type", "action": "list"},
-    {"name": "mo_node_list", "legacy": ["list_nodes"], "domain": "node", "action": "list"},
-    {"name": "mo_node_search", "legacy": ["search_nodes"], "domain": "node", "action": "search"},
-    {"name": "mo_filtered_search_nodes", "legacy": [], "domain": "node", "action": "filtered_search"},
-    {"name": "mo_distinct_property_values", "legacy": [], "domain": "node", "action": "distinct_property_values"},
-    {"name": "mo_aggregate_nodes", "legacy": [], "domain": "node", "action": "aggregate"},
-    {"name": "mo_schema_profile", "legacy": [], "domain": "schema", "action": "profile"},
-    {"name": "mo_node_context", "legacy": ["get_node_context"], "domain": "node", "action": "context"},
-    {"name": "mo_edge_list", "legacy": ["list_edges"], "domain": "edge", "action": "list"},
-    {"name": "mo_relation_type_list", "legacy": [], "domain": "relation_type", "action": "list"},
-    {"name": "mo_module_list", "legacy": ["list_modules"], "domain": "module", "action": "list"},
-    {"name": "mo_list_project_modules", "legacy": [], "domain": "module", "action": "project_list"},
-    {"name": "mo_list_module_elements", "legacy": [], "domain": "module", "action": "element_list"},
-    {"name": "mo_quantity_facts_query", "legacy": ["query_quantity_facts"], "domain": "quantity_fact", "action": "query"},
-    {"name": "mo_query_quantity_evidence", "legacy": [], "domain": "quantity", "action": "evidence_query"},
-    {"name": "mo_aggregate_quantity_by_module", "legacy": [], "domain": "quantity", "action": "aggregate_by_module"},
-    {"name": "mo_join_by_property", "legacy": [], "domain": "node", "action": "join_by_property"},
-    {"name": "mo_module_get", "legacy": ["get_module"], "domain": "module", "action": "get"},
-    {"name": "mo_assembly_list", "legacy": ["list_assembly_marks"], "domain": "assembly", "action": "list"},
-    {"name": "mo_assembly_get", "legacy": ["get_assembly_mark"], "domain": "assembly", "action": "get"},
-    {"name": "mo_fastener_summary", "legacy": ["get_fasteners"], "domain": "fastener", "action": "summary"},
+    {"name": "mo_schedule_table_extract", "domain": "schedule_table", "action": "extract"},
+    {"name": "mo_dxf_entity_summary", "domain": "dxf_entity", "action": "summary"},
+    {"name": "mo_dxf_entity_search", "domain": "dxf_entity", "action": "search"},
+    {"name": "mo_dxf_text_search", "domain": "dxf_text", "action": "search"},
+    {"name": "mo_dxf_dimension_search", "domain": "dxf_dimension", "action": "search"},
+    {"name": "mo_dxf_layer_summary", "domain": "dxf_layer", "action": "summary"},
+    {"name": "mo_dxf_bbox_query", "domain": "dxf_entity", "action": "bbox_query"},
+    {"name": "mo_question_answer", "domain": "question", "action": "answer"},
+    {"name": "mo_graph_get", "domain": "graph", "action": "get"},
+    {"name": "mo_node_type_list", "domain": "node_type", "action": "list"},
+    {"name": "mo_node_list", "domain": "node", "action": "list"},
+    {"name": "mo_node_search", "domain": "node", "action": "search"},
+    {"name": "mo_filtered_search_nodes", "domain": "node", "action": "filtered_search"},
+    {"name": "mo_distinct_property_values", "domain": "node", "action": "distinct_property_values"},
+    {"name": "mo_aggregate_nodes", "domain": "node", "action": "aggregate"},
+    {"name": "mo_schema_profile", "domain": "schema", "action": "profile"},
+    {"name": "mo_node_context", "domain": "node", "action": "context"},
+    {"name": "mo_edge_list", "domain": "edge", "action": "list"},
+    {"name": "mo_relation_type_list", "domain": "relation_type", "action": "list"},
+    {"name": "mo_module_list", "domain": "module", "action": "list"},
+    {"name": "mo_list_project_modules", "domain": "module", "action": "project_list"},
+    {"name": "mo_list_module_elements", "domain": "module", "action": "element_list"},
+    {"name": "mo_quantity_facts_query", "domain": "quantity_fact", "action": "query"},
+    {"name": "mo_query_quantity_evidence", "domain": "quantity", "action": "evidence_query"},
+    {"name": "mo_aggregate_quantity_by_module", "domain": "quantity", "action": "aggregate_by_module"},
+    {"name": "mo_join_by_property", "domain": "node", "action": "join_by_property"},
+    {"name": "mo_module_get", "domain": "module", "action": "get"},
+    {"name": "mo_assembly_list", "domain": "assembly", "action": "list"},
+    {"name": "mo_assembly_get", "domain": "assembly", "action": "get"},
+    {"name": "mo_fastener_summary", "domain": "fastener", "action": "summary"},
     {
         "name": "mo_section_weight_index",
-        "legacy": ["get_section_weight_index"],
         "domain": "section",
         "action": "weight_index",
     },
 ]
 
 TOOL_NAMES = [tool["name"] for tool in TOOL_MANIFEST]
-LEGACY_TOOL_NAMES = list(TOOL_ALIASES)
+CORE_TOOL_NAMES = [
+    "mo_server_status",
+    "mo_tool_manifest",
+    "mo_project_list",
+    "mo_project_overview",
+    "mo_project_ask",
+    "mo_pack_overview",
+    "mo_evidence_search",
+    "mo_document_read",
+    "mo_graph_get",
+    "mo_drawing_text_search",
+    "mo_quantity_facts_query",
+    "mo_module_get",
+]
+TOOL_PROFILE_NAMES = ("core", "expert")
 _CLOUD_CHUNK_ROW_CACHE: dict[str, dict[str, object]] = {}
 _DRAWING_ENTITY_SEARCH_CACHE: dict[str, dict[str, object]] = {}
+_PROJECT_FALLBACK_MAX_PACKS = 10
+_PROJECT_FALLBACK_BUDGET_SECONDS = 2.0
+_PROJECT_SEARCH_MAX_MATCHES = 40
+_LOGGER = logging.getLogger(__name__)
 
 
 def _split_csv(value: str) -> list[str]:
@@ -180,12 +231,58 @@ def _split_many(values: Sequence[str]) -> list[str]:
     return [part for value in values for part in _split_csv(value)]
 
 
-mcp = FastMCP(
+def _normalize_tool_profile(value: str | None) -> str:
+    profile = str(value or "core").strip().casefold()
+    aliases = {"canonical": "expert"}
+    profile = aliases.get(profile, profile)
+    if profile not in TOOL_PROFILE_NAMES:
+        choices = ", ".join(TOOL_PROFILE_NAMES)
+        raise ValueError(f"Unknown MCP tool profile {value!r}; expected one of: {choices}")
+    return profile
+
+
+def _tool_names_for_profile(profile: str) -> list[str]:
+    normalized = _normalize_tool_profile(profile)
+    if normalized == "core":
+        return list(CORE_TOOL_NAMES)
+    return list(TOOL_NAMES)
+
+
+class ProfiledFastMCP(FastMCP):
+    """FastMCP server that exposes only the tools selected by a public profile."""
+
+    def __init__(self, *args: object, tool_profile: str = "core", **kwargs: object) -> None:
+        self.tool_profile = _normalize_tool_profile(tool_profile)
+        super().__init__(*args, **kwargs)
+
+    def set_tool_profile(self, profile: str) -> None:
+        self.tool_profile = _normalize_tool_profile(profile)
+
+    def visible_tool_names(self) -> list[str]:
+        allowed = set(_tool_names_for_profile(self.tool_profile))
+        return [tool.name for tool in self._tool_manager.list_tools() if tool.name in allowed]
+
+    async def list_tools(self):
+        allowed = set(_tool_names_for_profile(self.tool_profile))
+        return [tool for tool in await super().list_tools() if tool.name in allowed]
+
+    async def call_tool(self, name: str, arguments: dict):
+        if name not in set(_tool_names_for_profile(self.tool_profile)):
+            raise ToolError(
+                f"Tool {name!r} is not exposed by the {self.tool_profile!r} profile. "
+                "Use MODULAR_ONTOLOGY_MCP_TOOL_PROFILE=expert for canonical specialist tools."
+            )
+        return await super().call_tool(name, arguments)
+
+
+mcp = ProfiledFastMCP(
     "Modular Ontology",
+    tool_profile=str(env("MODULAR_ONTOLOGY_MCP_TOOL_PROFILE", "core")),
     instructions=(
         "Use Modular Ontology tools to inspect BIM ontology packs, search evidence, "
         "sample graph nodes/edges, and answer natural language questions about Revit IFC "
-        "and Advance Steel model data."
+        "and Advance Steel model data. For project questions, call mo_project_ask first "
+        "and synthesize the final answer directly from its evidence."
     ),
     host=DEFAULT_HOST,
     port=DEFAULT_PORT,
@@ -200,6 +297,11 @@ mcp = FastMCP(
 
 def _json(payload: object, *, pretty: bool = True) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2 if pretty else None)
+
+
+def _env_enabled(name: str, *, default: bool) -> bool:
+    fallback = "1" if default else "0"
+    return str(env(name, fallback) or fallback).strip().casefold() not in {"0", "false", "no", "off"}
 
 
 def _mcp_company_env() -> str:
@@ -336,7 +438,334 @@ def _filter_sources(payload: dict) -> dict:
     return {**payload, "count": len(filtered_sources), "sources": filtered_sources}
 
 
+class CanonicalSnapshotToolError(RuntimeError):
+    """Fail-closed error raised before a canonical snapshot result is exposed."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
+_SHA256_HEX_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def _is_sha256_hex(value: object) -> bool:
+    return isinstance(value, str) and _SHA256_HEX_PATTERN.fullmatch(value) is not None
+
+
+def _canonical_snapshot_root() -> Path:
+    configured = env("MODULAR_ONTOLOGY_SNAPSHOT_DIR")
+    return Path(configured or ROOT / "snapshots").expanduser().resolve()
+
+
+def _canonical_snapshot_manifests() -> list[tuple[str, Path, dict]]:
+    root = _canonical_snapshot_root()
+    if not root.is_dir():
+        raise CanonicalSnapshotToolError(
+            "snapshot_store_unavailable",
+            "Canonical snapshot directory is unavailable.",
+        )
+
+    manifests: list[tuple[str, Path, dict]] = []
+    seen: set[str] = set()
+    for path in sorted(root.glob("*.json"), key=lambda item: item.name.casefold()):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CanonicalSnapshotToolError(
+                "snapshot_manifest_invalid",
+                f"Cannot read canonical snapshot manifest {path.name}: {exc}",
+            ) from exc
+        if not isinstance(payload, dict):
+            raise CanonicalSnapshotToolError(
+                "snapshot_manifest_invalid",
+                f"Canonical snapshot manifest {path.name} must be a JSON object.",
+            )
+        canonical_id = str(payload.get("canonical_id") or "").strip()
+        if not canonical_id:
+            raise CanonicalSnapshotToolError(
+                "snapshot_manifest_invalid",
+                f"Canonical snapshot manifest {path.name} has no canonical_id.",
+            )
+        if canonical_id in seen:
+            raise CanonicalSnapshotToolError(
+                "snapshot_id_ambiguous",
+                f"Canonical snapshot id is declared more than once: {canonical_id}",
+            )
+        seen.add(canonical_id)
+        manifests.append((canonical_id, path, payload))
+    return manifests
+
+
+def _canonical_snapshot_manifest(canonical_id: str) -> tuple[Path, dict]:
+    requested = canonical_id.strip()
+    if not requested:
+        raise CanonicalSnapshotToolError("snapshot_id_required", "canonical_id is required.")
+    for current_id, path, payload in _canonical_snapshot_manifests():
+        if current_id == requested:
+            return path, payload
+    raise CanonicalSnapshotToolError(
+        "snapshot_not_found",
+        f"Canonical snapshot is not available: {requested}",
+    )
+
+
+def _load_canonical_snapshot(canonical_id: str) -> tuple[dict, ProjectSnapshot]:
+    path, manifest = _canonical_snapshot_manifest(canonical_id)
+    snapshot = load_snapshot(path)
+    source_composite = str(manifest.get("source_composite_sha256") or "").strip().lower()
+    if not source_composite or snapshot.source_signature != f"sha256:{source_composite}":
+        raise CanonicalSnapshotToolError(
+            "snapshot_source_signature_mismatch",
+            "Canonical snapshot source signature is not bound to its composite SHA-256.",
+        )
+    return manifest, snapshot
+
+
+def _snapshot_is_visible(snapshot: ProjectSnapshot) -> bool:
+    if not _mcp_authorized():
+        return False
+    if _is_internal_company(_mcp_company()):
+        return True
+    required_pack_ids = {pack.pack_id for pack in snapshot.packs if pack.included}
+    return required_pack_ids.issubset(_visible_pack_ids())
+
+
+def _require_snapshot_access(snapshot: ProjectSnapshot) -> None:
+    if not _mcp_authorized():
+        raise CanonicalSnapshotToolError("unauthorized", "Invalid MCP user URL token.")
+    if not _snapshot_is_visible(snapshot):
+        raise CanonicalSnapshotToolError(
+            "forbidden",
+            "Canonical snapshot is outside the current MCP company scope.",
+        )
+
+
+def _snapshot_summary(manifest: dict, snapshot: ProjectSnapshot) -> dict:
+    included = [pack for pack in snapshot.packs if pack.included]
+    return {
+        "canonical_id": str(manifest["canonical_id"]),
+        "project_id": snapshot.project_id,
+        "internal_snapshot_id": snapshot.snapshot_id,
+        "internal_snapshot_hash": snapshot.snapshot_hash,
+        "source_signature": snapshot.source_signature,
+        "source_composite_sha256": str(manifest["source_composite_sha256"]),
+        "pack_count": len(snapshot.packs),
+        "included_pack_count": len(included),
+    }
+
+
+def _snapshot_verification_payload(verification: SnapshotVerification) -> dict:
+    return {
+        "valid": verification.valid,
+        "checked_pack_count": len(verification.checked_pack_ids),
+        "issues": [
+            {"code": issue.code, "message": issue.message, "pack_id": issue.pack_id}
+            for issue in verification.issues
+        ],
+        "warnings": [
+            {"code": issue.code, "message": issue.message, "pack_id": issue.pack_id}
+            for issue in verification.warnings
+        ],
+    }
+
+
+def _verify_canonical_snapshot(snapshot: ProjectSnapshot) -> SnapshotVerification:
+    verification = verify_snapshot(snapshot)
+    verification.require_valid()
+    included_count = sum(pack.included for pack in snapshot.packs)
+    if len(verification.checked_pack_ids) != included_count:
+        raise CanonicalSnapshotToolError(
+            "snapshot_verification_incomplete",
+            "Snapshot verification did not check every included pack.",
+        )
+    return verification
+
+
+def _exact_snapshot_query_plan(plan: dict) -> dict:
+    validated = validate_query_plan(plan)
+    actual_fields = {str(field) for field in plan}
+    if actual_fields != PLAN_FIELDS:
+        missing = sorted(PLAN_FIELDS - actual_fields)
+        extra = sorted(actual_fields - PLAN_FIELDS)
+        raise QueryContractError(
+            [
+                ContractIssue(
+                    "field_set_mismatch",
+                    "$",
+                    f"plan must contain exactly the seven fields; missing={missing}, extra={extra}",
+                )
+            ]
+        )
+    return validated.as_dict()
+
+
+def _exact_snapshot_query_bundle(bundle: dict) -> dict:
+    validated = validate_plan_bundle(bundle)
+    actual_fields = {str(field) for field in bundle}
+    if actual_fields != PLAN_BUNDLE_FIELDS:
+        missing = sorted(PLAN_BUNDLE_FIELDS - actual_fields)
+        extra = sorted(actual_fields - PLAN_BUNDLE_FIELDS)
+        raise PlanBundleContractError(
+            [
+                ContractIssue(
+                    "field_set_mismatch",
+                    "$",
+                    f"bundle must contain exactly project_id, plans, and reducers; missing={missing}, extra={extra}",
+                )
+            ]
+        )
+    return validated.as_dict()
+
+
+def _snapshot_bundle_bindings(
+    manifest: dict,
+    snapshot: ProjectSnapshot,
+    result: QueryBundleResult,
+) -> dict:
+    """Validate and expose immutable snapshot/query/result/source-pack bindings."""
+
+    if not result.complete or result.snapshot_id != snapshot.snapshot_id:
+        raise CanonicalSnapshotToolError(
+            "snapshot_binding_failed",
+            "Bundle result is not completely bound to the requested canonical snapshot.",
+        )
+    if (
+        result.bundle_hash != result.query_hash
+        or not _is_sha256_hex(result.bundle_hash)
+        or not _is_sha256_hex(result.query_hash)
+    ):
+        raise CanonicalSnapshotToolError(
+            "query_binding_failed",
+            "Bundle hash and query hash must match and be 64-digit SHA-256 hex values.",
+        )
+
+    evidence = result.evidence
+    if (
+        evidence.get("snapshot_id") != snapshot.snapshot_id
+        or evidence.get("bundle_hash") != result.bundle_hash
+        or evidence.get("query_hash") != result.query_hash
+        or evidence.get("result_hash") != result.result_hash
+        or not _is_sha256_hex(result.result_hash)
+    ):
+        raise CanonicalSnapshotToolError(
+            "result_binding_failed",
+            "Bundle evidence hashes do not match the completed result.",
+        )
+
+    expected_packs = {
+        pack.pack_id: pack.sha256.casefold()
+        for pack in snapshot.packs
+        if pack.included
+    }
+    raw_plan_bindings = evidence.get("plan_bindings")
+    if not isinstance(raw_plan_bindings, dict):
+        raise CanonicalSnapshotToolError(
+            "subplan_binding_failed",
+            "Bundle evidence has no subplan bindings.",
+        )
+
+    subplans: dict[str, dict] = {}
+    if set(raw_plan_bindings) != set(result.plan_results):
+        raise CanonicalSnapshotToolError(
+            "subplan_binding_failed",
+            "Bundle evidence does not cover exactly the completed subplans.",
+        )
+    for plan_id, plan_result in sorted(result.plan_results.items()):
+        raw_binding = raw_plan_bindings.get(plan_id)
+        if not isinstance(raw_binding, dict):
+            raise CanonicalSnapshotToolError(
+                "subplan_binding_failed",
+                f"Subplan {plan_id!r} has no hash binding.",
+            )
+        source_packs = [dict(pack) for pack in plan_result.source_packs]
+        if (
+            not plan_result.complete
+            or plan_result.snapshot_id != snapshot.snapshot_id
+            or plan_result.evidence.get("snapshot_id") != snapshot.snapshot_id
+            or plan_result.evidence.get("query_hash") != plan_result.query_hash
+            or plan_result.evidence.get("result_hash") != plan_result.result_hash
+            or raw_binding.get("query_hash") != plan_result.query_hash
+            or raw_binding.get("result_hash") != plan_result.result_hash
+            or raw_binding.get("source_packs") != source_packs
+            or not _is_sha256_hex(plan_result.query_hash)
+            or not _is_sha256_hex(plan_result.result_hash)
+        ):
+            raise CanonicalSnapshotToolError(
+                "subplan_binding_failed",
+                f"Subplan {plan_id!r} hashes are not internally consistent.",
+            )
+        if not source_packs:
+            raise CanonicalSnapshotToolError(
+                "subplan_binding_failed",
+                f"Subplan {plan_id!r} has no source-pack SHA binding.",
+            )
+        for source_pack in source_packs:
+            pack_id = str(source_pack.get("pack_id") or "")
+            source_sha = str(source_pack.get("sha256") or "").casefold()
+            if not pack_id or expected_packs.get(pack_id) != source_sha:
+                raise CanonicalSnapshotToolError(
+                    "subplan_binding_failed",
+                    f"Subplan {plan_id!r} source pack {pack_id!r} is outside "
+                    "the canonical snapshot or has a stale SHA-256.",
+                )
+        subplans[plan_id] = {
+            "snapshot_id": plan_result.snapshot_id,
+            "query_hash": plan_result.query_hash,
+            "result_hash": plan_result.result_hash,
+            "source_packs": source_packs,
+        }
+
+    return {
+        "snapshot": {
+            "canonical_id": str(manifest["canonical_id"]),
+            "internal_snapshot_id": snapshot.snapshot_id,
+            "internal_snapshot_hash": snapshot.snapshot_hash,
+            "source_signature": snapshot.source_signature,
+            "source_composite_sha256": str(manifest["source_composite_sha256"]),
+        },
+        "query": {
+            "bundle_hash": result.bundle_hash,
+            "query_hash": result.query_hash,
+        },
+        "result": {"result_hash": result.result_hash},
+        "subplans": subplans,
+    }
+
+
+def _snapshot_error_payload(exc: Exception, *, canonical_id: str | None = None) -> dict:
+    if isinstance(exc, PlanBundleContractError):
+        error = {"code": "invalid_plan_bundle", "detail": str(exc), "issues": exc.as_dict()["issues"]}
+    elif isinstance(exc, QueryContractError):
+        error = {"code": "invalid_query_plan", "detail": str(exc), "issues": exc.as_dict()["issues"]}
+    elif isinstance(exc, SnapshotVerificationError):
+        error = {
+            "code": "snapshot_verification_failed",
+            "detail": str(exc),
+            "verification": _snapshot_verification_payload(exc.result),
+        }
+    elif isinstance(exc, CanonicalSnapshotToolError):
+        error = {"code": exc.code, "detail": exc.detail}
+    elif isinstance(exc, SnapshotManifestError):
+        error = {"code": "snapshot_manifest_invalid", "detail": str(exc)}
+    elif isinstance(exc, ProjectQueryError):
+        error = {"code": "snapshot_query_rejected", "detail": str(exc)}
+    elif isinstance(exc, QueryExecutionError):
+        error = {"code": "snapshot_bundle_query_rejected", "detail": str(exc)}
+    elif isinstance(exc, OSError):
+        error = {"code": "snapshot_io_error", "detail": str(exc)}
+    else:
+        error = {"code": "snapshot_operation_failed", "detail": str(exc)}
+    payload: dict[str, object] = {"status": "error", "error": error}
+    if canonical_id is not None:
+        payload["canonical_id"] = canonical_id
+    return payload
+
+
 def _tool_manifest_payload() -> dict:
+    visible_tool_names = mcp.visible_tool_names()
+    visible_tool_name_set = set(visible_tool_names)
     return {
         "naming": {
             "prefix": "mo",
@@ -344,16 +773,37 @@ def _tool_manifest_payload() -> dict:
             "meaning": "mo is short for Modular Ontology.",
             "canonicalOnlyForNewClients": True,
         },
+        "exposure": {
+            "profile": mcp.tool_profile,
+            "visibleCount": len(visible_tool_names),
+            "visibleTools": visible_tool_names,
+            "availableProfiles": {
+                "core": len(CORE_TOOL_NAMES),
+                "expert": len(TOOL_NAMES),
+            },
+            "configuration": "MODULAR_ONTOLOGY_MCP_TOOL_PROFILE=core|expert",
+        },
         "workflow": {
             "primaryUnit": "project",
-            "guidance": "Start with project tools. Use pack tools only when the user explicitly wants to inspect a specific pack.",
-            "recommendedStart": ["mo_project_list", "mo_project_pack_list", "mo_project_overview", "mo_project_search"],
+            "guidance": "For a project question, call mo_project_ask first and answer directly from its evidence. Use pack tools only when the user explicitly wants to inspect a specific pack.",
+            "recommendedStart": ["mo_project_ask", "mo_project_list", "mo_project_overview"],
+            "retrieval": {
+                "defaultMode": "bm25",
+                "fallback": "sqlite-lexical",
+                "vector": "disabled",
+                "answerMode": "client_synthesis",
+            },
+            "canonicalSnapshotTools": [
+                "mo_snapshot_list",
+                "mo_snapshot_status",
+                "mo_snapshot_query",
+                "mo_snapshot_bundle_query",
+            ],
             "packLevelTools": ["mo_pack_overview", "mo_pack_schema", "mo_document_list", "mo_document_read"],
         },
         "tools": TOOL_MANIFEST,
         "canonicalTools": TOOL_NAMES,
-        "legacyTools": LEGACY_TOOL_NAMES,
-        "legacyAliases": TOOL_ALIASES,
+        "visibleCanonicalTools": [name for name in TOOL_NAMES if name in visible_tool_name_set],
     }
 
 
@@ -501,243 +951,73 @@ def _not_found_payload(kind: str, identifier: str) -> str:
     )
 
 
-_MISSING = object()
-_HEAVY_FIELDS = {
-    "bim_references",
-    "content",
-    "embedding",
-    "formula",
-    "formula_details",
-    "formula_source",
-    "raw",
-    "raw_json",
-    "raw_text",
-    "source_text",
-}
-_DEFAULT_NODE_FIELDS = [
-    "id",
-    "label",
-    "type",
-    "module_id",
-    "module_type",
-    "workset_name",
-    "category",
-    "class",
-    "family_name",
-    "family_and_type",
-    "type_name",
-    "work_category",
-    "item_name",
-    "specification",
-    "quantity",
-    "unit",
-    "normalized_unit",
-    "source_sheet",
-    "source_row",
-    "source_element_id",
-    "ifc_guid",
-]
+_MISSING = query_primitives.MISSING
+_DEFAULT_NODE_FIELDS = query_primitives.DEFAULT_NODE_FIELDS
 _MODULE_PATTERN = re.compile(r"^[0-9]+-[0-9]{2}-(A|ST|L|G|O)$")
 
 
 def _normalize_tool_dict(value: dict | None) -> dict:
-    return value if isinstance(value, dict) else {}
+    return query_primitives.normalize_dict(value)
 
 
 def _normalize_tool_list(value: Sequence | None) -> list:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [item.strip() for item in value.split(",") if item.strip()]
-    return list(value)
+    return query_primitives.normalize_list(value)
 
 
 def _node_field(node: dict, field: str) -> object:
-    if field in node:
-        return node.get(field)
-    properties = node.get("properties")
-    if not isinstance(properties, dict):
-        return _MISSING
-    if field.startswith("properties."):
-        field = field.split(".", 1)[1]
-    current: object = properties
-    for part in field.split("."):
-        if isinstance(current, dict) and part in current:
-            current = current[part]
-        else:
-            return _MISSING
-    return current
+    return query_primitives.node_field(node, field)
 
 
 def _node_has_field(node: dict, field: str) -> bool:
-    return _node_field(node, field) is not _MISSING
+    return query_primitives.node_has_field(node, field)
 
 
 def _is_heavy_field(field: str) -> bool:
-    normalized = field.split(".", 1)[-1]
-    return normalized in _HEAVY_FIELDS
+    return query_primitives.is_heavy_field(field)
 
 
 def _to_number(value: object) -> float | None:
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, int | float):
-        return float(value)
-    text = str(value).strip()
-    if not text:
-        return None
-    text = text.replace(",", "")
-    match = re.search(r"-?\d+(?:\.\d+)?", text)
-    if not match:
-        return None
-    try:
-        return float(match.group(0))
-    except ValueError:
-        return None
+    return query_primitives.to_number(value)
 
 
 def _loose_equal(left: object, right: object) -> bool:
-    left_number = _to_number(left)
-    right_number = _to_number(right)
-    if left_number is not None and right_number is not None:
-        return left_number == right_number
-    return left == right or str(left) == str(right)
+    return query_primitives.loose_equal(left, right)
 
 
 def _match_one(value: object, operator: str, expected: object, *, exists: bool) -> bool:
-    if operator == "exists":
-        return exists if bool(expected) else not exists
-    if not exists:
-        return operator == "ne" and expected is not None
-    if operator == "eq":
-        return _loose_equal(value, expected)
-    if operator == "ne":
-        return not _loose_equal(value, expected)
-    if operator == "in":
-        return any(_loose_equal(value, item) for item in _normalize_tool_list(expected if isinstance(expected, Sequence) and not isinstance(expected, str) else [expected]))
-    if operator == "not_in":
-        return not any(_loose_equal(value, item) for item in _normalize_tool_list(expected if isinstance(expected, Sequence) and not isinstance(expected, str) else [expected]))
-    if operator == "contains":
-        return str(expected).casefold() in str(value).casefold()
-    if operator == "startswith":
-        return str(value).casefold().startswith(str(expected).casefold())
-    if operator == "endswith":
-        return str(value).casefold().endswith(str(expected).casefold())
-    if operator == "regex":
-        try:
-            return bool(re.search(str(expected), str(value)))
-        except re.error:
-            return False
-    if operator in {"gt", "gte", "lt", "lte"}:
-        left_number = _to_number(value)
-        right_number = _to_number(expected)
-        if left_number is None or right_number is None:
-            return False
-        if operator == "gt":
-            return left_number > right_number
-        if operator == "gte":
-            return left_number >= right_number
-        if operator == "lt":
-            return left_number < right_number
-        return left_number <= right_number
-    if operator == "wildcard":
-        return fnmatch.fnmatchcase(str(value), str(expected))
-    return False
+    return query_primitives.match_one(value, operator, expected, exists=exists)
 
 
 def _matches_where(node: dict, where: dict | None) -> bool:
-    for field, condition in _normalize_tool_dict(where).items():
-        value = _node_field(node, str(field))
-        exists = value is not _MISSING
-        if isinstance(condition, dict):
-            if not condition:
-                continue
-            if not all(_match_one(value, str(operator), expected, exists=exists) for operator, expected in condition.items()):
-                return False
-        elif not _match_one(value, "eq", condition, exists=exists):
-            return False
-    return True
+    return query_primitives.matches_where(node, where)
 
 
 def _natural_key(value: object) -> tuple:
-    if value is None or value is _MISSING:
-        return (1, "")
-    parts = re.split(r"(\d+)", str(value))
-    key: list[tuple[int, object]] = []
-    for part in parts:
-        if not part:
-            continue
-        if part.isdigit():
-            key.append((0, int(part)))
-        else:
-            key.append((1, part.casefold()))
-    return (0, tuple(key))
+    return query_primitives.natural_key(value)
 
 
 def _hashable_value(value: object) -> object:
-    if value is _MISSING:
-        return None
-    if isinstance(value, list | dict):
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
-    return value
+    return query_primitives.hashable_value(value)
 
 
 def _sort_value_key(value: object) -> tuple:
-    if value is None or value is _MISSING:
-        return (1, 0, "")
-    number = _to_number(value)
-    if number is not None:
-        return (0, 0, number)
-    return (0, 1, str(value).casefold())
+    return query_primitives.sort_value_key(value)
 
 
 def _sort_rows(rows: list[dict], order_by: Sequence | None) -> list[dict]:
-    specs = _normalize_tool_list(order_by)
-    if not specs:
-        return rows
-    ordered = list(rows)
-    for raw_spec in reversed(specs):
-        if isinstance(raw_spec, str):
-            spec = {"field": raw_spec}
-        elif isinstance(raw_spec, dict):
-            spec = raw_spec
-        else:
-            continue
-        field = str(spec.get("field") or "")
-        if not field:
-            continue
-        reverse = str(spec.get("direction", "asc")).lower() == "desc"
-        natural = bool(spec.get("natural", False))
-        ordered.sort(
-            key=lambda row: _natural_key(row.get(field)) if natural else _sort_value_key(row.get(field)),
-            reverse=reverse,
-        )
-    return ordered
+    return query_primitives.sort_rows(rows, order_by)
 
 
 def _sort_values(values: list[object], order: str = "asc") -> list[object]:
-    return sorted(values, key=_natural_key, reverse=str(order).lower() == "desc")
+    return query_primitives.sort_values(values, order)
 
 
 def _compact_sample_value(value: object) -> object:
-    if isinstance(value, list):
-        return {"type": "list", "length": len(value)}
-    if isinstance(value, dict):
-        return {"type": "object", "keys": sorted(str(key) for key in value)[:12]}
-    return value
+    return query_primitives.compact_sample_value(value)
 
 
 def _project_node(node: dict, fields: Sequence | None = None, *, include_heavy_fields: bool = False) -> dict:
-    selected_fields = _normalize_tool_list(fields) or _DEFAULT_NODE_FIELDS
-    row: dict[str, object] = {}
-    for field_obj in selected_fields:
-        field = str(field_obj)
-        if not include_heavy_fields and _is_heavy_field(field):
-            continue
-        value = _node_field(node, field)
-        if value is not _MISSING:
-            row[field.split(".", 1)[-1]] = value
-    return row
+    return query_primitives.project_node(node, fields, include_heavy_fields=include_heavy_fields)
 
 
 def _pack_nodes(pack_id: str, *, node_limit: int = 50000) -> tuple[dict, list[dict]]:
@@ -2655,7 +2935,7 @@ def _project_pack_list_payload(project_id: str = "", include_empty: bool = True)
                     "project": project,
                     "packCount": len(packs),
                     "packs": packs,
-                    "recommendedNext": "Use mo_project_overview or mo_project_search first; use mo_pack_overview only for pack-level inspection.",
+                    "recommendedNext": "For a project question use mo_project_ask first; use mo_project_overview or mo_project_search for exploration and mo_pack_overview only for pack-level inspection.",
                 }
             )
 
@@ -2673,6 +2953,7 @@ def _project_pack_list_payload(project_id: str = "", include_empty: bool = True)
         "projects": project_items,
         "unassignedPacks": unassigned_packs,
         "tools": {
+            "projectAsk": "mo_project_ask",
             "projectOverview": "mo_project_overview",
             "projectSearch": "mo_project_search",
             "packOverview": "mo_pack_overview",
@@ -2719,7 +3000,7 @@ def _project_overview_payload(
     }
 
 
-def _project_search_payload(project_id: str, search_text: str, limit_per_pack: int = 3) -> dict:
+def _project_search_scope(project_id: str) -> tuple[dict[str, dict], list[str]]:
     projects_by_id = _visible_project_by_id()
     packs_by_id = _visible_pack_by_id()
     projects = [projects_by_id[project_id]] if project_id else list(projects_by_id.values())
@@ -2730,6 +3011,21 @@ def _project_search_payload(project_id: str, search_text: str, limit_per_pack: i
         if pack_id in packs_by_id and _pack_is_visible(pack_id)
     ]
     unique_pack_ids = list(dict.fromkeys(pack_ids))
+    return packs_by_id, unique_pack_ids
+
+
+def _project_pack_projection(pack: dict) -> dict:
+    title = str(pack.get("title") or pack.get("displayName") or pack.get("id") or "")
+    return {
+        "id": pack.get("id"),
+        "title": title,
+        "displayName": pack.get("displayName") or title,
+        "commonScoped": bool(pack.get("commonScoped", False)),
+    }
+
+
+def _legacy_project_search_payload(project_id: str, search_text: str, limit_per_pack: int = 3) -> dict:
+    packs_by_id, unique_pack_ids = _project_search_scope(project_id)
     results = []
     for pack_id in unique_pack_ids:
         matches = search_indexed_documents(pack_id, search_text, limit=max(0, limit_per_pack))
@@ -2742,6 +3038,181 @@ def _project_search_payload(project_id: str, search_text: str, limit_per_pack: i
         "packCount": len(unique_pack_ids),
         "matchCount": sum(len(item["matches"]) for item in results),
         "results": results,
+    }
+
+
+def _fast_project_search_payload(project_id: str, search_text: str, limit_per_pack: int = 3) -> dict:
+    started = time.perf_counter()
+    packs_by_id, unique_pack_ids = _project_search_scope(project_id)
+    limit_per_pack = max(0, int(limit_per_pack))
+
+    db_started = time.perf_counter()
+    indexed_pack_ids = pack_ids_with_documents()
+    indexed_scope = [pack_id for pack_id in unique_pack_ids if pack_id in indexed_pack_ids]
+    requested_mode = str(env("MODULAR_ONTOLOGY_PROJECT_SEARCH_MODE", "bm25") or "bm25").strip().casefold()
+    bm25_status = bm25_index_status() if requested_mode != "lexical" else {"available": False, "ready": False}
+    matches_by_pack = None
+    retrieval_mode = "lexical"
+    lexical_fallback = False
+    if bm25_status.get("ready"):
+        matches_by_pack = search_documents_bm25_multi(
+            indexed_scope,
+            search_text,
+            limit_per_pack=limit_per_pack,
+        )
+        if matches_by_pack is not None:
+            retrieval_mode = "bm25"
+            if not any(matches_by_pack.values()):
+                lexical_fallback = True
+                retrieval_mode = "bm25+lexical-fallback"
+                matches_by_pack = search_documents_multi(
+                    indexed_scope,
+                    search_text,
+                    limit_per_pack=limit_per_pack,
+                )
+    if matches_by_pack is None:
+        lexical_fallback = requested_mode != "lexical"
+        retrieval_mode = "lexical-fallback" if lexical_fallback else "lexical"
+        matches_by_pack = search_documents_multi(
+            indexed_scope,
+            search_text,
+            limit_per_pack=limit_per_pack,
+        )
+    db_ms = (time.perf_counter() - db_started) * 1000
+
+    fallback_started = time.perf_counter()
+    fallback_candidates = [pack_id for pack_id in unique_pack_ids if pack_id not in indexed_pack_ids]
+    fallback_pack_count = 0
+    if limit_per_pack > 0:
+        deadline = fallback_started + _PROJECT_FALLBACK_BUDGET_SECONDS
+        for pack_id in fallback_candidates:
+            if fallback_pack_count >= _PROJECT_FALLBACK_MAX_PACKS or time.perf_counter() >= deadline:
+                break
+            matches_by_pack[pack_id] = search_pack_evidence(pack_id, search_text, limit=limit_per_pack)
+            fallback_pack_count += 1
+    fallback_ms = (time.perf_counter() - fallback_started) * 1000
+    skipped_fallback_packs = max(0, len(fallback_candidates) - fallback_pack_count)
+
+    all_matched_results = [
+        {
+            "pack": _project_pack_projection(packs_by_id[pack_id]),
+            "matches": matches_by_pack.get(pack_id, []),
+        }
+        for pack_id in unique_pack_ids
+        if matches_by_pack.get(pack_id)
+    ]
+    ranked_matches = sorted(
+        (
+            (float(match.get("score") or 0.0), result["pack"], match)
+            for result in all_matched_results
+            for match in result["matches"]
+        ),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    selected_by_pack: dict[str, dict] = {}
+    for _, pack, match in ranked_matches[:_PROJECT_SEARCH_MAX_MATCHES]:
+        pack_id = str(pack["id"])
+        selected_by_pack.setdefault(pack_id, {"pack": pack, "matches": []})["matches"].append(match)
+    matched_results = list(selected_by_pack.values())
+    match_count = len(ranked_matches)
+    returned_match_count = min(match_count, _PROJECT_SEARCH_MAX_MATCHES)
+    if _env_enabled("MODULAR_ONTOLOGY_PROJECT_SEARCH_FULL", default=False):
+        results = [
+            {"pack": packs_by_id[pack_id], "matches": matches_by_pack.get(pack_id, [])}
+            for pack_id in unique_pack_ids
+        ]
+        returned_match_count = match_count
+    else:
+        results = matched_results
+
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    return {
+        "projectId": project_id or None,
+        "query": search_text,
+        "packCount": len(unique_pack_ids),
+        "matchedPackCount": len(all_matched_results),
+        "matchCount": match_count,
+        "returnedMatchCount": returned_match_count,
+        "truncated": returned_match_count < match_count,
+        "results": results,
+        "retrieval": {
+            "mode": retrieval_mode,
+            "scannedPacks": len(unique_pack_ids),
+            "indexedPacks": len(indexed_scope),
+            "fallbackPacks": fallback_pack_count,
+            "candidateCount": match_count,
+            "returnedCandidateCount": returned_match_count,
+            "bm25Available": bool(bm25_status.get("available")),
+            "bm25Ready": bool(bm25_status.get("ready")),
+            "bm25IndexedDocuments": int(bm25_status.get("indexedDocumentCount") or 0),
+            "lexicalFallback": lexical_fallback,
+            "partial": skipped_fallback_packs > 0,
+            "skippedFallbackPacks": skipped_fallback_packs,
+            "dbMs": round(db_ms, 3),
+            "fallbackMs": round(fallback_ms, 3),
+            "elapsedMs": round(elapsed_ms, 3),
+        },
+    }
+
+
+def _project_search_payload(project_id: str, search_text: str, limit_per_pack: int = 3) -> dict:
+    if not _env_enabled("MODULAR_ONTOLOGY_FAST_PROJECT_SEARCH", default=True):
+        return _legacy_project_search_payload(project_id, search_text, limit_per_pack)
+    return _fast_project_search_payload(project_id, search_text, limit_per_pack)
+
+
+def _project_tool_response(tool: str, project_id: str, payload: dict) -> str:
+    response = _json(payload, pretty=False)
+    retrieval = payload.get("retrieval") if isinstance(payload.get("retrieval"), dict) else {}
+    _LOGGER.info(
+        "tool=%s project_id=%s total_ms=%s db_ms=%s fallback_ms=%s "
+        "fallback_pack_count=%s candidate_count=%s result_bytes=%s",
+        tool,
+        project_id or "all",
+        retrieval.get("elapsedMs", 0),
+        retrieval.get("dbMs", 0),
+        retrieval.get("fallbackMs", 0),
+        retrieval.get("fallbackPacks", 0),
+        retrieval.get("candidateCount", 0),
+        len(response.encode("utf-8")),
+    )
+    return response
+
+
+def _project_ask_payload(project_id: str, question: str, top_k: int = 8) -> dict:
+    started = time.perf_counter()
+    bounded_top_k = max(1, min(20, int(top_k)))
+    search_payload = _fast_project_search_payload(project_id, question, limit_per_pack=3)
+    candidates = []
+    for result in search_payload["results"]:
+        pack = result["pack"]
+        for match in result["matches"]:
+            path = str(match.get("path") or "")
+            document_id = str(match.get("chunkId") or f"{pack['id']}:{path}")
+            score = float(match.get("score") or 0.0)
+            retrieval_source = str(match.get("retrievalSource") or "lexical")
+            candidates.append(
+                {
+                    "packId": pack["id"],
+                    "documentId": document_id,
+                    "path": path,
+                    "title": match.get("title"),
+                    "snippet": match.get("snippet", ""),
+                    "score": score,
+                    "signals": {retrieval_source: score},
+                }
+            )
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    evidence = candidates[:bounded_top_k]
+    retrieval = dict(search_payload["retrieval"])
+    retrieval["elapsedMs"] = round((time.perf_counter() - started) * 1000, 3)
+    return {
+        "status": "evidence_ready" if evidence else "no_answer",
+        "projectId": project_id,
+        "answerMode": "client_synthesis",
+        "evidence": evidence,
+        "retrieval": retrieval,
     }
 
 
@@ -2771,12 +3242,13 @@ def copycrab_status() -> str:
                 "detail": "Invalid MCP user URL token.",
                 "tools": [],
                 "canonicalTools": [],
-                "legacyTools": [],
             }
         )
     packs = _filter_pack_list(read_packs())
     projects = _visible_projects()
     scope = _mcp_scope()
+    visible_tool_names = mcp.visible_tool_names()
+    visible_tool_name_set = set(visible_tool_names)
     return _json(
         {
             "status": "ok",
@@ -2785,9 +3257,11 @@ def copycrab_status() -> str:
             "userEmail": scope.get("userEmail") or "",
             "pack_count": len(packs),
             "project_count": len(projects),
-            "tools": TOOL_NAMES,
-            "canonicalTools": TOOL_NAMES,
-            "legacyTools": LEGACY_TOOL_NAMES,
+            "toolProfile": mcp.tool_profile,
+            "tools": visible_tool_names,
+            "tool_count": len(visible_tool_names),
+            "canonicalTools": [name for name in TOOL_NAMES if name in visible_tool_name_set],
+            "implementedCanonicalToolCount": len(TOOL_NAMES),
             "toolNaming": _tool_manifest_payload()["naming"],
         }
     )
@@ -3963,9 +4437,124 @@ def mo_server_status() -> str:
 
 @mcp.tool()
 def mo_tool_manifest() -> str:
-    """Return canonical mo_<domain>_<action> tool names and legacy aliases."""
+    """Return canonical mo_<domain>_<action> tool names and active exposure profile."""
 
     return _json(_tool_manifest_payload())
+
+
+@mcp.tool()
+def mo_snapshot_list() -> str:
+    """List canonical snapshot releases available to the current MCP scope."""
+
+    try:
+        if not _mcp_authorized():
+            raise CanonicalSnapshotToolError("unauthorized", "Invalid MCP user URL token.")
+        snapshots = []
+        for canonical_id, _, _ in _canonical_snapshot_manifests():
+            manifest, snapshot = _load_canonical_snapshot(canonical_id)
+            if _snapshot_is_visible(snapshot):
+                snapshots.append(_snapshot_summary(manifest, snapshot))
+        return _json({"status": "ok", "count": len(snapshots), "snapshots": snapshots})
+    except Exception as exc:
+        return _json(_snapshot_error_payload(exc))
+
+
+@mcp.tool()
+def mo_snapshot_status(canonical_id: str) -> str:
+    """Load and SHA-256 verify every included pack in one canonical snapshot."""
+
+    try:
+        if not _mcp_authorized():
+            raise CanonicalSnapshotToolError("unauthorized", "Invalid MCP user URL token.")
+        manifest, snapshot = _load_canonical_snapshot(canonical_id)
+        _require_snapshot_access(snapshot)
+        verification = _verify_canonical_snapshot(snapshot)
+        return _json(
+            {
+                "status": "ok",
+                "snapshot": _snapshot_summary(manifest, snapshot),
+                "verification": _snapshot_verification_payload(verification),
+            }
+        )
+    except Exception as exc:
+        return _json(_snapshot_error_payload(exc, canonical_id=canonical_id))
+
+
+@mcp.tool()
+def mo_snapshot_query(canonical_id: str, plan: dict) -> str:
+    """Execute an exact seven-field plan only after canonical snapshot SHA verification."""
+
+    try:
+        if not _mcp_authorized():
+            raise CanonicalSnapshotToolError("unauthorized", "Invalid MCP user URL token.")
+        canonical_plan = _exact_snapshot_query_plan(plan)
+        manifest, snapshot = _load_canonical_snapshot(canonical_id)
+        _require_snapshot_access(snapshot)
+
+        # This preflight hashes every included pack.  The orchestrator then
+        # verifies the same immutable snapshot again immediately before its
+        # deterministic full-scan execution; there is intentionally no MCP
+        # argument or internal call here that can disable either check.
+        verification = _verify_canonical_snapshot(snapshot)
+        execution = execute_structured_project_query(canonical_plan, snapshot)
+        if execution.verification.checked_pack_ids != verification.checked_pack_ids:
+            raise CanonicalSnapshotToolError(
+                "snapshot_verification_changed",
+                "Snapshot verification coverage changed before query execution.",
+            )
+
+        return _json(
+            {
+                "status": "ok",
+                "snapshot": _snapshot_summary(manifest, execution.snapshot),
+                "verification": _snapshot_verification_payload(execution.verification),
+                "plan": execution.plan.as_dict(),
+                "result": execution.result.as_dict(),
+            }
+        )
+    except Exception as exc:
+        return _json(_snapshot_error_payload(exc, canonical_id=canonical_id))
+
+
+@mcp.tool()
+def mo_snapshot_bundle_query(canonical_id: str, bundle: dict) -> str:
+    """Execute an exact plan bundle against one fully verified canonical snapshot."""
+
+    try:
+        if not _mcp_authorized():
+            raise CanonicalSnapshotToolError("unauthorized", "Invalid MCP user URL token.")
+
+        # Validate the complete bundle, including recursively forbidden pack
+        # and snapshot selectors, before any snapshot file is opened.
+        canonical_bundle = _exact_snapshot_query_bundle(bundle)
+        manifest, snapshot = _load_canonical_snapshot(canonical_id)
+        _require_snapshot_access(snapshot)
+
+        # Hash every included pack before execution. Each subplan hashes its
+        # selected packs again inside execute_query_bundle. A final full pass
+        # closes the mutation window before any result is returned.
+        before = _verify_canonical_snapshot(snapshot)
+        result = execute_query_bundle(canonical_bundle, snapshot)
+        after = _verify_canonical_snapshot(snapshot)
+        if before.checked_pack_ids != after.checked_pack_ids:
+            raise CanonicalSnapshotToolError(
+                "snapshot_verification_changed",
+                "Snapshot verification coverage changed during bundle execution.",
+            )
+        bindings = _snapshot_bundle_bindings(manifest, snapshot, result)
+
+        return _json(
+            {
+                "status": "ok",
+                "snapshot": _snapshot_summary(manifest, snapshot),
+                "verification": _snapshot_verification_payload(after),
+                "bundle": canonical_bundle,
+                "bindings": bindings,
+                "result": result.as_dict(),
+            }
+        )
+    except Exception as exc:
+        return _json(_snapshot_error_payload(exc, canonical_id=canonical_id))
 
 
 @mcp.tool()
@@ -4015,8 +4604,76 @@ def mo_project_search(project_id: str = "", search_text: str = "", limit_per_pac
     if project_id and project_id not in _visible_project_by_id():
         return _not_found_payload("project", project_id)
     if not search_text.strip():
-        return _json({"projectId": project_id or None, "query": search_text, "packCount": 0, "matchCount": 0, "results": []})
-    return _json(_project_search_payload(project_id=project_id, search_text=search_text, limit_per_pack=limit_per_pack))
+        return _project_tool_response(
+            "mo_project_search",
+            project_id,
+            {
+                "projectId": project_id or None,
+                "query": search_text,
+                "packCount": 0,
+                "matchedPackCount": 0,
+                "matchCount": 0,
+                "returnedMatchCount": 0,
+                "truncated": False,
+                "results": [],
+                "retrieval": {
+                    "mode": "lexical",
+                    "scannedPacks": 0,
+                    "indexedPacks": 0,
+                    "fallbackPacks": 0,
+                    "candidateCount": 0,
+                    "returnedCandidateCount": 0,
+                    "partial": False,
+                    "skippedFallbackPacks": 0,
+                    "dbMs": 0,
+                    "fallbackMs": 0,
+                    "elapsedMs": 0,
+                },
+            },
+        )
+    payload = _project_search_payload(
+        project_id=project_id,
+        search_text=search_text,
+        limit_per_pack=limit_per_pack,
+    )
+    return _project_tool_response("mo_project_search", project_id, payload)
+
+
+@mcp.tool()
+def mo_project_ask(project_id: str, question: str, top_k: int = 8) -> str:
+    """Retrieve ranked project evidence once; synthesize the final answer in the client without server-side AI calls."""
+
+    if project_id not in _visible_project_by_id():
+        return _not_found_payload("project", project_id)
+    if not question.strip():
+        return _project_tool_response(
+            "mo_project_ask",
+            project_id,
+            {
+                "status": "no_answer",
+                "projectId": project_id,
+                "answerMode": "client_synthesis",
+                "evidence": [],
+                "retrieval": {
+                    "mode": "lexical",
+                    "scannedPacks": 0,
+                    "indexedPacks": 0,
+                    "fallbackPacks": 0,
+                    "candidateCount": 0,
+                    "returnedCandidateCount": 0,
+                    "partial": False,
+                    "skippedFallbackPacks": 0,
+                    "dbMs": 0,
+                    "fallbackMs": 0,
+                    "elapsedMs": 0,
+                },
+            },
+        )
+    return _project_tool_response(
+        "mo_project_ask",
+        project_id,
+        _project_ask_payload(project_id=project_id, question=question, top_k=top_k),
+    )
 
 
 @mcp.tool()
@@ -4578,6 +5235,16 @@ def mo_section_weight_index(pack_id: str) -> str:
     return get_section_weight_index(pack_id=pack_id)
 
 
+def _unregister_removed_legacy_tools() -> None:
+    registered = {tool.name for tool in mcp._tool_manager.list_tools()}
+    for name in _REMOVED_LEGACY_TOOL_NAMES:
+        if name in registered:
+            mcp.remove_tool(name)
+
+
+_unregister_removed_legacy_tools()
+
+
 def configure_server(
     *,
     host: str,
@@ -4585,7 +5252,10 @@ def configure_server(
     path: str,
     allowed_hosts: Sequence[str],
     allowed_origins: Sequence[str],
+    tool_profile: str | None = None,
 ) -> None:
+    if tool_profile is not None:
+        mcp.set_tool_profile(tool_profile)
     mcp.settings.host = host
     mcp.settings.port = port
     mcp.settings.streamable_http_path = path
@@ -4607,6 +5277,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--host", default=DEFAULT_HOST, help="HTTP bind host for remote MCP.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="HTTP port for remote MCP.")
     parser.add_argument("--path", default=DEFAULT_PATH, help="Remote MCP endpoint path.")
+    parser.add_argument(
+        "--tool-profile",
+        choices=TOOL_PROFILE_NAMES,
+        default=str(env("MODULAR_ONTOLOGY_MCP_TOOL_PROFILE", "core")),
+        help="Expose core tools (default) or all canonical expert tools.",
+    )
     parser.add_argument(
         "--allowed-host",
         action="append",
@@ -4634,6 +5310,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         path=args.path,
         allowed_hosts=allowed_hosts,
         allowed_origins=allowed_origins,
+        tool_profile=args.tool_profile,
     )
     mcp.run(transport=args.transport)
 
