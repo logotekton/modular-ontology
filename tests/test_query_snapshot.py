@@ -4,6 +4,8 @@ import gzip
 import json
 import shutil
 import sqlite3
+import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from modular_ontology.google_drive_sync import (
     DriveItem,
     _download_database_file,
     sync_google_drive_registry_files,
+    sync_google_drive_runtime_metadata,
     sync_google_drive_storage,
 )
 from modular_ontology.pack_index import PackFile
@@ -229,6 +232,195 @@ def test_ephemeral_registry_sync_uses_direct_file_ids(monkeypatch, tmp_path: Pat
     assert metadata["xktPath"].endswith("model.xkt")
     assert not stale_active.exists()
     assert not (runtime / "03_IFC_Models" / "deleted-project").exists()
+
+
+def test_ephemeral_runtime_metadata_sync_never_downloads_query_database(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    registry = {
+        "version": 1,
+        "projects": [
+            {
+                "id": "project-a",
+                "driveFolderId": "project-a",
+                "packIds": ["pack-a"],
+            }
+        ],
+        "commonPackIds": [],
+        "packs": [
+            {"id": "pack-a", "drive": {"fileId": "pack-a-file"}},
+        ],
+    }
+
+    class MetadataOnlyDrive:
+        def __init__(self) -> None:
+            self.download_calls: list[str] = []
+            self.gzip_download_calls: list[str] = []
+
+        def list_children(self, folder_id):
+            return {
+                "root": [DriveItem("projects", "02_Projects", google_drive_sync.FOLDER_MIME)],
+                "projects": [DriveItem("project-a", "project-a", google_drive_sync.FOLDER_MIME)],
+                "project-a": [DriveItem("ifc", "ifc-models", google_drive_sync.FOLDER_MIME)],
+                "ifc": [
+                    DriveItem("ifc-file", "model.ifc", "application/octet-stream", size=100),
+                    DriveItem("xkt-file", "model.xkt", "application/octet-stream", size=80),
+                ],
+            }.get(folder_id, [])
+
+        def download_gzip_file(self, file_id, target):
+            self.gzip_download_calls.append(file_id)
+            raise AssertionError("metadata-only sync must not download the query database")
+
+        def download_file(self, file_id, target):
+            self.download_calls.append(file_id)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                json.dumps(registry) if file_id == "registry-file" else file_id,
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr(google_drive_sync, "EPHEMERAL_STORAGE", True)
+    monkeypatch.delenv("MODULAR_ONTOLOGY_QUERY_DATABASE_FILE_ID", raising=False)
+    monkeypatch.setenv("MODULAR_ONTOLOGY_USERS_FILE_ID", "users-file")
+    monkeypatch.setenv("MODULAR_ONTOLOGY_MCP_TOKENS_FILE_ID", "tokens-file")
+    monkeypatch.setenv("MODULAR_ONTOLOGY_PACK_REGISTRY_FILE_ID", "registry-file")
+    runtime = tmp_path / "runtime"
+    fake_drive = MetadataOnlyDrive()
+
+    result = sync_google_drive_runtime_metadata(
+        client=fake_drive,
+        root_folder_id="root",
+        data_dir=runtime,
+    )
+
+    assert result["status"] == "synced"
+    assert result["mode"] == "direct-file-ids"
+    assert result["databaseIncluded"] is False
+    assert fake_drive.gzip_download_calls == []
+    assert fake_drive.download_calls == ["registry-file", "users-file", "tokens-file"]
+    assert not (runtime / "01_Database" / "modular_ontology.sqlite3").exists()
+    assert json.loads((runtime / "01_Database" / "pack_registry.json").read_text(encoding="utf-8")) == registry
+    assert (runtime / "00_Admin" / "users.json").read_text(encoding="utf-8") == "users-file"
+    assert (runtime / "00_Admin" / "mcp_tokens.json").read_text(encoding="utf-8") == "tokens-file"
+    assert json.loads((runtime / "02_Projects" / ".drive-project-pack-links.json").read_text(encoding="utf-8")) == {
+        "project-a": ["pack-a"],
+    }
+    metadata = json.loads(
+        (runtime / "03_IFC_Models" / "project-a" / "metadata" / "model.metadata.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["viewerStatus"] == "ready"
+    assert metadata["xktPath"].endswith("model.xkt")
+    assert (runtime / ".google-drive-registry-metadata-sync.json").exists()
+    assert not (runtime / ".google-drive-registry-sync.json").exists()
+
+
+def test_metadata_profile_does_not_satisfy_database_but_database_satisfies_metadata(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[bool] = []
+
+    def fake_direct_sync(client, *, data_dir, root_folder_id, include_database):
+        calls.append(include_database)
+        return {
+            "status": "synced",
+            "synced_at": google_drive_sync.time.time(),
+            "scope": "registry",
+            "databaseIncluded": include_database,
+        }
+
+    monkeypatch.setattr(
+        google_drive_sync,
+        "_sync_serverless_registry_files_by_id",
+        fake_direct_sync,
+    )
+    monkeypatch.setenv("MODULAR_ONTOLOGY_GOOGLE_DRIVE_REGISTRY_SYNC_TTL_SECONDS", "1800")
+
+    sync_google_drive_registry_files(
+        client=object(),
+        root_folder_id="root",
+        data_dir=tmp_path,
+        include_database=False,
+    )
+    sync_google_drive_registry_files(
+        client=object(),
+        root_folder_id="root",
+        data_dir=tmp_path,
+    )
+    sync_google_drive_registry_files(
+        client=object(),
+        root_folder_id="root",
+        data_dir=tmp_path,
+        include_database=False,
+    )
+
+    assert calls == [False, True]
+    metadata_marker = json.loads(
+        (tmp_path / ".google-drive-registry-metadata-sync.json").read_text(encoding="utf-8")
+    )
+    assert metadata_marker["databaseIncluded"] is True
+
+
+def test_registry_sync_profiles_share_one_process_lock(monkeypatch, tmp_path: Path) -> None:
+    state_lock = threading.Lock()
+    start = threading.Barrier(3)
+    active = 0
+    max_active = 0
+    calls: list[bool] = []
+    errors: list[BaseException] = []
+
+    def fake_direct_sync(client, *, data_dir, root_folder_id, include_database):
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+            calls.append(include_database)
+        time.sleep(0.03)
+        with state_lock:
+            active -= 1
+        return {
+            "status": "synced",
+            "synced_at": google_drive_sync.time.time(),
+            "scope": "registry",
+            "databaseIncluded": include_database,
+        }
+
+    def run(include_database: bool) -> None:
+        try:
+            start.wait()
+            sync_google_drive_registry_files(
+                client=object(),
+                root_folder_id="root",
+                data_dir=tmp_path,
+                force=True,
+                include_database=include_database,
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    monkeypatch.setattr(
+        google_drive_sync,
+        "_sync_serverless_registry_files_by_id",
+        fake_direct_sync,
+    )
+    workers = [
+        threading.Thread(target=run, args=(False,)),
+        threading.Thread(target=run, args=(True,)),
+    ]
+    for worker in workers:
+        worker.start()
+    start.wait()
+    for worker in workers:
+        worker.join(timeout=2)
+
+    assert not errors
+    assert all(not worker.is_alive() for worker in workers)
+    assert sorted(calls) == [False, True]
+    assert max_active == 1
 
 
 def test_ephemeral_direct_sync_rejects_mixed_database_registry_generation_without_activation(

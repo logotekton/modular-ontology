@@ -67,6 +67,7 @@ PROJECT_FOLDERS_FILENAME = ".drive-project-folders.json"
 DRIVE_FILE_CACHE_FILENAME = ".google-drive-file-cache.json"
 PROJECT_SYNC_MARKER_FOLDER = ".google-drive-project-sync"
 _DB_SYNC_LOCK = threading.Lock()
+_REGISTRY_SYNC_LOCK = threading.RLock()
 _PACK_CACHE_LOCK = threading.Lock()
 
 # Drive가 지수 백오프 재시도를 요구하는 일시적 오류 (429 rate limit, 5xx)
@@ -1747,8 +1748,40 @@ def _sync_marker(data_dir: Path) -> Path:
     return data_dir / ".google-drive-sync.json"
 
 
-def _registry_sync_marker(data_dir: Path) -> Path:
-    return data_dir / ".google-drive-registry-sync.json"
+def _registry_sync_marker(data_dir: Path, *, include_database: bool = True) -> Path:
+    # Metadata-only cold-start hydration must not satisfy a later query-runtime
+    # hydration that also needs the database (or vice versa).  Keep the legacy
+    # marker name for the database-inclusive profile for backwards compatibility.
+    filename = (
+        ".google-drive-registry-sync.json"
+        if include_database
+        else ".google-drive-registry-metadata-sync.json"
+    )
+    return data_dir / filename
+
+
+def _write_registry_sync_markers(
+    data_dir: Path,
+    result: dict[str, Any],
+    *,
+    include_database: bool,
+) -> None:
+    """Persist TTL state for every hydration profile satisfied by ``result``."""
+
+    markers = [_registry_sync_marker(data_dir, include_database=include_database)]
+    if include_database and result.get("status") in {"synced", "cached"}:
+        # A DB-inclusive registry sync also hydrates users, project links and
+        # IFC/XKT metadata, so it satisfies the lightweight runtime profile.
+        markers.append(_registry_sync_marker(data_dir, include_database=False))
+    payload = json.dumps(result, ensure_ascii=False, indent=2)
+    for marker in dict.fromkeys(markers):
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        temp = marker.with_name(f".{marker.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temp.write_text(payload, encoding="utf-8")
+            os.replace(temp, marker)
+        finally:
+            temp.unlink(missing_ok=True)
 
 
 def _project_sync_marker(data_dir: Path, project_id: str) -> Path:
@@ -1841,19 +1874,56 @@ def sync_google_drive_registry_files(
     root_folder_id: str | None = None,
     data_dir: Path = DATA_DIR,
     force: bool = False,
-    include_database: bool | None = None,
+    include_database: bool = True,
 ) -> dict[str, Any]:
+    """Hydrate one consistent registry generation under a process-wide lock."""
+
+    with _REGISTRY_SYNC_LOCK:
+        return _sync_google_drive_registry_files_locked(
+            client=client,
+            root_folder_id=root_folder_id,
+            data_dir=data_dir,
+            force=force,
+            include_database=include_database,
+        )
+
+
+def _sync_google_drive_registry_files_locked(
+    *,
+    client: GoogleDriveClient | None = None,
+    root_folder_id: str | None = None,
+    data_dir: Path = DATA_DIR,
+    force: bool = False,
+    include_database: bool = True,
+) -> dict[str, Any]:
+    """Hydrate registry/runtime files from Drive.
+
+    ``include_database=True`` preserves the historical query-runtime behavior.
+    Pass ``False`` for UI/auth/project/graph cold paths: registry, users, project
+    links and IFC/XKT metadata are synchronized, while the query database is
+    neither downloaded, expanded, nor validated.  The two profiles use separate
+    TTL markers so one cannot accidentally suppress the other.
+    """
+
+    # Treat an explicit legacy ``None`` exactly like the old implementation:
+    # only the literal ``False`` opts out of database hydration.
+    include_database = include_database is not False
     root_folder_id = root_folder_id or str(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID", "")).strip()
     if not root_folder_id:
         return {"status": "skipped", "reason": "MODULAR_ONTOLOGY_GOOGLE_DRIVE_FOLDER_ID is not set.", "scope": "registry"}
 
     ttl = int(str(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_REGISTRY_SYNC_TTL_SECONDS", str(DEFAULT_TTL_SECONDS))))
-    marker = _registry_sync_marker(data_dir)
+    marker = _registry_sync_marker(data_dir, include_database=include_database)
     if not force and ttl > 0 and marker.exists():
         try:
             previous = json.loads(marker.read_text(encoding="utf-8"))
             if time.time() - float(previous.get("synced_at", 0)) < ttl:
-                return {"status": "cached", **previous}
+                _write_registry_sync_markers(
+                    data_dir,
+                    previous,
+                    include_database=include_database,
+                )
+                return {**previous, "status": "cached"}
         except (OSError, ValueError, json.JSONDecodeError):
             pass
 
@@ -1865,8 +1935,11 @@ def sync_google_drive_registry_files(
         include_database=include_database,
     )
     if direct_result is not None:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(json.dumps(direct_result, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_registry_sync_markers(
+            data_dir,
+            direct_result,
+            include_database=include_database,
+        )
         return direct_result
     root = _children_by_name(client, root_folder_id)
     downloaded: list[str] = []
@@ -1933,7 +2006,7 @@ def sync_google_drive_registry_files(
                 )
                 staged_database: Path | None = None
                 database_downloaded = False
-                if include_database is not False and database_item:
+                if include_database and database_item:
                     staged_database = staging_data / DATABASE_FOLDER / DATABASE_FILENAME
                     database_downloaded = _stage_drive_item(
                         client,
@@ -1945,13 +2018,13 @@ def sync_google_drive_registry_files(
                         skipped=skipped,
                         decompress_gzip=database_item.name == QUERY_DATABASE_FILENAME,
                     )
-                elif include_database is False:
+                elif not include_database:
                     skipped.append(str(data_dir / DATABASE_FOLDER / DATABASE_FILENAME))
 
                 registry_payload = _load_registry_path(staged_registry)
                 validate_pack_registry(registry_payload, require_drive_mappings=True)
                 database_to_validate = staged_database or (data_dir / DATABASE_FOLDER / DATABASE_FILENAME)
-                if database_to_validate.exists():
+                if include_database and database_to_validate.exists():
                     validate_database_against_pack_registry(database_to_validate, registry_payload)
                 _validate_registry_project_folder_inventory(
                     staging_data,
@@ -2045,12 +2118,37 @@ def sync_google_drive_registry_files(
         "missing": missing,
         "warnings": warnings,
         "scope": "registry",
-        "databaseIncluded": include_database is not False,
+        "databaseIncluded": include_database,
         "inventoryValidated": bool(registry_payload),
     }
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_registry_sync_markers(
+        data_dir,
+        result,
+        include_database=include_database,
+    )
     return result
+
+
+def sync_google_drive_runtime_metadata(
+    *,
+    client: GoogleDriveClient | None = None,
+    root_folder_id: str | None = None,
+    data_dir: Path = DATA_DIR,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Hydrate only the small files needed by non-query runtime paths.
+
+    This named entry point makes the no-database contract explicit for callers
+    such as authentication, project lists, IFC model lists, and graph loading.
+    """
+
+    return sync_google_drive_registry_files(
+        client=client,
+        root_folder_id=root_folder_id,
+        data_dir=data_dir,
+        force=force,
+        include_database=False,
+    )
 
 
 def _sync_serverless_registry_files_by_id(
@@ -2058,9 +2156,9 @@ def _sync_serverless_registry_files_by_id(
     *,
     data_dir: Path,
     root_folder_id: str,
-    include_database: bool | None = None,
+    include_database: bool = True,
 ) -> dict[str, Any] | None:
-    """Restore the compact DB plus live project and IFC/XKT metadata on Vercel.
+    """Restore live registry metadata and optionally the compact DB on Vercel.
 
     The compact query database deliberately omits graph payloads and filesystem
     metadata.  Project folders and IFC/XKT metadata therefore remain authoritative
@@ -2071,7 +2169,7 @@ def _sync_serverless_registry_files_by_id(
     if not EPHEMERAL_STORAGE:
         return None
     query_database_file_id = str(env("MODULAR_ONTOLOGY_QUERY_DATABASE_FILE_ID", "") or "").strip()
-    if not query_database_file_id:
+    if include_database and not query_database_file_id:
         return None
 
     downloaded: list[str] = []
@@ -2086,7 +2184,7 @@ def _sync_serverless_registry_files_by_id(
         staging_data = Path(staging_dir)
         staged_database = staging_data / DATABASE_FOLDER / DATABASE_FILENAME
         staged_registry = staging_data / DATABASE_FOLDER / PACK_REGISTRY_FILENAME
-        if include_database is not False:
+        if include_database:
             client.download_gzip_file(query_database_file_id, staged_database)
 
         registry_file_id = str(env("MODULAR_ONTOLOGY_PACK_REGISTRY_FILE_ID", "") or "").strip()
@@ -2107,12 +2205,12 @@ def _sync_serverless_registry_files_by_id(
         validate_pack_registry(registry_payload, require_drive_mappings=True)
         database_to_validate = (
             staged_database
-            if include_database is not False
+            if include_database
             else data_dir / DATABASE_FOLDER / DATABASE_FILENAME
         )
-        if database_to_validate.exists():
+        if include_database and database_to_validate.exists():
             validate_database_against_pack_registry(database_to_validate, registry_payload)
-        elif include_database is not False:
+        elif include_database:
             raise RuntimeError("Direct query database download did not produce a database file.")
 
         projects = root.get(PROJECTS_FOLDER)
@@ -2135,11 +2233,11 @@ def _sync_serverless_registry_files_by_id(
         _activate_staged_database_registry(
             data_dir=data_dir,
             staged_registry=staged_registry,
-            staged_database=staged_database if include_database is not False else None,
+            staged_database=staged_database if include_database else None,
         )
         registry_target = data_dir / DATABASE_FOLDER / PACK_REGISTRY_FILENAME
         downloaded.append(str(registry_target))
-        if include_database is not False:
+        if include_database:
             database_target = data_dir / DATABASE_FOLDER / DATABASE_FILENAME
             downloaded.append(str(database_target))
 
@@ -2196,7 +2294,7 @@ def _sync_serverless_registry_files_by_id(
         "warnings": warnings,
         "scope": "registry",
         "mode": "direct-file-ids",
-        "databaseIncluded": include_database is not False,
+        "databaseIncluded": include_database,
     }
 
 

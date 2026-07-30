@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { DragEvent } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -31,7 +31,7 @@ import type { LocalEdge, LocalNode, ParsedLocalPack } from "./localPacks";
 import { OntologyGraph } from "./OntologyGraph";
 import type { OgController, OgDetail } from "./OntologyGraph";
 import { AiChatPanel } from "./app/ai-chat/AiChatPanel";
-import { getJson, HttpError, request } from "./api/http";
+import { getJson, HttpError, isAbortError, request } from "./api/http";
 
 const OPENAI_CHAT_MODEL = "gpt-4.1-mini";
 
@@ -122,6 +122,15 @@ type GraphPayload = {
   };
 };
 
+type GraphInflightRequest = {
+  controller: AbortController;
+  consumers: number;
+  promise: Promise<GraphPayload>;
+};
+
+const GRAPH_FETCH_DEBOUNCE_MS = 180;
+const GRAPH_CACHE_LIMIT = 8;
+
 type AiKeyStatus = "missing" | "untested" | "testing" | "valid" | "invalid";
 
 type IndexStats = {
@@ -132,6 +141,15 @@ type IndexStats = {
   documents: number;
   nodes: number;
   edges: number;
+};
+
+type BootstrapPayload = {
+  authenticated: boolean;
+  user: CurrentUser | null;
+  packs: Pack[];
+  projects: Project[];
+  ifcModels: IfcModel[];
+  stats?: IndexStats;
 };
 
 type QueryEvidence = {
@@ -440,6 +458,10 @@ function App() {
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [selectedGraphPackIds, setSelectedGraphPackIds] = useState<string[]>([]);
   const [graph, setGraph] = useState<GraphPayload | null>(null);
+  const [graphLoading, setGraphLoading] = useState(false);
+  const [graphDataRevision, setGraphDataRevision] = useState(0);
+  const graphCacheRef = useRef<Map<string, GraphPayload>>(new Map());
+  const graphInflightRef = useRef<Map<string, GraphInflightRequest>>(new Map());
   const [localGraph, setLocalGraph] = useState<GraphPayload | null>(null);
   const [localPackCount, setLocalPackCount] = useState(0);
   const [localPackStatus, setLocalPackStatus] = useState("");
@@ -536,9 +558,19 @@ function App() {
   const skipNextSessionRefreshRef = useRef("");
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? projects[0];
   const selectedPackId = selectedGraphPackIds[0] ?? selectedProject?.packIds[0] ?? "";
-  const graphPackOptions = selectedProject
-    ? packs.filter((pack) => selectedProject.packIds.includes(pack.id))
-    : [];
+  const activeGraphPackIds = useMemo(() => {
+    if (!selectedProject) return [];
+    const selectedPackIds = new Set(selectedGraphPackIds);
+    return selectedProject.packIds.filter((packId) => selectedPackIds.has(packId));
+  }, [selectedGraphPackIds, selectedProject]);
+  const graphSelectionKey = activeGraphPackIds.join(",");
+  const graphPackOptions = useMemo(() => {
+    if (!selectedProject) return [];
+    const packsById = new Map(packs.map((pack) => [pack.id, pack]));
+    return selectedProject.packIds
+      .map((packId) => packsById.get(packId))
+      .filter((pack): pack is Pack => Boolean(pack));
+  }, [packs, selectedProject]);
   const graphPackGroups = groupPacksForDisplay(graphPackOptions);
   const visibleNav = nav.filter((item) => !["Admin", "Sync"].includes(item.label) || currentUser?.role === "admin");
 
@@ -561,6 +593,35 @@ function App() {
       }
       return [...current, ...group.packIds.filter((packId) => !current.includes(packId))];
     });
+  }
+
+  function readCachedGraph(key: string) {
+    const cache = graphCacheRef.current;
+    const payload = cache.get(key);
+    if (!payload) return null;
+    cache.delete(key);
+    cache.set(key, payload);
+    return payload;
+  }
+
+  function cacheGraph(key: string, payload: GraphPayload) {
+    const cache = graphCacheRef.current;
+    cache.delete(key);
+    cache.set(key, payload);
+    while (cache.size > GRAPH_CACHE_LIMIT) {
+      const oldestKey = cache.keys().next().value;
+      if (oldestKey === undefined) break;
+      cache.delete(oldestKey);
+    }
+  }
+
+  function invalidateGraphCache() {
+    graphCacheRef.current.clear();
+    for (const requestEntry of graphInflightRef.current.values()) {
+      requestEntry.controller.abort();
+    }
+    graphInflightRef.current.clear();
+    setGraphDataRevision((revision) => revision + 1);
   }
 
   function confirmAction(options: ConfirmDialogOptions) {
@@ -637,18 +698,19 @@ function App() {
   }, [authToken]);
 
   useEffect(() => {
-    if (currentUser?.role === "admin") {
-      refreshAdminDirectory().catch(() => {
-        setManagedUsers([]);
-        setCompanies([]);
-        setCompanyProjectAccess({});
-      });
-      return;
+    graphCacheRef.current.clear();
+    for (const requestEntry of graphInflightRef.current.values()) {
+      requestEntry.controller.abort();
     }
+    graphInflightRef.current.clear();
+  }, [authToken]);
+
+  useEffect(() => {
+    if (currentUser?.role === "admin") return;
     setManagedUsers([]);
     setCompanies([]);
     setCompanyProjectAccess({});
-  }, [currentUser?.role, authToken]);
+  }, [currentUser?.role]);
 
   useEffect(() => {
     if (currentUser && currentUser.role !== "admin" && ["Admin", "Sync"].includes(activeTab)) {
@@ -659,10 +721,17 @@ function App() {
   useEffect(() => {
     if (activeTab !== "Admin" || currentUser?.role !== "admin" || !authToken) return;
     let cancelled = false;
-    const refresh = () => {
-      refreshAdminDirectory().catch(() => {
+    let refreshing = false;
+    const refresh = async () => {
+      if (refreshing) return;
+      refreshing = true;
+      try {
+        await refreshAdminDirectory();
+      } catch {
         if (!cancelled) setUploadStatus("관리자 목록 새로고침 실패");
-      });
+      } finally {
+        refreshing = false;
+      }
     };
     const refreshOnVisible = () => {
       if (document.visibilityState === "visible") refresh();
@@ -698,44 +767,98 @@ function App() {
   }, [projects, selectedProjectId]);
 
   useEffect(() => {
-    if (!selectedProjectId) return;
-    const project = projects.find((item) => item.id === selectedProjectId);
-    if (!project) return;
-    const activePackIds = selectedGraphPackIds.filter((packId) => project.packIds.includes(packId));
-    if (!activePackIds.length) {
+    if (!selectedProjectId) {
+      setGraphLoading(false);
+      return;
+    }
+    if (!graphSelectionKey) {
       setSelectedNode(null);
       setAiMessages([]);
       setAiQuestion("");
       setGraph(null);
+      setGraphLoading(false);
       setStatus("표시할 팩을 선택하세요");
       return;
     }
+    if (activeTab !== "Graph Explorer") return;
+
     let active = true;
+    let activeRequest: GraphInflightRequest | null = null;
     setSelectedNode(null);
     setGraphDetail(null);
     setAiMessages([]);
     setAiQuestion("");
-    setGraph(null);
-    setStatus("그래프 불러오는 중");
-    const query = new URLSearchParams({
-      // OntologyGraph 엔진은 차수 필터로 표시량을 관리하므로 캡을 크게 잡는다
-      max_nodes: "20000",
-      max_edges: "50000",
-      pack_ids: activePackIds.join(","),
-    });
-    getJson<GraphPayload>(`/api/projects/${encodeURIComponent(selectedProjectId)}/graph?${query.toString()}`, { token: authToken })
-      .then((payload) => {
-        if (!active) return;
-        setGraph(payload);
-        setStatus("준비됨");
-      })
-      .catch((error: Error) => {
-        if (active) setStatus(error.message);
-      });
+    const requestKey = `${selectedProjectId}\u0000${graphSelectionKey}`;
+    const cachedPayload = readCachedGraph(requestKey);
+    if (cachedPayload) {
+      setGraph(cachedPayload);
+      setGraphLoading(false);
+      setStatus("준비됨");
+      return;
+    }
+
+    setGraphLoading(true);
+    setStatus(graph ? "그래프 새로 고치는 중" : "그래프 불러오는 중");
+    const timeoutId = window.setTimeout(() => {
+      if (!active) return;
+      let requestEntry = graphInflightRef.current.get(requestKey);
+      if (!requestEntry) {
+        const controller = new AbortController();
+        const query = new URLSearchParams({
+          // OntologyGraph 엔진은 차수 필터로 표시량을 관리하므로 캡을 크게 잡는다
+          max_nodes: "20000",
+          max_edges: "50000",
+          pack_ids: graphSelectionKey,
+        });
+        const promise = getJson<GraphPayload>(
+          `/api/projects/${encodeURIComponent(selectedProjectId)}/graph?${query.toString()}`,
+          { token: authToken, signal: controller.signal }
+        ).then((payload) => {
+          cacheGraph(requestKey, payload);
+          return payload;
+        });
+        requestEntry = { controller, consumers: 0, promise };
+        graphInflightRef.current.set(requestKey, requestEntry);
+        promise.then(
+          () => {
+            if (graphInflightRef.current.get(requestKey) === requestEntry) {
+              graphInflightRef.current.delete(requestKey);
+            }
+          },
+          () => {
+            if (graphInflightRef.current.get(requestKey) === requestEntry) {
+              graphInflightRef.current.delete(requestKey);
+            }
+          }
+        );
+      }
+      activeRequest = requestEntry;
+      requestEntry.consumers += 1;
+      requestEntry.promise
+        .then((payload) => {
+          if (!active) return;
+          setGraph(payload);
+          setGraphLoading(false);
+          setStatus("준비됨");
+        })
+        .catch((error: unknown) => {
+          if (!active || isAbortError(error)) return;
+          setGraphLoading(false);
+          setStatus(error instanceof Error ? error.message : String(error));
+        });
+    }, GRAPH_FETCH_DEBOUNCE_MS);
+
     return () => {
       active = false;
+      window.clearTimeout(timeoutId);
+      if (!activeRequest) return;
+      activeRequest.consumers = Math.max(0, activeRequest.consumers - 1);
+      if (activeRequest.consumers === 0 && graphInflightRef.current.get(requestKey) === activeRequest) {
+        activeRequest.controller.abort();
+        graphInflightRef.current.delete(requestKey);
+      }
     };
-  }, [projects, selectedProjectId, selectedGraphPackIds, authToken]);
+  }, [activeTab, selectedProjectId, graphSelectionKey, authToken, graphDataRevision]);
 
   async function refreshPublicStatus(token = authToken) {
     const tasks: Promise<unknown>[] = [getJson<IndexStats>("/api/index/status").then(setIndexStats)];
@@ -760,15 +883,19 @@ function App() {
   }
 
   async function refreshData(nextPackId?: string, token = authToken) {
-    const [packData, projectData, ifcModelData] = await Promise.all([
-      getJson<Pack[]>("/api/packs", { token }),
-      getJson<Project[]>("/api/projects", { token }),
-      getJson<IfcModel[]>("/api/ifc/models", { token }).catch(() => []),
-    ]);
+    const payload = await getJson<BootstrapPayload>("/api/bootstrap", { token });
+    if (!payload.authenticated || !payload.user) {
+      throw new Error("로그인 세션이 만료되었습니다.");
+    }
+    const packData = payload.packs;
+    const projectData = payload.projects;
+    const ifcModelData = payload.ifcModels;
+    invalidateGraphCache();
+    setCurrentUser(payload.user);
     setPacks(packData);
     setProjects(projectData);
     setIfcModels(ifcModelData);
-    refreshPublicStatus(token).catch(() => undefined);
+    if (payload.stats) setIndexStats(payload.stats);
     const nextProject =
       (nextPackId && projectData.find((project) => project.packIds.includes(nextPackId))) ||
       (selectedProjectId && projectData.find((project) => project.id === selectedProjectId)) ||
@@ -788,11 +915,25 @@ function App() {
       setCurrentUser(null);
       return;
     }
-    const payload = await getJson<{ authenticated: boolean; user: CurrentUser | null }>("/api/auth/me", { token });
+    const payload = await getJson<BootstrapPayload>("/api/bootstrap", { token });
     const user = payload.authenticated ? payload.user : null;
     setCurrentUser(user);
     if (user) {
-      await refreshData(undefined, token);
+      invalidateGraphCache();
+      setPacks(payload.packs);
+      setProjects(payload.projects);
+      setIfcModels(payload.ifcModels);
+      if (payload.stats) setIndexStats(payload.stats);
+      const nextProject =
+        (selectedProjectId && payload.projects.find((project) => project.id === selectedProjectId)) ||
+        payload.projects[0];
+      setSelectedProjectId(nextProject?.id ?? "");
+      setSelectedGraphPackIds([]);
+      setStatus("Ready");
+    } else {
+      setPacks([]);
+      setProjects([]);
+      setIfcModels([]);
     }
   }
 
@@ -1534,7 +1675,7 @@ function App() {
                   {localGraph
                     ? `${localGraph.pack.title} (세션 전용 · 서버 미등록)`
                     : selectedProject?.name ?? graph?.pack.title ?? status}
-                  {!localGraph && graphPackOptions.length ? ` / ${selectedGraphPackIds.length}개 팩 표시` : ""}
+                  {!localGraph && graphPackOptions.length ? ` / ${activeGraphPackIds.length}개 팩 표시` : ""}
                 </span>
               </div>
               <div className="graph-local-actions">
@@ -1568,6 +1709,12 @@ function App() {
               </div>
             </div>
             {localPackStatus ? <div className="graph-local-status">{localPackStatus}</div> : null}
+            {!localGraph && graphLoading && graph ? (
+              <div className="graph-local-status" role="status" aria-live="polite">
+                <LoaderCircle className="inline-loading-spinner" size={14} />
+                선택한 팩으로 그래프를 새로 고치는 중입니다. 현재 그래프는 계속 탐색할 수 있습니다.
+              </div>
+            ) : null}
             {!localGraph && graphPackOptions.length ? (
               <div className="graph-pack-filter" aria-label="프로젝트 팩 필터">
                 <div>
@@ -1601,7 +1748,7 @@ function App() {
                 controllerRef={ogControllerRef}
               />
             ) : graphPackOptions.length ? (
-              selectedGraphPackIds.length ? (
+              activeGraphPackIds.length ? (
                 graph ? (
                   <OntologyGraph
                     nodes={graph.nodes}
@@ -1611,11 +1758,17 @@ function App() {
                     controllerRef={ogControllerRef}
                     serverStats={graph.stats}
                   />
-                ) : (
+                ) : graphLoading ? (
                   <div className="graph-project-empty-state project-empty-state graph-loading-state">
                     <LoaderCircle className="loading-spinner" size={28} />
                     <strong>그래프 불러오는 중…</strong>
                     <span>대용량 팩은 수 초 걸릴 수 있습니다.</span>
+                  </div>
+                ) : (
+                  <div className="graph-project-empty-state project-empty-state">
+                    <AlertTriangle size={28} />
+                    <strong>그래프를 불러오지 못했습니다.</strong>
+                    <span>{status}</span>
                   </div>
                 )
               ) : (

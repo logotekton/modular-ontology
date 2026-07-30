@@ -120,6 +120,7 @@ def test_project_graph_bounds_default_cold_pack_fanout(monkeypatch) -> None:
 
     assert captured["packIds"] == ["direct-a", "direct-b", "direct-c"]
     assert result["diagnostics"] == {
+        "graphCache": "built",
         "projectPackSelectionTruncated": True,
         "projectPacksAvailable": 5,
         "projectPacksLoaded": 3,
@@ -143,3 +144,108 @@ def test_project_graph_rejects_explicit_pack_fanout_over_limit(monkeypatch) -> N
 
     assert exc_info.value.status_code == 400
     assert "at most 3 packs" in str(exc_info.value.detail)
+
+
+def test_project_graph_accepts_large_folder_selection_without_dropping_packs(monkeypatch) -> None:
+    pack_ids = [f"pack-{index:03d}" for index in range(104)]
+    project = {"id": "project-large", "name": "Large Project", "packIds": pack_ids}
+    captured: dict[str, object] = {}
+    registry_calls = 0
+
+    def ensure_registry():
+        nonlocal registry_calls
+        registry_calls += 1
+
+    monkeypatch.delenv("MODULAR_ONTOLOGY_PROJECT_GRAPH_MAX_PACKS", raising=False)
+    monkeypatch.setattr(app, "ensure_runtime_registry", ensure_registry)
+    monkeypatch.setattr(app, "current_user", lambda _authorization: {"email": "admin@example.com"})
+    monkeypatch.setattr(app, "ensure_project_access", lambda _project_id, _user: project)
+    monkeypatch.setattr(
+        app,
+        "list_packs",
+        lambda: [
+            {
+                "id": pack_id,
+                "sizeBytes": 1,
+                "counts": {"nodes": 1, "edges": 0, "documents": 0},
+            }
+            for pack_id in pack_ids
+        ],
+    )
+
+    def get_graph(active_pack_ids, **_kwargs):
+        captured["packIds"] = list(active_pack_ids)
+        return {"diagnostics": {}, "activePackIds": list(active_pack_ids)}
+
+    monkeypatch.setattr(app, "get_or_build_project_graph", get_graph)
+
+    result = app.project_graph(
+        "project-large",
+        pack_ids=",".join(reversed(pack_ids)),
+        max_nodes=20_000,
+        max_edges=50_000,
+        authorization=None,
+    )
+
+    assert registry_calls == 1
+    assert captured["packIds"] == sorted(pack_ids)
+    assert result["activePackIds"] == sorted(pack_ids)
+    assert result["diagnostics"]["projectPackSelectionTruncated"] is False
+    assert result["diagnostics"]["projectPacksLoaded"] == 104
+    assert result["diagnostics"]["projectGraphPackLimit"] == 250
+
+
+def test_project_graph_checks_project_access_before_shared_cache(monkeypatch) -> None:
+    monkeypatch.setattr(app, "ensure_runtime_registry", lambda: None)
+    monkeypatch.setattr(app, "current_user", lambda _authorization: {"email": "viewer@example.com"})
+
+    def deny_project(_project_id, _user):
+        raise app.HTTPException(status_code=403, detail="forbidden")
+
+    monkeypatch.setattr(app, "ensure_project_access", deny_project)
+    monkeypatch.setattr(
+        app,
+        "get_or_build_project_graph",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unauthorized requests must never reach the graph cache")
+        ),
+    )
+
+    with pytest.raises(app.HTTPException) as exc_info:
+        app.project_graph("private-project", pack_ids="pack-a", authorization="Bearer viewer")
+
+    assert exc_info.value.status_code == 403
+
+
+def test_project_graph_preview_miss_fails_fast_with_retry_hint(monkeypatch) -> None:
+    project = {
+        "id": "project-large",
+        "name": "Large Project",
+        "packIds": [f"pack-{index:02d}" for index in range(17)],
+    }
+    monkeypatch.setattr(app, "ensure_runtime_registry", lambda: None)
+    monkeypatch.setattr(app, "current_user", lambda _authorization: {"email": "admin@example.com"})
+    monkeypatch.setattr(app, "ensure_project_access", lambda _project_id, _user: project)
+    monkeypatch.setattr(
+        app,
+        "list_packs",
+        lambda: [{"id": pack_id, "counts": {}} for pack_id in project["packIds"]],
+    )
+    monkeypatch.setattr(
+        app,
+        "get_or_build_project_graph",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            app.GraphPreviewUnavailableError("preview refresh required")
+        ),
+    )
+
+    with pytest.raises(app.HTTPException) as exc_info:
+        app.project_graph(
+            "project-large",
+            pack_ids=",".join(project["packIds"]),
+            authorization="Bearer admin",
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.headers == {"Retry-After": "5"}
+    assert "preview refresh required" in str(exc_info.value.detail)

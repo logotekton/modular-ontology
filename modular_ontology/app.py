@@ -60,6 +60,7 @@ from .google_drive_sync import (
     google_drive_sync_status,
     restore_ifc_files_from_drive,
     sync_google_drive_registry_files,
+    sync_google_drive_runtime_metadata,
     sync_google_drive_project_storage,
     sync_google_drive_storage,
     sync_google_drive_mcp_tokens_file,
@@ -78,7 +79,21 @@ from .mcp_tokens import (
     get_mcp_token_record,
     regenerate_mcp_token_for_user,
 )
-from .pack_index import PackFile, build_graph, build_multi_pack_graph, list_packs, list_projects, save_uploaded_pack, unique_pack_files
+from .graph_preview import (
+    GraphBuildInProgressError,
+    GraphPreviewUnavailableError,
+    get_or_build_project_graph,
+    invalidate_graph_cache,
+)
+from .pack_index import (
+    PackFile,
+    build_graph,
+    build_multi_pack_graph,
+    list_packs as _list_packs,
+    list_projects as _list_projects,
+    save_uploaded_pack,
+    unique_pack_files,
+)
 from .project_store import (
     attach_pack_to_project,
     create_project,
@@ -108,7 +123,19 @@ _VERCEL_RUNTIME_HOST_ENV_NAMES = (
     "VERCEL_BRANCH_URL",
     "VERCEL_PROJECT_PRODUCTION_URL",
 )
-_DEFAULT_PROJECT_GRAPH_MAX_PACKS = 16
+_DEFAULT_PROJECT_GRAPH_MAX_PACKS = 250
+
+
+def list_packs() -> list[dict[str, Any]]:
+    """List runtime metadata without hydrating the separate query database."""
+
+    return _list_packs(include_query_database=False)
+
+
+def list_projects() -> list[dict[str, Any]]:
+    """List runtime projects without hydrating the separate query database."""
+
+    return _list_projects(include_query_database=False)
 
 
 def _project_graph_max_packs() -> int:
@@ -117,13 +144,21 @@ def _project_graph_max_packs() -> int:
         value = int(str(raw))
     except (TypeError, ValueError):
         value = _DEFAULT_PROJECT_GRAPH_MAX_PACKS
-    return max(1, min(value, 100))
+    return max(1, min(value, 500))
 
 
-def _default_project_graph_pack_ids(project_pack_ids: list[str], limit: int) -> list[str]:
+def _default_project_graph_pack_ids(
+    project_pack_ids: list[str],
+    limit: int,
+    *,
+    pack_summaries: list[dict[str, Any]] | None = None,
+) -> list[str]:
     """Prefer project-specific packs and keep a bounded cold Drive fan-out."""
 
-    summaries = {str(pack.get("id") or ""): pack for pack in list_packs()}
+    summaries = {
+        str(pack.get("id") or ""): pack
+        for pack in (pack_summaries if pack_summaries is not None else list_packs())
+    }
     project_specific = [
         pack_id
         for pack_id in project_pack_ids
@@ -233,8 +268,11 @@ configure_mcp_server(
 )
 remote_mcp_app = remote_mcp.streamable_http_app()
 
-_GOOGLE_DRIVE_SYNC_LOCK = threading.Lock()
-_GOOGLE_DRIVE_SCOPE_SYNC_LOCK = threading.Lock()
+_GOOGLE_DRIVE_SYNC_LOCK = threading.RLock()
+# Registry metadata and the compact query database describe one published
+# generation.  Keep scoped hydration on the same process lock as full/query
+# syncs so a metadata-only activation cannot race a database activation.
+_GOOGLE_DRIVE_SCOPE_SYNC_LOCK = _GOOGLE_DRIVE_SYNC_LOCK
 _GOOGLE_DRIVE_SCOPE_SYNC_CACHE: dict[str, dict[str, Any]] = {}
 
 
@@ -269,6 +307,11 @@ def _remember_scope_sync(scope: str, result: dict[str, Any]) -> None:
     }
 
 
+def _invalidate_runtime_metadata_caches() -> None:
+    invalidate_users_cache()
+    invalidate_graph_cache()
+
+
 def _run_scoped_google_drive_sync(
     scope: str,
     sync_fn: Callable[[], dict[str, Any]],
@@ -287,8 +330,8 @@ def _run_scoped_google_drive_sync(
                     return cached
             result = sync_fn()
             _remember_scope_sync(scope, result)
-        if result.get("status") == "synced" and on_synced:
-            on_synced()
+            if result.get("status") == "synced" and on_synced:
+                on_synced()
         return {"enabled": True, **result}
     except Exception as exc:
         return {"enabled": True, "status": "error", "error": str(exc)}
@@ -305,8 +348,8 @@ def run_google_drive_sync(force: bool = False, *, include_shared_packs: bool = T
     try:
         with _GOOGLE_DRIVE_SYNC_LOCK:
             result = sync_google_drive_storage(force=force, include_shared_packs=include_shared_packs)
-        if result.get("status") == "synced":
-            invalidate_users_cache()
+            if result.get("status") == "synced":
+                _invalidate_runtime_metadata_caches()
         return result
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
@@ -327,11 +370,26 @@ def run_google_drive_registry_sync(force: bool = False) -> dict[str, Any]:
     try:
         with _GOOGLE_DRIVE_SYNC_LOCK:
             result = sync_google_drive_registry_files(force=force)
-        if result.get("status") == "synced":
-            invalidate_users_cache()
+            if result.get("status") in {"synced", "cached"} and result.get("databaseIncluded") is not False:
+                # DB-inclusive hydration also downloads and activates every file
+                # needed by current_user().  Record that fact while holding the
+                # shared lock so /api/query does not immediately hydrate the
+                # same registry metadata a second time.
+                _remember_scope_sync("runtime_metadata", result)
+            if result.get("status") == "synced":
+                _invalidate_runtime_metadata_caches()
         return {"enabled": True, **result}
     except Exception as exc:
         return {"enabled": True, "status": "error", "error": str(exc)}
+
+
+def run_google_drive_runtime_metadata_sync(force: bool = False) -> dict[str, Any]:
+    return _run_scoped_google_drive_sync(
+        "runtime_metadata",
+        lambda: sync_google_drive_runtime_metadata(force=force),
+        force=force,
+        on_synced=_invalidate_runtime_metadata_caches,
+    )
 
 
 def run_google_drive_users_sync(force: bool = False) -> dict[str, Any]:
@@ -402,18 +460,8 @@ def ensure_runtime_storage() -> dict[str, Any]:
 def ensure_runtime_registry() -> dict[str, Any]:
     if not google_drive_sync_enabled():
         return {"enabled": False, "status": "disabled"}
-    storage_status = google_drive_sync_status()
-    stats = index_stats()
-    if stats.get("packs", 0) > 0 and storage_status.get("status") in {"synced", "cached"}:
-        ttl = int(str(env("MODULAR_ONTOLOGY_GOOGLE_DRIVE_REGISTRY_SYNC_TTL_SECONDS", str(1800))))
-        try:
-            synced_at = float(storage_status.get("synced_at", 0) or 0)
-        except (TypeError, ValueError):
-            synced_at = 0
-        if ttl > 0 and synced_at and time.time() - synced_at < ttl:
-            return {"enabled": True, **storage_status}
-    result = run_google_drive_registry_sync()
-    if result.get("status") in {"synced", "cached"}:
+    result = run_google_drive_runtime_metadata_sync()
+    if result.get("status") == "synced":
         try:
             drive_projects = _apply_drive_project_folders()
             if any(drive_projects.get(key) for key in ("created", "updated", "renamed", "deleted", "conflicts")):
@@ -423,6 +471,15 @@ def ensure_runtime_registry() -> dict[str, Any]:
                 result["projectPackLinks"] = links
         except Exception as exc:
             result["registryApplyError"] = str(exc)
+    return result
+
+
+def ensure_runtime_query_index() -> dict[str, Any]:
+    """Hydrate the compact SQLite query index only for search/QA paths."""
+
+    result = run_google_drive_registry_sync()
+    if result.get("enabled") and result.get("status") == "error":
+        raise RuntimeError(f"Google Drive query-index sync failed: {result.get('error')}")
     return result
 
 
@@ -979,6 +1036,58 @@ def me(authorization: str | None = Header(default=None)) -> dict[str, object]:
     return {"authenticated": True, "user": public_user(user)}
 
 
+@app.get("/api/bootstrap")
+def bootstrap(authorization: str | None = Header(default=None)) -> dict[str, object]:
+    """Return the authenticated workspace catalog in one cold-start request."""
+
+    ensure_runtime_registry()
+    token = extract_bearer_token(authorization)
+    user = get_user_by_token(token)
+    if not user:
+        return {
+            "authenticated": False,
+            "user": None,
+            "packs": [],
+            "projects": [],
+            "ifcModels": [],
+        }
+
+    all_projects = list_projects()
+    if is_internal_user(user):
+        visible_projects = all_projects
+    else:
+        allowed_project_ids = set(get_company_project_access(user.company))
+        visible_projects = [
+            project for project in all_projects if project.get("id") in allowed_project_ids
+        ]
+    visible_pack_ids = {
+        pack_id
+        for project in visible_projects
+        for pack_id in project.get("packIds", [])
+        if isinstance(pack_id, str)
+    }
+    all_packs = list_packs()
+    visible_packs = (
+        all_packs
+        if is_internal_user(user)
+        else [pack for pack in all_packs if pack.get("id") in visible_pack_ids]
+    )
+    all_models = list_ifc_models()
+    visible_models = (
+        all_models
+        if is_internal_user(user)
+        else [model for model in all_models if model.get("projectId") in {project["id"] for project in visible_projects}]
+    )
+    return {
+        "authenticated": True,
+        "user": public_user(user),
+        "packs": visible_packs,
+        "projects": visible_projects,
+        "ifcModels": visible_models,
+        "stats": _runtime_catalog_stats(visible_packs, visible_projects, visible_models),
+    }
+
+
 @app.post("/api/auth/logout")
 def logout(authorization: str | None = Header(default=None)) -> dict[str, str]:
     clear_session(extract_bearer_token(authorization))
@@ -1264,14 +1373,43 @@ def packs(authorization: str | None = Header(default=None)) -> list[dict[str, An
     return [pack for pack in list_packs() if pack["id"] in visible_pack_ids]
 
 
+def _runtime_catalog_stats(
+    pack_rows: list[dict[str, Any]] | None = None,
+    project_rows: list[dict[str, Any]] | None = None,
+    model_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    pack_rows = pack_rows if pack_rows is not None else list_packs()
+    project_rows = project_rows if project_rows is not None else list_projects()
+    model_rows = model_rows if model_rows is not None else list_ifc_models()
+    return {
+        "packs": len(pack_rows),
+        "documents": sum(int(pack.get("counts", {}).get("documents") or 0) for pack in pack_rows),
+        "nodes": sum(int(pack.get("counts", {}).get("nodes") or 0) for pack in pack_rows),
+        "edges": sum(int(pack.get("counts", {}).get("edges") or 0) for pack in pack_rows),
+        "users": len(list_users()),
+        "projects": len(project_rows),
+        "ifcModels": len(model_rows),
+    }
+
+
 @app.get("/api/index/status")
 def index_status(sync: bool = False) -> dict[str, Any]:
-    storage_status = ensure_runtime_storage() if sync else ensure_runtime_registry()
-    stats = index_stats()
-    stats["users"] = len(list_users())
-    stats["projects"] = len(list_projects())
-    stats["ifcModels"] = len(list_ifc_models())
-    stats["bm25"] = bm25_index_status()
+    if sync:
+        storage_status = ensure_runtime_storage()
+        stats = index_stats()
+        stats["users"] = len(list_users())
+        stats["projects"] = len(list_projects())
+        stats["ifcModels"] = len(list_ifc_models())
+        stats["bm25"] = bm25_index_status()
+    else:
+        storage_status = ensure_runtime_registry()
+        stats = _runtime_catalog_stats()
+        stats["statsSource"] = "registryCatalog"
+        stats["queryIndex"] = {
+            "state": "deferred",
+            "validated": False,
+        }
+        stats["bm25"] = {"available": False, "deferred": True}
     stats["storage"] = storage_runtime_status(storage_status)
     return stats
 
@@ -1304,9 +1442,12 @@ def _reindex_packs_by_path(paths: list[Path]) -> dict[str, Any]:
             pack = known.get(path.resolve())
             if pack is not None:
                 indexed.append(index_pack(conn, pack))
-        return {"status": "indexed", "packs": indexed, "stats": index_stats(conn)}
+        result = {"status": "indexed", "packs": indexed, "stats": index_stats(conn)}
     finally:
         conn.close()
+    if indexed:
+        invalidate_graph_cache()
+    return result
 
 
 def _require_persistent_sync_storage() -> None:
@@ -1336,6 +1477,7 @@ def admin_sync_google_drive_storage(authorization: str | None = Header(default=N
         with _GOOGLE_DRIVE_SYNC_LOCK:
             if changed:
                 index_result = index_all_packs()
+                invalidate_graph_cache()
                 result["reindexed"] = index_result.get("stats", {})
             else:
                 result["reindexed"] = index_stats()
@@ -1563,6 +1705,7 @@ def reindex(full: bool = False, authorization: str | None = Header(default=None)
     if not full:
         registry = require_google_drive_sync(run_google_drive_registry_sync(force=True))
         result = index_all_packs()
+        invalidate_graph_cache()
         drive_projects = _apply_drive_project_folders()
         links = _apply_drive_project_pack_links()
         result.update({
@@ -1584,6 +1727,7 @@ def reindex(full: bool = False, authorization: str | None = Header(default=None)
             detail="Full Drive sync was incomplete; refusing to prune the local ontology index.",
         )
     result = index_all_packs(prune_missing=True)
+    invalidate_graph_cache()
     result["driveProjects"] = _apply_drive_project_folders()
     result["projectPackLinks"] = _apply_drive_project_pack_links()
     result["projects"] = list_projects()
@@ -1627,6 +1771,7 @@ def project_graph(
         for pack_id in (pack_ids or "").split(",")
         if pack_id.strip()
     ]
+    requested_pack_ids = list(dict.fromkeys(requested_pack_ids))
     pack_limit = _project_graph_max_packs()
     if len(requested_pack_ids) > pack_limit:
         raise HTTPException(
@@ -1636,20 +1781,40 @@ def project_graph(
                 "Select fewer packs to keep lazy graph loading within the serverless time budget."
             ),
         )
-    active_pack_ids = requested_pack_ids or _default_project_graph_pack_ids(project_pack_ids, pack_limit)
-    selection_truncated = not requested_pack_ids and len(project_pack_ids) > len(active_pack_ids)
-    invalid_pack_ids = [pack_id for pack_id in active_pack_ids if pack_id not in project_pack_ids]
+    project_pack_id_set = set(project_pack_ids)
+    invalid_pack_ids = [
+        pack_id for pack_id in requested_pack_ids if pack_id not in project_pack_id_set
+    ]
     if invalid_pack_ids:
-        raise HTTPException(status_code=400, detail=f"Packs are not linked to this project: {', '.join(invalid_pack_ids)}")
-    for pack_id in active_pack_ids:
-        ensure_pack_access(pack_id, user)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Packs are not linked to this project: {', '.join(invalid_pack_ids)}",
+        )
+    pack_summaries = list_packs()
+    if requested_pack_ids:
+        requested_pack_id_set = set(requested_pack_ids)
+        # Graph selection is order-sensitive for fair budgeting and ambiguous
+        # cross-pack endpoints. Canonicalize to the project's declared order so
+        # UI click order and query-string order cannot change graph semantics.
+        active_pack_ids = [
+            pack_id for pack_id in project_pack_ids if pack_id in requested_pack_id_set
+        ]
+    else:
+        active_pack_ids = _default_project_graph_pack_ids(
+            project_pack_ids,
+            pack_limit,
+            pack_summaries=pack_summaries,
+        )
+    selection_truncated = not requested_pack_ids and len(project_pack_ids) > len(active_pack_ids)
     try:
-        result = build_multi_pack_graph(
+        result = get_or_build_project_graph(
             active_pack_ids,
+            pack_summaries=pack_summaries,
             title=project["name"],
             project=project,
             max_nodes=max_nodes,
             max_edges=max_edges,
+            builder=build_multi_pack_graph,
         )
         diagnostics = result.setdefault("diagnostics", {})
         diagnostics.update(
@@ -1661,6 +1826,18 @@ def project_graph(
             }
         )
         return result
+    except GraphPreviewUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+            headers={"Retry-After": "5"},
+        ) from exc
+    except GraphBuildInProgressError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+            headers={"Retry-After": "2"},
+        ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except FileNotFoundError as exc:
@@ -1726,6 +1903,7 @@ async def upload_pack(
         )
     write_back["database"] = require_google_drive_write_back(run_google_drive_write_back("database"))
     summary["writeBack"] = write_back
+    invalidate_graph_cache()
     return summary
 
 
@@ -1905,7 +2083,7 @@ def admin_link_ifc_model(
 
 @app.post("/api/query")
 def query_ontology(request: QueryRequest, authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    ensure_runtime_registry()
+    ensure_runtime_query_index()
     user = current_user(authorization)
     if request.use_openai and not user:
         raise HTTPException(status_code=401, detail="Login is required to use OpenAI AI Query.")

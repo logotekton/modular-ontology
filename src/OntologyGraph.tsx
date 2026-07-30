@@ -75,6 +75,9 @@ const FALLBACK_PALETTE = [
   "#c0990e", "#67a7b8", "#ff6f6c", "#737373", "#a05fb8", "#84c980",
 ];
 const MAX_VISIBLE_DEFAULT = 4000;
+const SIMULATION_ALPHA_MIN = 0.003;
+const MAX_SIMULATION_TICKS_PER_PAINT = 6;
+const SIMULATION_FRAME_BUDGET_MS = 12;
 
 export function OntologyGraph<N extends OgNode, E extends OgEdge>({
   nodes,
@@ -150,6 +153,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
     let selected: SimNode<N> | null = null;
     let hovered: SimNode<N> | null = null;
     let aiHighlight: Set<string> | null = null; // AI 참조 노드 강조
+    const selectionHighlight = new Set<string>();
 
     let alpha = 0;
     let engMinDeg = 0;
@@ -164,6 +168,11 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
     let H = 0;
     let dpr = 1;
     let disposed = false;
+    let simulationTickCount = 0;
+    let paintCount = 0;
+    let lastPaintOrdinaryLabels = 0;
+    let lastPaintInteractiveLabels = 0;
+    let lastPaintSimulationActive = false;
 
     // 대용량 가드: 표시 노드가 한도 이하가 되도록 최소 차수 자동 상향
     while (engMinDeg < 200 && simNodes.filter((n) => n.degree >= engMinDeg).length > MAX_VISIBLE_DEFAULT) engMinDeg++;
@@ -295,7 +304,8 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       }
     };
     const tick = () => {
-      if (engPaused || alpha < 0.003 || !vNodes.length) return;
+      if (engPaused || alpha < SIMULATION_ALPHA_MIN || !vNodes.length) return;
+      simulationTickCount++;
       alpha *= 0.985;
       const strength = 220 * engRep * alpha;
       const useQuad = vNodes.length > 60;
@@ -358,25 +368,34 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
     const resize = () => {
       const rect = container.getBoundingClientRect();
       if (!rect.width || !rect.height) return;
-      dpr = window.devicePixelRatio || 1;
-      W = rect.width;
-      H = rect.height;
-      canvas.width = Math.round(W * dpr);
-      canvas.height = Math.round(H * dpr);
+      const nextDpr = window.devicePixelRatio || 1;
+      const nextW = rect.width;
+      const nextH = rect.height;
+      const nextCanvasWidth = Math.round(nextW * nextDpr);
+      const nextCanvasHeight = Math.round(nextH * nextDpr);
+      if (
+        W === nextW &&
+        H === nextH &&
+        dpr === nextDpr &&
+        canvas.width === nextCanvasWidth &&
+        canvas.height === nextCanvasHeight
+      ) {
+        return;
+      }
+      dpr = nextDpr;
+      W = nextW;
+      H = nextH;
+      canvas.width = nextCanvasWidth;
+      canvas.height = nextCanvasHeight;
       requestDraw();
     };
     const draw = () => {
+      paintCount++;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.fillStyle = THEME.bg;
       ctx.fillRect(0, 0, W, H);
       ctx.translate(cam.x, cam.y);
       ctx.scale(cam.k, cam.k);
-
-      const highlight = new Set<string>();
-      if (selected) {
-        highlight.add(selected.id);
-        for (const nb of adj.get(selected.id) ?? []) highlight.add(nb.id);
-      }
 
       ctx.lineWidth = 1 / cam.k;
       ctx.strokeStyle = selected || aiHighlight ? THEME.edgeDim : THEME.edge;
@@ -435,7 +454,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
         }
       }
       for (const n of vNodes) {
-        const isSelHl = highlight.has(n.id);
+        const isSelHl = selectionHighlight.has(n.id);
         const isAiHl = aiHighlight !== null && aiHighlight.has(n.id);
         let nodeAlpha = 1;
         if (selected) nodeAlpha = isSelHl ? 1 : 0.18;
@@ -465,15 +484,30 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       ctx.textBaseline = "top";
       let labelBudget = 350;
       const aiLabelable = aiHighlight !== null && aiHighlight.size <= 60;
+      const simulationActive = !engPaused && alpha >= SIMULATION_ALPHA_MIN && vNodes.length > 0;
+      lastPaintOrdinaryLabels = 0;
+      lastPaintInteractiveLabels = 0;
+      lastPaintSimulationActive = simulationActive;
+      let activeFont = "";
       for (const n of vNodes) {
-        const isHl = highlight.has(n.id) || hovered === n || (aiLabelable && aiHighlight!.has(n.id));
-        const show = isHl || (cam.k * n.r > 5 && labelBudget > 0);
+        const isHl = selectionHighlight.has(n.id) || hovered === n || (aiLabelable && aiHighlight!.has(n.id));
+        // Ordinary labels dominate canvas paint time. Interactive labels stay
+        // visible while moving; the original label policy returns when settled.
+        const show = isHl || (!simulationActive && cam.k * n.r > 5 && labelBudget > 0);
         if (!show) continue;
-        if (!isHl) labelBudget--;
+        if (isHl) lastPaintInteractiveLabels++;
+        else {
+          labelBudget--;
+          lastPaintOrdinaryLabels++;
+        }
         let fsScreen = Math.max(10, Math.min(15, n.r * 1.4)) * Math.min(cam.k, 1.4);
         if (isHl) fsScreen = Math.max(fsScreen, 11);
         const fs = fsScreen / cam.k;
-        ctx.font = `${fs}px Figtree, "Pretendard Variable", Pretendard, sans-serif`;
+        const font = `${fs}px Figtree, "Pretendard Variable", Pretendard, sans-serif`;
+        if (font !== activeFont) {
+          ctx.font = font;
+          activeFont = font;
+        }
         ctx.globalAlpha = (selected || aiHighlight) && !isHl ? 0.25 : isHl ? 1 : 0.8;
         const label = n.label.length > 24 ? `${n.label.slice(0, 24)}…` : n.label;
         ctx.strokeStyle = THEME.halo;
@@ -486,7 +520,16 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
     };
     let raf = 0;
     let redrawRequested = false;
-    const shouldSimulate = () => !engPaused && alpha >= 0.003 && vNodes.length > 0;
+    const shouldSimulate = () => !engPaused && alpha >= SIMULATION_ALPHA_MIN && vNodes.length > 0;
+    const tickWithinFrameBudget = () => {
+      const startedAt = performance.now();
+      let ticks = 0;
+      while (shouldSimulate() && ticks < MAX_SIMULATION_TICKS_PER_PAINT) {
+        tick();
+        ticks++;
+        if (performance.now() - startedAt >= SIMULATION_FRAME_BUDGET_MS) break;
+      }
+    };
     const requestDraw = () => {
       redrawRequested = true;
       if (!disposed && !raf) raf = requestAnimationFrame(frame);
@@ -495,7 +538,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       raf = 0;
       if (disposed) return;
       redrawRequested = false;
-      tick();
+      tickWithinFrameBudget();
       draw();
       if (shouldSimulate() || redrawRequested) requestDraw();
     };
@@ -577,6 +620,11 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
     const select = (node: SimNode<N> | null) => {
       const previous = selected;
       selected = node;
+      selectionHighlight.clear();
+      if (selected) {
+        selectionHighlight.add(selected.id);
+        for (const nb of adj.get(selected.id) ?? []) selectionHighlight.add(nb.id);
+      }
       if (engFocus || (node && !vNodes.some((v) => v.id === node.id)) || (previous && !node)) {
         // 필터에 숨겨진 노드 선택(이웃 점프) 시 강제 표시를 위해 재계산
         rebuildVisible();
@@ -744,6 +792,14 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       },
       fit: fitView,
       stats: () => ({ visible: vNodes.length, edges: vEdges.length, alpha, k: cam.k }),
+      renderStats: () => ({
+        simulationTicks: simulationTickCount,
+        paints: paintCount,
+        settled: !shouldSimulate(),
+        lastPaintSimulationActive,
+        lastPaintOrdinaryLabels,
+        lastPaintInteractiveLabels,
+      }),
       select: (id: string | null) => {
         select(id ? byId.get(id) ?? null : null);
         draw();

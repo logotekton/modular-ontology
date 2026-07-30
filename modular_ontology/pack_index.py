@@ -361,10 +361,11 @@ def _extract_readme(zf: zipfile.ZipFile) -> str:
     return re.sub(r"\s+", " ", text.replace("#", "")).strip()[:280]
 
 
-def list_packs() -> list[dict[str, Any]]:
+def list_packs(*, include_query_database: bool = True) -> list[dict[str, Any]]:
     registry_summaries: list[dict[str, Any]] = []
     if EPHEMERAL_STORAGE:
-        _sync_registry_from_drive()
+        if include_query_database or not _pack_registry_path().exists():
+            _sync_registry_from_drive(include_database=include_query_database)
         registry_summaries = _registry_pack_summaries()
     packs = unique_pack_files()
     if packs:
@@ -380,7 +381,7 @@ def list_packs() -> list[dict[str, Any]]:
     registry_summaries = _registry_pack_summaries()
     if registry_summaries:
         return registry_summaries
-    _sync_registry_from_drive()
+    _sync_registry_from_drive(include_database=include_query_database)
     registry_summaries = _registry_pack_summaries()
     return registry_summaries or _db_pack_summaries()
 
@@ -421,12 +422,19 @@ def _merge_pack_summaries(
     )
 
 
-def _sync_registry_from_drive() -> None:
+def _sync_registry_from_drive(*, include_database: bool = True) -> None:
     try:
-        from .google_drive_sync import google_drive_sync_enabled, sync_google_drive_registry_files
+        from .google_drive_sync import (
+            google_drive_sync_enabled,
+            sync_google_drive_registry_files,
+            sync_google_drive_runtime_metadata,
+        )
 
         if google_drive_sync_enabled():
-            sync_google_drive_registry_files()
+            if include_database:
+                sync_google_drive_registry_files()
+            else:
+                sync_google_drive_runtime_metadata()
     except Exception:
         return
 
@@ -1195,7 +1203,7 @@ def _build_graph_from_db(pack_id: str, max_nodes: int = 900, max_edges: int = 16
     }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _MultiPackNodeCandidate:
     pack_id: str
     pack_order: int
@@ -2026,8 +2034,12 @@ def _build_producer_graph(
                     return
 
 
-def list_projects() -> list[dict[str, Any]]:
-    packs = list_packs()
+def list_projects(*, include_query_database: bool = True) -> list[dict[str, Any]]:
+    packs = (
+        list_packs()
+        if include_query_database
+        else list_packs(include_query_database=False)
+    )
     from .project_store import list_projects as list_stored_projects
 
     if EPHEMERAL_STORAGE:
