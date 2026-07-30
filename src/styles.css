@@ -4392,6 +4392,16 @@ dd {
   font-size: 12.5px;
 }
 
+.graph-progress-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.graph-progress-status span {
+  min-width: 0;
+}
+
 .graph-panel.local-drag {
   outline: 2px dashed #0074e2;
   outline-offset: -6px;

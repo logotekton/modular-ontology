@@ -32,6 +32,11 @@ import { OntologyGraph } from "./OntologyGraph";
 import type { OgController, OgDetail } from "./OntologyGraph";
 import { AiChatPanel } from "./app/ai-chat/AiChatPanel";
 import { getJson, HttpError, isAbortError, request } from "./api/http";
+import { getFullGraphManifest, loadFullGraph } from "./graph/fullGraphLoader";
+import type {
+  FullGraphManifest,
+  FullGraphProgress,
+} from "./graph/fullGraphLoader";
 
 const OPENAI_CHAT_MODEL = "gpt-4.1-mini";
 
@@ -91,12 +96,17 @@ type IfcModel = {
 
 type GraphNode = {
   id: string;
+  originalId?: string;
+  occurrence?: number;
   label: string;
   type: string;
   packId?: string;
   color: string;
   size: number;
   properties: Record<string, unknown>;
+  x?: number;
+  y?: number;
+  placeholder?: boolean;
 };
 
 type GraphEdge = {
@@ -120,6 +130,9 @@ type GraphPayload = {
     totalNodes: number;
     totalEdges: number;
   };
+  graphFormat?: "legacy-json" | "full-chunks";
+  transferredBytes?: number;
+  placeholderNodes?: number;
 };
 
 type GraphInflightRequest = {
@@ -129,7 +142,13 @@ type GraphInflightRequest = {
 };
 
 const GRAPH_FETCH_DEBOUNCE_MS = 180;
-const GRAPH_CACHE_LIMIT = 8;
+const GRAPH_CACHE_LIMIT = 1;
+const GRAPH_CACHE_MAX_ESTIMATED_BYTES = 96 * 1024 * 1024;
+
+type CachedGraph = {
+  payload: GraphPayload;
+  estimatedBytes: number;
+};
 
 type AiKeyStatus = "missing" | "untested" | "testing" | "valid" | "invalid";
 
@@ -428,6 +447,17 @@ function groupPacksForDisplay(packs: Pack[]): PackDisplayGroup[] {
   return groups;
 }
 
+function graphPackGroupSelection(project: Project, packId: string, packs: Pack[]) {
+  const packsById = new Map(packs.map((pack) => [pack.id, pack]));
+  const projectPacks = project.packIds
+    .map((projectPackId) => packsById.get(projectPackId))
+    .filter((pack): pack is Pack => Boolean(pack));
+  return (
+    groupPacksForDisplay(projectPacks).find((group) => group.packIds.includes(packId))
+      ?.packIds ?? [packId]
+  );
+}
+
 function roleLabel(role?: string | null) {
   if (!role) return ROLE_LABELS.guest;
   return ROLE_LABELS[role] ?? role;
@@ -450,6 +480,52 @@ function httpErrorDetail(error: unknown, fallback: string) {
   return fallback;
 }
 
+function estimateGraphMemory(payload: GraphPayload) {
+  // Compact topology objects are substantially smaller than legacy nodes with
+  // nested properties. This deliberately overestimates the common full-graph
+  // payload so the single-entry cache never keeps an unexpectedly giant graph.
+  return payload.nodes.length * 320 + payload.edges.length * 176;
+}
+
+function fullGraphTotals(manifest: FullGraphManifest) {
+  const totals = (manifest.totals ?? manifest.stats ?? {}) as Record<string, unknown>;
+  return {
+    nodes: Number(manifest.totalNodes ?? totals.totalNodes ?? totals.nodes ?? 0) || 0,
+    edges: Number(manifest.totalEdges ?? totals.totalEdges ?? totals.edges ?? 0) || 0,
+  };
+}
+
+function graphProgressText(progress: FullGraphProgress | null) {
+  if (!progress) return "전체 그래프 준비 중";
+  if (progress.phase === "manifest") return "전체 그래프 매니페스트 확인 중";
+  const nodes = `${progress.loadedNodes.toLocaleString()} / ${progress.totalNodes.toLocaleString()} 노드`;
+  const edges = `${progress.loadedEdges.toLocaleString()} / ${progress.totalEdges.toLocaleString()} 엣지`;
+  const chunks = `${progress.loadedChunks.toLocaleString()} / ${progress.totalChunks.toLocaleString()} 청크`;
+  return `${progress.phase === "download" ? "다운로드" : "해석"} · ${nodes} · ${edges} · ${chunks}`;
+}
+
+function nodeDetailProperties(payload: unknown) {
+  if (!payload || typeof payload !== "object") return null;
+  const record = payload as Record<string, unknown>;
+  const node =
+    record.node && typeof record.node === "object"
+      ? (record.node as Record<string, unknown>)
+      : record;
+  const properties =
+    node.properties && typeof node.properties === "object"
+      ? (node.properties as Record<string, unknown>)
+      : record.properties && typeof record.properties === "object"
+        ? (record.properties as Record<string, unknown>)
+        : null;
+  if (!properties) return null;
+  return {
+    properties,
+    label: typeof node.label === "string" ? node.label : undefined,
+    type: typeof node.type === "string" ? node.type : undefined,
+    color: typeof node.color === "string" ? node.color : undefined,
+  };
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState<AppTab>(() => tabFromPathname(window.location.pathname));
   const [packs, setPacks] = useState<Pack[]>([]);
@@ -460,8 +536,10 @@ function App() {
   const [graph, setGraph] = useState<GraphPayload | null>(null);
   const [graphLoading, setGraphLoading] = useState(false);
   const [graphDataRevision, setGraphDataRevision] = useState(0);
-  const graphCacheRef = useRef<Map<string, GraphPayload>>(new Map());
+  const graphCacheRef = useRef<Map<string, CachedGraph>>(new Map());
   const graphInflightRef = useRef<Map<string, GraphInflightRequest>>(new Map());
+  const graphDetailRequestRef = useRef<AbortController | null>(null);
+  const [graphProgress, setGraphProgress] = useState<FullGraphProgress | null>(null);
   const [localGraph, setLocalGraph] = useState<GraphPayload | null>(null);
   const [localPackCount, setLocalPackCount] = useState(0);
   const [localPackStatus, setLocalPackStatus] = useState("");
@@ -597,17 +675,19 @@ function App() {
 
   function readCachedGraph(key: string) {
     const cache = graphCacheRef.current;
-    const payload = cache.get(key);
-    if (!payload) return null;
+    const entry = cache.get(key);
+    if (!entry) return null;
     cache.delete(key);
-    cache.set(key, payload);
-    return payload;
+    cache.set(key, entry);
+    return entry.payload;
   }
 
   function cacheGraph(key: string, payload: GraphPayload) {
     const cache = graphCacheRef.current;
-    cache.delete(key);
-    cache.set(key, payload);
+    const estimatedBytes = estimateGraphMemory(payload);
+    cache.clear();
+    if (estimatedBytes > GRAPH_CACHE_MAX_ESTIMATED_BYTES) return;
+    cache.set(key, { payload, estimatedBytes });
     while (cache.size > GRAPH_CACHE_LIMIT) {
       const oldestKey = cache.keys().next().value;
       if (oldestKey === undefined) break;
@@ -622,6 +702,77 @@ function App() {
     }
     graphInflightRef.current.clear();
     setGraphDataRevision((revision) => revision + 1);
+  }
+
+  function handleGraphDetail(detail: OgDetail<GraphNode> | null) {
+    graphDetailRequestRef.current?.abort();
+    graphDetailRequestRef.current = null;
+    setGraphDetail(detail);
+    if (
+      !detail ||
+      localGraph ||
+      graph?.graphFormat !== "full-chunks" ||
+      detail.node.placeholder ||
+      !authToken
+    ) {
+      return;
+    }
+    const projectId = graph.project?.id || selectedProjectId;
+    if (!projectId) return;
+    const controller = new AbortController();
+    graphDetailRequestRef.current = controller;
+    const query = new URLSearchParams({ node_id: detail.id });
+    if (detail.node.originalId) query.set("original_id", detail.node.originalId);
+    if (Number.isSafeInteger(detail.node.occurrence)) {
+      query.set("occurrence", String(detail.node.occurrence));
+    }
+    void getJson<unknown>(
+      `/api/projects/${encodeURIComponent(projectId)}/graph/full/node?${query.toString()}`,
+      { token: authToken, signal: controller.signal },
+    )
+      .then((payload) => {
+        const hydrated = nodeDetailProperties(payload);
+        if (!hydrated) return;
+        setGraphDetail((current) => {
+          if (!current || current.id !== detail.id) return current;
+          const node = {
+            ...current.node,
+            ...(hydrated.label ? { label: hydrated.label } : {}),
+            ...(hydrated.type ? { type: hydrated.type } : {}),
+            ...(hydrated.color ? { color: hydrated.color } : {}),
+            properties: { ...current.node.properties, ...hydrated.properties },
+          };
+          return {
+            ...current,
+            node,
+            label: hydrated.label ?? current.label,
+            type: hydrated.type ?? current.type,
+            color: hydrated.color ?? current.color,
+            props: { ...current.props, ...hydrated.properties },
+          };
+        });
+        setSelectedNode((current) =>
+          current?.id === detail.id
+            ? {
+                ...current,
+                ...(hydrated.label ? { label: hydrated.label } : {}),
+                ...(hydrated.type ? { type: hydrated.type } : {}),
+                ...(hydrated.color ? { color: hydrated.color } : {}),
+                properties: { ...current.properties, ...hydrated.properties },
+              }
+            : current,
+        );
+      })
+      .catch((error: unknown) => {
+        if (isAbortError(error)) return;
+        // Topology interaction remains complete when an older backend does not
+        // yet expose the optional heavy-property detail endpoint.
+      })
+      .finally(() => {
+        if (graphDetailRequestRef.current === controller) {
+          graphDetailRequestRef.current = null;
+        }
+      });
   }
 
   function confirmAction(options: ConfirmDialogOptions) {
@@ -705,6 +856,14 @@ function App() {
     graphInflightRef.current.clear();
   }, [authToken]);
 
+  useEffect(
+    () => () => {
+      graphDetailRequestRef.current?.abort();
+      graphDetailRequestRef.current = null;
+    },
+    [selectedProjectId, authToken],
+  );
+
   useEffect(() => {
     if (currentUser?.role === "admin") return;
     setManagedUsers([]);
@@ -769,6 +928,7 @@ function App() {
   useEffect(() => {
     if (!selectedProjectId) {
       setGraphLoading(false);
+      setGraphProgress(null);
       return;
     }
     if (!graphSelectionKey) {
@@ -777,6 +937,7 @@ function App() {
       setAiQuestion("");
       setGraph(null);
       setGraphLoading(false);
+      setGraphProgress(null);
       setStatus("표시할 팩을 선택하세요");
       return;
     }
@@ -793,30 +954,76 @@ function App() {
     if (cachedPayload) {
       setGraph(cachedPayload);
       setGraphLoading(false);
-      setStatus("준비됨");
+      setGraphProgress(null);
+      setStatus(cachedPayload.graphFormat === "full-chunks" ? "전체 그래프 준비됨" : "준비됨");
       return;
     }
 
     setGraphLoading(true);
+    setGraphProgress({
+      phase: "manifest",
+      loadedBytes: 0,
+      totalBytes: 0,
+      loadedChunks: 0,
+      totalChunks: 0,
+      loadedNodes: 0,
+      totalNodes: 0,
+      loadedEdges: 0,
+      totalEdges: 0,
+    });
     setStatus(graph ? "그래프 새로 고치는 중" : "그래프 불러오는 중");
     const timeoutId = window.setTimeout(() => {
       if (!active) return;
       let requestEntry = graphInflightRef.current.get(requestKey);
       if (!requestEntry) {
         const controller = new AbortController();
-        const query = new URLSearchParams({
-          // OntologyGraph 엔진은 차수 필터로 표시량을 관리하므로 캡을 크게 잡는다
-          max_nodes: "20000",
-          max_edges: "50000",
-          pack_ids: graphSelectionKey,
-        });
-        const promise = getJson<GraphPayload>(
-          `/api/projects/${encodeURIComponent(selectedProjectId)}/graph?${query.toString()}`,
-          { token: authToken, signal: controller.signal }
-        ).then((payload) => {
+        const packIds = [...activeGraphPackIds];
+        const projectSnapshot = selectedProject;
+        const packOptionsSnapshot = [...graphPackOptions];
+        const promise = (async () => {
+          const manifest = await getFullGraphManifest({
+            projectId: selectedProjectId,
+            packIds,
+            token: authToken,
+            signal: controller.signal,
+          });
+          const result = await loadFullGraph({
+            manifest,
+            token: authToken,
+            signal: controller.signal,
+            onProgress: (progress) => {
+              if (active) setGraphProgress(progress);
+            },
+          });
+          const totals = fullGraphTotals(manifest);
+          const fallbackPack: Pack = packOptionsSnapshot[0] ?? {
+            id: `${selectedProjectId}:full-graph`,
+            title: manifest.projectName || projectSnapshot?.name || "프로젝트 전체 그래프",
+            filename: "full-graph-v3",
+            source: "project-full-graph",
+            validationStatus: "ready",
+            counts: { nodes: totals.nodes, edges: totals.edges },
+          };
+          const payload: GraphPayload = {
+            pack: fallbackPack,
+            project: projectSnapshot,
+            packs: packOptionsSnapshot,
+            activePackIds: manifest.packIds ?? packIds,
+            nodes: result.nodes,
+            edges: result.edges,
+            stats: {
+              visibleNodes: result.nodes.length,
+              visibleEdges: result.edges.length,
+              totalNodes: Math.max(totals.nodes, result.nodes.length),
+              totalEdges: Math.max(totals.edges, result.edges.length),
+            },
+            graphFormat: "full-chunks",
+            transferredBytes: result.transferredBytes,
+            placeholderNodes: result.placeholderCount,
+          };
           cacheGraph(requestKey, payload);
           return payload;
-        });
+        })();
         requestEntry = { controller, consumers: 0, promise };
         graphInflightRef.current.set(requestKey, requestEntry);
         promise.then(
@@ -839,11 +1046,20 @@ function App() {
           if (!active) return;
           setGraph(payload);
           setGraphLoading(false);
-          setStatus("준비됨");
+          setGraphProgress(null);
+          setStatus(
+            payload.graphFormat === "full-chunks"
+              ? "전체 그래프 준비됨"
+              : "호환 모드로 불러옴 · 전체 그래프 아티팩트를 다시 생성하세요",
+          );
         })
         .catch((error: unknown) => {
           if (!active || isAbortError(error)) return;
+          setGraph(null);
+          setSelectedNode(null);
+          setGraphDetail(null);
           setGraphLoading(false);
+          setGraphProgress(null);
           setStatus(error instanceof Error ? error.message : String(error));
         });
     }, GRAPH_FETCH_DEBOUNCE_MS);
@@ -902,7 +1118,11 @@ function App() {
       projectData[0];
     if (nextProject) {
       setSelectedProjectId(nextProject.id);
-      setSelectedGraphPackIds(nextPackId && nextProject.packIds.includes(nextPackId) ? [nextPackId] : []);
+      setSelectedGraphPackIds(
+        nextPackId && nextProject.packIds.includes(nextPackId)
+          ? graphPackGroupSelection(nextProject, nextPackId, packData)
+          : [],
+      );
     } else {
       setSelectedProjectId("");
       setSelectedGraphPackIds([]);
@@ -1307,7 +1527,7 @@ function App() {
     const project = projects.find((item) => item.packIds.includes(packId));
     if (project) {
       setSelectedProjectId(project.id);
-      setSelectedGraphPackIds([packId]);
+      setSelectedGraphPackIds(graphPackGroupSelection(project, packId, packs));
     }
     navigateToTab("Graph Explorer");
   }
@@ -1710,9 +1930,22 @@ function App() {
             </div>
             {localPackStatus ? <div className="graph-local-status">{localPackStatus}</div> : null}
             {!localGraph && graphLoading && graph ? (
-              <div className="graph-local-status" role="status" aria-live="polite">
+              <div
+                className="graph-local-status graph-progress-status"
+                role="status"
+                aria-live="polite"
+                data-graph-phase={graphProgress?.phase ?? "manifest"}
+                data-loaded-nodes={graphProgress?.loadedNodes ?? 0}
+                data-total-nodes={graphProgress?.totalNodes ?? 0}
+                data-loaded-edges={graphProgress?.loadedEdges ?? 0}
+                data-total-edges={graphProgress?.totalEdges ?? 0}
+                data-loaded-chunks={graphProgress?.loadedChunks ?? 0}
+                data-total-chunks={graphProgress?.totalChunks ?? 0}
+              >
                 <LoaderCircle className="inline-loading-spinner" size={14} />
-                선택한 팩으로 그래프를 새로 고치는 중입니다. 현재 그래프는 계속 탐색할 수 있습니다.
+                <span>
+                  {graphProgressText(graphProgress)} · 현재 그래프는 계속 탐색할 수 있습니다.
+                </span>
               </div>
             ) : null}
             {!localGraph && graphPackOptions.length ? (
@@ -1744,7 +1977,7 @@ function App() {
                 nodes={localGraph.nodes}
                 edges={localGraph.edges}
                 onSelectNode={setSelectedNode}
-                onDetail={setGraphDetail}
+                onDetail={handleGraphDetail}
                 controllerRef={ogControllerRef}
               />
             ) : graphPackOptions.length ? (
@@ -1754,15 +1987,26 @@ function App() {
                     nodes={graph.nodes}
                     edges={graph.edges}
                     onSelectNode={setSelectedNode}
-                    onDetail={setGraphDetail}
+                    onDetail={handleGraphDetail}
                     controllerRef={ogControllerRef}
                     serverStats={graph.stats}
                   />
                 ) : graphLoading ? (
-                  <div className="graph-project-empty-state project-empty-state graph-loading-state">
+                  <div
+                    className="graph-project-empty-state project-empty-state graph-loading-state"
+                    role="status"
+                    aria-live="polite"
+                    data-graph-phase={graphProgress?.phase ?? "manifest"}
+                    data-loaded-nodes={graphProgress?.loadedNodes ?? 0}
+                    data-total-nodes={graphProgress?.totalNodes ?? 0}
+                    data-loaded-edges={graphProgress?.loadedEdges ?? 0}
+                    data-total-edges={graphProgress?.totalEdges ?? 0}
+                    data-loaded-chunks={graphProgress?.loadedChunks ?? 0}
+                    data-total-chunks={graphProgress?.totalChunks ?? 0}
+                  >
                     <LoaderCircle className="loading-spinner" size={28} />
                     <strong>그래프 불러오는 중…</strong>
-                    <span>대용량 팩은 수 초 걸릴 수 있습니다.</span>
+                    <span>{graphProgressText(graphProgress)}</span>
                   </div>
                 ) : (
                   <div className="graph-project-empty-state project-empty-state">

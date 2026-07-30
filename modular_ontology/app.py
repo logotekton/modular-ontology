@@ -15,7 +15,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -84,6 +84,19 @@ from .graph_preview import (
     GraphPreviewUnavailableError,
     get_or_build_project_graph,
     invalidate_graph_cache,
+)
+from .full_graph import (
+    FULL_GRAPH_ALGORITHM,
+    FULL_GRAPH_LAYOUT,
+    FULL_GRAPH_VERSION,
+    FullGraphChunkNotFoundError,
+    FullGraphUnavailableError,
+    full_graph_node_detail,
+    issue_full_graph_capability,
+    load_full_graph_entry,
+    resolve_full_graph_chunk,
+    resolve_full_graph_chunk_from_manifest,
+    validate_full_graph_capability,
 )
 from .pack_index import (
     PackFile,
@@ -1842,6 +1855,285 @@ def project_graph(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"Pack not found: {exc}") from None
+
+
+def _full_graph_project_selection(
+    project: dict[str, Any],
+    pack_ids: str | None,
+    *,
+    pack_summaries: list[dict[str, Any]],
+) -> tuple[list[str], bool]:
+    project_pack_ids = [
+        pack_id
+        for pack_id in project.get("packIds", [])
+        if isinstance(pack_id, str)
+    ]
+    requested_pack_ids = list(
+        dict.fromkeys(
+            pack_id.strip()
+            for pack_id in (pack_ids or "").split(",")
+            if pack_id.strip()
+        )
+    )
+    pack_limit = _project_graph_max_packs()
+    if len(requested_pack_ids) > pack_limit:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"A project graph can load at most {pack_limit} packs per request."
+            ),
+        )
+    project_pack_id_set = set(project_pack_ids)
+    invalid_pack_ids = [
+        pack_id
+        for pack_id in requested_pack_ids
+        if pack_id not in project_pack_id_set
+    ]
+    if invalid_pack_ids:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Packs are not linked to this project: "
+                f"{', '.join(invalid_pack_ids)}"
+            ),
+        )
+    if requested_pack_ids:
+        requested_pack_id_set = set(requested_pack_ids)
+        active_pack_ids = [
+            pack_id
+            for pack_id in project_pack_ids
+            if pack_id in requested_pack_id_set
+        ]
+    else:
+        active_pack_ids = _default_project_graph_pack_ids(
+            project_pack_ids,
+            pack_limit,
+            pack_summaries=pack_summaries,
+        )
+    selection_truncated = (
+        not requested_pack_ids
+        and len(project_pack_ids) > len(active_pack_ids)
+    )
+    if not active_pack_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="Select at least one ontology pack for the full graph.",
+        )
+    return active_pack_ids, selection_truncated
+
+
+@app.get("/api/projects/{project_id}/graph/full/manifest")
+def project_full_graph_manifest(
+    project_id: str,
+    pack_ids: str | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    ensure_runtime_registry()
+    user = current_user(authorization)
+    project = ensure_project_access(project_id, user)
+    pack_summaries = list_packs()
+    active_pack_ids, selection_truncated = _full_graph_project_selection(
+        project,
+        pack_ids,
+        pack_summaries=pack_summaries,
+    )
+    try:
+        entry = load_full_graph_entry(
+            active_pack_ids,
+            pack_summaries=pack_summaries,
+        )
+    except FullGraphUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+            headers={"Retry-After": "5"},
+        ) from exc
+
+    selection_key = str(entry["selectionKey"])
+    graph_capability = issue_full_graph_capability(project_id, selection_key)
+    graph_capability_query = (
+        f"?graph_access={quote(graph_capability, safe='')}"
+        if graph_capability
+        else ""
+    )
+    chunks = [
+        {
+            **descriptor,
+            "url": (
+                f"/api/projects/{quote(project_id, safe='')}/graph/full/chunks/"
+                f"{quote(selection_key, safe='')}/"
+                f"{quote(str(descriptor['file']), safe='')}"
+                f"{graph_capability_query}"
+            ),
+        }
+        for descriptor in entry.get("chunks") or []
+        if isinstance(descriptor, dict)
+    ]
+    stats = dict(entry.get("stats") or {})
+    diagnostics = {
+        **dict(entry.get("diagnostics") or {}),
+        "projectPackSelectionTruncated": selection_truncated,
+        "projectPacksAvailable": len(project.get("packIds") or []),
+        "projectPacksLoaded": len(active_pack_ids),
+        "projectGraphPackLimit": _project_graph_max_packs(),
+    }
+    return {
+        "version": FULL_GRAPH_VERSION,
+        "algorithm": FULL_GRAPH_ALGORITHM,
+        "layout": FULL_GRAPH_LAYOUT,
+        "selectionKey": selection_key,
+        "projectId": project_id,
+        "projectName": str(project.get("name") or project_id),
+        "packIds": active_pack_ids,
+        "packCount": len(active_pack_ids),
+        "totalNodes": int(stats.get("totalNodes") or 0),
+        "totalEdges": int(stats.get("totalEdges") or 0),
+        "stats": stats,
+        "diagnostics": diagnostics,
+        "chunks": chunks,
+    }
+
+
+@app.get(
+    "/api/projects/{project_id}/graph/full/chunks/"
+    "{selection_key}/{filename}"
+)
+def project_full_graph_chunk(
+    project_id: str,
+    selection_key: str,
+    filename: str,
+    graph_access: str | None = None,
+    authorization: str | None = Header(default=None),
+    if_none_match: str | None = Header(default=None),
+) -> Response:
+    capability_authorized = validate_full_graph_capability(
+        graph_access,
+        project_id,
+        selection_key,
+    )
+    if graph_access is not None and not capability_authorized:
+        raise HTTPException(
+            status_code=401,
+            detail="The full-graph access capability is invalid or expired.",
+        )
+    try:
+        if capability_authorized:
+            path, descriptor, entry = resolve_full_graph_chunk_from_manifest(
+                selection_key,
+                filename,
+            )
+        else:
+            ensure_runtime_registry()
+            user = current_user(authorization)
+            project = ensure_project_access(project_id, user)
+            pack_summaries = list_packs()
+            path, descriptor, entry = resolve_full_graph_chunk(
+                selection_key,
+                filename,
+                pack_summaries=pack_summaries,
+            )
+    except FullGraphUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except FullGraphChunkNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Full-graph chunk not found: {filename}",
+        ) from exc
+
+    if not capability_authorized:
+        project_pack_ids = [
+            pack_id
+            for pack_id in project.get("packIds") or []
+            if isinstance(pack_id, str)
+        ]
+        entry_pack_ids = [
+            pack_id
+            for pack_id in entry.get("packIds") or []
+            if isinstance(pack_id, str)
+        ]
+        entry_pack_id_set = set(entry_pack_ids)
+        canonical_entry_ids = [
+            pack_id
+            for pack_id in project_pack_ids
+            if pack_id in entry_pack_id_set
+        ]
+        if canonical_entry_ids != entry_pack_ids:
+            raise HTTPException(
+                status_code=403,
+                detail="This full-graph chunk is not available for the project.",
+            )
+
+    digest = str(descriptor["sha256"])
+    etag = f'"{digest}"'
+    cache_headers = {
+        "Cache-Control": "private, max-age=31536000, immutable",
+        "Content-Encoding": "gzip",
+        "ETag": etag,
+        "Vary": "Authorization",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if isinstance(if_none_match, str) and etag in {
+        token.strip()
+        for token in if_none_match.split(",")
+    }:
+        return Response(status_code=304, headers=cache_headers)
+    return FileResponse(
+        path,
+        media_type="application/json",
+        headers=cache_headers,
+    )
+
+
+@app.get("/api/projects/{project_id}/graph/full/node")
+def project_full_graph_node_detail(
+    project_id: str,
+    node_id: str,
+    original_id: str | None = None,
+    occurrence: int = 0,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    ensure_runtime_registry()
+    user = current_user(authorization)
+    project = ensure_project_access(project_id, user)
+    project_pack_ids = [
+        pack_id
+        for pack_id in project.get("packIds") or []
+        if isinstance(pack_id, str)
+    ]
+    matched_pack_id = next(
+        (
+            pack_id
+            for pack_id in sorted(
+                project_pack_ids,
+                key=len,
+                reverse=True,
+            )
+            if node_id.startswith(f"{pack_id}::")
+        ),
+        None,
+    )
+    if not matched_pack_id:
+        raise HTTPException(
+            status_code=404,
+            detail="The graph node is not authored by a pack in this project.",
+        )
+    authored_id = (
+        str(original_id)
+        if original_id is not None
+        else node_id[len(matched_pack_id) + 2 :]
+    )
+    authored_occurrence = max(0, int(occurrence))
+    detail = full_graph_node_detail(
+        matched_pack_id,
+        authored_id,
+        occurrence=authored_occurrence,
+    )
+    if detail is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Graph node not found: {node_id}",
+        )
+    return detail
 
 
 @app.post("/api/packs/upload")
