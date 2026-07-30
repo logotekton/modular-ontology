@@ -411,11 +411,27 @@ def _merge_pack_summaries(
     registry_summaries: list[dict[str, Any]],
     direct_summaries: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    merged = {str(summary["id"]): summary for summary in registry_summaries if summary.get("id")}
+    # In an ephemeral runtime the Drive registry is the authoritative metadata
+    # snapshot. A ZIP fetched lazily into /tmp must not make the same pack lose
+    # its Drive identity or change its graph-preview signature merely because
+    # it is now present in the local cache.
+    merged = {
+        str(summary["id"]): copy.deepcopy(summary)
+        for summary in registry_summaries
+        if summary.get("id")
+    }
     for summary in direct_summaries:
         pack_id = str(summary.get("id") or "").strip()
-        if pack_id:
-            merged[pack_id] = summary
+        if not pack_id:
+            continue
+        registry_summary = merged.get(pack_id)
+        if registry_summary is None:
+            merged[pack_id] = copy.deepcopy(summary)
+            continue
+        merged[pack_id] = {
+            **copy.deepcopy(summary),
+            **registry_summary,
+        }
     return sorted(
         merged.values(),
         key=lambda item: (str(item.get("title") or "").casefold(), str(item.get("id") or "")),

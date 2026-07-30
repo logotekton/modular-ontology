@@ -66,6 +66,47 @@ def test_graph_and_mcp_share_exact_registry_lazy_fetch(monkeypatch, tmp_path: Pa
     assert requested == [pack_id]
 
 
+def test_ephemeral_summary_merge_keeps_registry_identity_after_lazy_fetch() -> None:
+    from modular_ontology import graph_preview, pack_index
+
+    registry_summary = {
+        "id": "law-pack",
+        "title": "Registry title",
+        "sizeBytes": 120,
+        "counts": {"nodes": 4, "edges": 3, "documents": 2},
+        "drive": {
+            "fileId": "drive-file",
+            "modifiedTime": "2026-07-07T22:46:44.000Z",
+            "sizeBytes": 120,
+        },
+    }
+    direct_summary = {
+        "id": "law-pack",
+        "title": "Direct cache title",
+        "sizeBytes": 120,
+        "counts": {"nodes": 4, "edges": 3, "documents": 2},
+        "cacheOnly": True,
+    }
+
+    merged = pack_index._merge_pack_summaries(
+        [registry_summary],
+        [direct_summary],
+    )
+
+    assert merged == [{**direct_summary, **registry_summary}]
+    assert merged[0]["drive"] == registry_summary["drive"]
+    assert merged[0]["cacheOnly"] is True
+    assert graph_preview.graph_pack_signature(
+        ["law-pack"],
+        merged,
+        registry_generation="registry-v1",
+    ) == graph_preview.graph_pack_signature(
+        ["law-pack"],
+        [registry_summary],
+        registry_generation="registry-v1",
+    )
+
+
 def test_compact_db_never_silently_returns_empty_graph_when_payload_is_expected(monkeypatch) -> None:
     from modular_ontology import pack_index
 

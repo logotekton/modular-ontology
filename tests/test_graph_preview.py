@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from modular_ontology import graph_preview
+from modular_ontology import graph_preview, pack_index
 from scripts import build_graph_previews as preview_builder
 
 
@@ -126,6 +126,44 @@ def test_preview_loads_exact_signature_and_adapts_project_metadata(monkeypatch, 
     assert result["pack"]["id"] == "runtime"
     assert result["pack"]["title"] == "Runtime Project"
     assert result["diagnostics"]["graphCache"] == "preview"
+
+
+def test_preview_signature_survives_lazy_direct_pack_cache(monkeypatch, tmp_path: Path) -> None:
+    registry_summaries = _summaries()
+    direct_summaries = [
+        {
+            "id": summary["id"],
+            "title": f"Direct {summary['id']}",
+            "sizeBytes": summary["sizeBytes"],
+            "counts": dict(summary["counts"]),
+        }
+        for summary in registry_summaries
+    ]
+    merged_summaries = pack_index._merge_pack_summaries(
+        registry_summaries,
+        direct_summaries,
+    )
+    preview_dir = tmp_path / "previews"
+    _write_preview(preview_dir, registry_summaries)
+    monkeypatch.setenv("MODULAR_ONTOLOGY_GRAPH_PREVIEW_DIR", str(preview_dir))
+    graph_preview.invalidate_graph_cache()
+
+    payload = graph_preview.load_graph_preview(
+        ["pack-a", "pack-b"],
+        pack_summaries=merged_summaries,
+        max_nodes=20_000,
+        max_edges=50_000,
+    )
+
+    assert payload is not None
+    assert payload["activePackIds"] == ["pack-a", "pack-b"]
+    assert graph_preview.graph_pack_signature(
+        ["pack-a", "pack-b"],
+        merged_summaries,
+    ) == graph_preview.graph_pack_signature(
+        ["pack-a", "pack-b"],
+        registry_summaries,
+    )
 
 
 def test_stale_preview_falls_back_once_then_hits_memory_cache(monkeypatch, tmp_path: Path) -> None:
@@ -529,10 +567,31 @@ def test_bundled_preview_generation_is_complete_and_self_consistent() -> None:
     preview_dir = graph_preview.DEFAULT_GRAPH_PREVIEW_DIR
     manifest = json.loads((preview_dir / "manifest.json").read_text(encoding="utf-8"))
     entries = manifest["entries"]
+    registry = json.loads(
+        (preview_builder.REPOSITORY / "data" / "01_Database" / "pack_registry.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    packs = [pack for pack in registry["packs"] if isinstance(pack, dict) and pack.get("id")]
+    projects = [project for project in registry["projects"] if isinstance(project, dict)]
+    expected_selections = preview_builder._large_ui_selections(
+        projects,
+        {str(pack["id"]): pack for pack in packs},
+        threshold=manifest["selectionThreshold"],
+        max_combinations=manifest["budgets"]["maxCombinations"],
+    )
+    expected_keys = {
+        graph_preview.graph_selection_key(
+            list(pack_ids),
+            manifest["maxNodes"],
+            manifest["maxEdges"],
+        )
+        for pack_ids in expected_selections
+    }
 
     assert manifest["version"] == graph_preview.GRAPH_PREVIEW_VERSION
     assert manifest["algorithm"] == graph_preview.GRAPH_PREVIEW_ALGORITHM
-    assert len(entries) == 28
+    assert set(entries) == expected_keys
     assert {path.name for path in preview_dir.glob("*.json.gz")} == {
         entry["file"] for entry in entries.values()
     }
@@ -550,3 +609,8 @@ def test_bundled_preview_generation_is_complete_and_self_consistent() -> None:
         assert payload["activePackIds"] == entry["packIds"]
         assert len(payload["nodes"]) == entry["visibleNodes"]
         assert len(payload["edges"]) == entry["visibleEdges"]
+        assert entry["packSignature"] == graph_preview.graph_pack_signature(
+            entry["packIds"],
+            packs,
+            registry_generation=str(registry.get("generatedAt") or registry.get("generation") or ""),
+        )
