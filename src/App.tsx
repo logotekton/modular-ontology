@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { DragEvent } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -31,8 +31,13 @@ import type { LocalEdge, LocalNode, ParsedLocalPack } from "./localPacks";
 import { OntologyGraph } from "./OntologyGraph";
 import type { OgController, OgDetail } from "./OntologyGraph";
 import { AiChatPanel } from "./app/ai-chat/AiChatPanel";
+import { getJson, HttpError, isAbortError, request } from "./api/http";
+import { getFullGraphManifest, loadFullGraph } from "./graph/fullGraphLoader";
+import type {
+  FullGraphManifest,
+  FullGraphProgress,
+} from "./graph/fullGraphLoader";
 
-const API_BASE = "";
 const OPENAI_CHAT_MODEL = "gpt-4.1-mini";
 
 type Pack = {
@@ -91,12 +96,17 @@ type IfcModel = {
 
 type GraphNode = {
   id: string;
+  originalId?: string;
+  occurrence?: number;
   label: string;
   type: string;
   packId?: string;
   color: string;
   size: number;
   properties: Record<string, unknown>;
+  x?: number;
+  y?: number;
+  placeholder?: boolean;
 };
 
 type GraphEdge = {
@@ -120,6 +130,24 @@ type GraphPayload = {
     totalNodes: number;
     totalEdges: number;
   };
+  graphFormat?: "legacy-json" | "full-chunks";
+  transferredBytes?: number;
+  placeholderNodes?: number;
+};
+
+type GraphInflightRequest = {
+  controller: AbortController;
+  consumers: number;
+  promise: Promise<GraphPayload>;
+};
+
+const GRAPH_FETCH_DEBOUNCE_MS = 180;
+const GRAPH_CACHE_LIMIT = 1;
+const GRAPH_CACHE_MAX_ESTIMATED_BYTES = 96 * 1024 * 1024;
+
+type CachedGraph = {
+  payload: GraphPayload;
+  estimatedBytes: number;
 };
 
 type AiKeyStatus = "missing" | "untested" | "testing" | "valid" | "invalid";
@@ -132,6 +160,15 @@ type IndexStats = {
   documents: number;
   nodes: number;
   edges: number;
+};
+
+type BootstrapPayload = {
+  authenticated: boolean;
+  user: CurrentUser | null;
+  packs: Pack[];
+  projects: Project[];
+  ifcModels: IfcModel[];
+  stats?: IndexStats;
 };
 
 type QueryEvidence = {
@@ -410,6 +447,17 @@ function groupPacksForDisplay(packs: Pack[]): PackDisplayGroup[] {
   return groups;
 }
 
+function graphPackGroupSelection(project: Project, packId: string, packs: Pack[]) {
+  const packsById = new Map(packs.map((pack) => [pack.id, pack]));
+  const projectPacks = project.packIds
+    .map((projectPackId) => packsById.get(projectPackId))
+    .filter((pack): pack is Pack => Boolean(pack));
+  return (
+    groupPacksForDisplay(projectPacks).find((group) => group.packIds.includes(packId))
+      ?.packIds ?? [packId]
+  );
+}
+
 function roleLabel(role?: string | null) {
   if (!role) return ROLE_LABELS.guest;
   return ROLE_LABELS[role] ?? role;
@@ -424,12 +472,58 @@ function validationLabel(status?: string) {
   return status;
 }
 
-async function getJson<T>(path: string, token?: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-  });
-  if (!res.ok) throw new Error(await res.text());
-  return res.json() as Promise<T>;
+function httpErrorDetail(error: unknown, fallback: string) {
+  if (error instanceof HttpError && error.body && typeof error.body === "object") {
+    const detail = (error.body as { detail?: unknown }).detail;
+    if (typeof detail === "string" && detail) return detail;
+  }
+  return fallback;
+}
+
+function estimateGraphMemory(payload: GraphPayload) {
+  // Compact topology objects are substantially smaller than legacy nodes with
+  // nested properties. This deliberately overestimates the common full-graph
+  // payload so the single-entry cache never keeps an unexpectedly giant graph.
+  return payload.nodes.length * 320 + payload.edges.length * 176;
+}
+
+function fullGraphTotals(manifest: FullGraphManifest) {
+  const totals = (manifest.totals ?? manifest.stats ?? {}) as Record<string, unknown>;
+  return {
+    nodes: Number(manifest.totalNodes ?? totals.totalNodes ?? totals.nodes ?? 0) || 0,
+    edges: Number(manifest.totalEdges ?? totals.totalEdges ?? totals.edges ?? 0) || 0,
+  };
+}
+
+function graphProgressText(progress: FullGraphProgress | null) {
+  if (!progress) return "전체 그래프 준비 중";
+  if (progress.phase === "manifest") return "전체 그래프 매니페스트 확인 중";
+  const nodes = `${progress.loadedNodes.toLocaleString()} / ${progress.totalNodes.toLocaleString()} 노드`;
+  const edges = `${progress.loadedEdges.toLocaleString()} / ${progress.totalEdges.toLocaleString()} 엣지`;
+  const chunks = `${progress.loadedChunks.toLocaleString()} / ${progress.totalChunks.toLocaleString()} 청크`;
+  return `${progress.phase === "download" ? "다운로드" : "해석"} · ${nodes} · ${edges} · ${chunks}`;
+}
+
+function nodeDetailProperties(payload: unknown) {
+  if (!payload || typeof payload !== "object") return null;
+  const record = payload as Record<string, unknown>;
+  const node =
+    record.node && typeof record.node === "object"
+      ? (record.node as Record<string, unknown>)
+      : record;
+  const properties =
+    node.properties && typeof node.properties === "object"
+      ? (node.properties as Record<string, unknown>)
+      : record.properties && typeof record.properties === "object"
+        ? (record.properties as Record<string, unknown>)
+        : null;
+  if (!properties) return null;
+  return {
+    properties,
+    label: typeof node.label === "string" ? node.label : undefined,
+    type: typeof node.type === "string" ? node.type : undefined,
+    color: typeof node.color === "string" ? node.color : undefined,
+  };
 }
 
 function App() {
@@ -440,6 +534,12 @@ function App() {
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [selectedGraphPackIds, setSelectedGraphPackIds] = useState<string[]>([]);
   const [graph, setGraph] = useState<GraphPayload | null>(null);
+  const [graphLoading, setGraphLoading] = useState(false);
+  const [graphDataRevision, setGraphDataRevision] = useState(0);
+  const graphCacheRef = useRef<Map<string, CachedGraph>>(new Map());
+  const graphInflightRef = useRef<Map<string, GraphInflightRequest>>(new Map());
+  const graphDetailRequestRef = useRef<AbortController | null>(null);
+  const [graphProgress, setGraphProgress] = useState<FullGraphProgress | null>(null);
   const [localGraph, setLocalGraph] = useState<GraphPayload | null>(null);
   const [localPackCount, setLocalPackCount] = useState(0);
   const [localPackStatus, setLocalPackStatus] = useState("");
@@ -536,9 +636,19 @@ function App() {
   const skipNextSessionRefreshRef = useRef("");
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? projects[0];
   const selectedPackId = selectedGraphPackIds[0] ?? selectedProject?.packIds[0] ?? "";
-  const graphPackOptions = selectedProject
-    ? packs.filter((pack) => selectedProject.packIds.includes(pack.id))
-    : [];
+  const activeGraphPackIds = useMemo(() => {
+    if (!selectedProject) return [];
+    const selectedPackIds = new Set(selectedGraphPackIds);
+    return selectedProject.packIds.filter((packId) => selectedPackIds.has(packId));
+  }, [selectedGraphPackIds, selectedProject]);
+  const graphSelectionKey = activeGraphPackIds.join(",");
+  const graphPackOptions = useMemo(() => {
+    if (!selectedProject) return [];
+    const packsById = new Map(packs.map((pack) => [pack.id, pack]));
+    return selectedProject.packIds
+      .map((packId) => packsById.get(packId))
+      .filter((pack): pack is Pack => Boolean(pack));
+  }, [packs, selectedProject]);
   const graphPackGroups = groupPacksForDisplay(graphPackOptions);
   const visibleNav = nav.filter((item) => !["Admin", "Sync"].includes(item.label) || currentUser?.role === "admin");
 
@@ -561,6 +671,108 @@ function App() {
       }
       return [...current, ...group.packIds.filter((packId) => !current.includes(packId))];
     });
+  }
+
+  function readCachedGraph(key: string) {
+    const cache = graphCacheRef.current;
+    const entry = cache.get(key);
+    if (!entry) return null;
+    cache.delete(key);
+    cache.set(key, entry);
+    return entry.payload;
+  }
+
+  function cacheGraph(key: string, payload: GraphPayload) {
+    const cache = graphCacheRef.current;
+    const estimatedBytes = estimateGraphMemory(payload);
+    cache.clear();
+    if (estimatedBytes > GRAPH_CACHE_MAX_ESTIMATED_BYTES) return;
+    cache.set(key, { payload, estimatedBytes });
+    while (cache.size > GRAPH_CACHE_LIMIT) {
+      const oldestKey = cache.keys().next().value;
+      if (oldestKey === undefined) break;
+      cache.delete(oldestKey);
+    }
+  }
+
+  function invalidateGraphCache() {
+    graphCacheRef.current.clear();
+    for (const requestEntry of graphInflightRef.current.values()) {
+      requestEntry.controller.abort();
+    }
+    graphInflightRef.current.clear();
+    setGraphDataRevision((revision) => revision + 1);
+  }
+
+  function handleGraphDetail(detail: OgDetail<GraphNode> | null) {
+    graphDetailRequestRef.current?.abort();
+    graphDetailRequestRef.current = null;
+    setGraphDetail(detail);
+    if (
+      !detail ||
+      localGraph ||
+      graph?.graphFormat !== "full-chunks" ||
+      detail.node.placeholder ||
+      !authToken
+    ) {
+      return;
+    }
+    const projectId = graph.project?.id || selectedProjectId;
+    if (!projectId) return;
+    const controller = new AbortController();
+    graphDetailRequestRef.current = controller;
+    const query = new URLSearchParams({ node_id: detail.id });
+    if (detail.node.originalId) query.set("original_id", detail.node.originalId);
+    if (Number.isSafeInteger(detail.node.occurrence)) {
+      query.set("occurrence", String(detail.node.occurrence));
+    }
+    void getJson<unknown>(
+      `/api/projects/${encodeURIComponent(projectId)}/graph/full/node?${query.toString()}`,
+      { token: authToken, signal: controller.signal },
+    )
+      .then((payload) => {
+        const hydrated = nodeDetailProperties(payload);
+        if (!hydrated) return;
+        setGraphDetail((current) => {
+          if (!current || current.id !== detail.id) return current;
+          const node = {
+            ...current.node,
+            ...(hydrated.label ? { label: hydrated.label } : {}),
+            ...(hydrated.type ? { type: hydrated.type } : {}),
+            ...(hydrated.color ? { color: hydrated.color } : {}),
+            properties: { ...current.node.properties, ...hydrated.properties },
+          };
+          return {
+            ...current,
+            node,
+            label: hydrated.label ?? current.label,
+            type: hydrated.type ?? current.type,
+            color: hydrated.color ?? current.color,
+            props: { ...current.props, ...hydrated.properties },
+          };
+        });
+        setSelectedNode((current) =>
+          current?.id === detail.id
+            ? {
+                ...current,
+                ...(hydrated.label ? { label: hydrated.label } : {}),
+                ...(hydrated.type ? { type: hydrated.type } : {}),
+                ...(hydrated.color ? { color: hydrated.color } : {}),
+                properties: { ...current.properties, ...hydrated.properties },
+              }
+            : current,
+        );
+      })
+      .catch((error: unknown) => {
+        if (isAbortError(error)) return;
+        // Topology interaction remains complete when an older backend does not
+        // yet expose the optional heavy-property detail endpoint.
+      })
+      .finally(() => {
+        if (graphDetailRequestRef.current === controller) {
+          graphDetailRequestRef.current = null;
+        }
+      });
   }
 
   function confirmAction(options: ConfirmDialogOptions) {
@@ -637,18 +849,27 @@ function App() {
   }, [authToken]);
 
   useEffect(() => {
-    if (currentUser?.role === "admin") {
-      refreshAdminDirectory().catch(() => {
-        setManagedUsers([]);
-        setCompanies([]);
-        setCompanyProjectAccess({});
-      });
-      return;
+    graphCacheRef.current.clear();
+    for (const requestEntry of graphInflightRef.current.values()) {
+      requestEntry.controller.abort();
     }
+    graphInflightRef.current.clear();
+  }, [authToken]);
+
+  useEffect(
+    () => () => {
+      graphDetailRequestRef.current?.abort();
+      graphDetailRequestRef.current = null;
+    },
+    [selectedProjectId, authToken],
+  );
+
+  useEffect(() => {
+    if (currentUser?.role === "admin") return;
     setManagedUsers([]);
     setCompanies([]);
     setCompanyProjectAccess({});
-  }, [currentUser?.role, authToken]);
+  }, [currentUser?.role]);
 
   useEffect(() => {
     if (currentUser && currentUser.role !== "admin" && ["Admin", "Sync"].includes(activeTab)) {
@@ -659,10 +880,17 @@ function App() {
   useEffect(() => {
     if (activeTab !== "Admin" || currentUser?.role !== "admin" || !authToken) return;
     let cancelled = false;
-    const refresh = () => {
-      refreshAdminDirectory().catch(() => {
+    let refreshing = false;
+    const refresh = async () => {
+      if (refreshing) return;
+      refreshing = true;
+      try {
+        await refreshAdminDirectory();
+      } catch {
         if (!cancelled) setUploadStatus("관리자 목록 새로고침 실패");
-      });
+      } finally {
+        refreshing = false;
+      }
     };
     const refreshOnVisible = () => {
       if (document.visibilityState === "visible") refresh();
@@ -698,49 +926,160 @@ function App() {
   }, [projects, selectedProjectId]);
 
   useEffect(() => {
-    if (!selectedProjectId) return;
-    const project = projects.find((item) => item.id === selectedProjectId);
-    if (!project) return;
-    const activePackIds = selectedGraphPackIds.filter((packId) => project.packIds.includes(packId));
-    if (!activePackIds.length) {
+    if (!selectedProjectId) {
+      setGraphLoading(false);
+      setGraphProgress(null);
+      return;
+    }
+    if (!graphSelectionKey) {
       setSelectedNode(null);
       setAiMessages([]);
       setAiQuestion("");
       setGraph(null);
+      setGraphLoading(false);
+      setGraphProgress(null);
       setStatus("표시할 팩을 선택하세요");
       return;
     }
+    if (activeTab !== "Graph Explorer") return;
+
     let active = true;
+    let activeRequest: GraphInflightRequest | null = null;
     setSelectedNode(null);
     setGraphDetail(null);
     setAiMessages([]);
     setAiQuestion("");
-    setGraph(null);
-    setStatus("그래프 불러오는 중");
-    const query = new URLSearchParams({
-      // OntologyGraph 엔진은 차수 필터로 표시량을 관리하므로 캡을 크게 잡는다
-      max_nodes: "20000",
-      max_edges: "50000",
-      pack_ids: activePackIds.join(","),
+    const requestKey = `${selectedProjectId}\u0000${graphSelectionKey}`;
+    const cachedPayload = readCachedGraph(requestKey);
+    if (cachedPayload) {
+      setGraph(cachedPayload);
+      setGraphLoading(false);
+      setGraphProgress(null);
+      setStatus(cachedPayload.graphFormat === "full-chunks" ? "전체 그래프 준비됨" : "준비됨");
+      return;
+    }
+
+    setGraphLoading(true);
+    setGraphProgress({
+      phase: "manifest",
+      loadedBytes: 0,
+      totalBytes: 0,
+      loadedChunks: 0,
+      totalChunks: 0,
+      loadedNodes: 0,
+      totalNodes: 0,
+      loadedEdges: 0,
+      totalEdges: 0,
     });
-    getJson<GraphPayload>(`/api/projects/${encodeURIComponent(selectedProjectId)}/graph?${query.toString()}`, authToken)
-      .then((payload) => {
-        if (!active) return;
-        setGraph(payload);
-        setStatus("준비됨");
-      })
-      .catch((error: Error) => {
-        if (active) setStatus(error.message);
-      });
+    setStatus(graph ? "그래프 새로 고치는 중" : "그래프 불러오는 중");
+    const timeoutId = window.setTimeout(() => {
+      if (!active) return;
+      let requestEntry = graphInflightRef.current.get(requestKey);
+      if (!requestEntry) {
+        const controller = new AbortController();
+        const packIds = [...activeGraphPackIds];
+        const projectSnapshot = selectedProject;
+        const packOptionsSnapshot = [...graphPackOptions];
+        const promise = (async () => {
+          const manifest = await getFullGraphManifest({
+            projectId: selectedProjectId,
+            packIds,
+            token: authToken,
+            signal: controller.signal,
+          });
+          const result = await loadFullGraph({
+            manifest,
+            token: authToken,
+            signal: controller.signal,
+            onProgress: (progress) => {
+              if (active) setGraphProgress(progress);
+            },
+          });
+          const totals = fullGraphTotals(manifest);
+          const fallbackPack: Pack = packOptionsSnapshot[0] ?? {
+            id: `${selectedProjectId}:full-graph`,
+            title: manifest.projectName || projectSnapshot?.name || "프로젝트 전체 그래프",
+            filename: "full-graph-v3",
+            source: "project-full-graph",
+            validationStatus: "ready",
+            counts: { nodes: totals.nodes, edges: totals.edges },
+          };
+          const payload: GraphPayload = {
+            pack: fallbackPack,
+            project: projectSnapshot,
+            packs: packOptionsSnapshot,
+            activePackIds: manifest.packIds ?? packIds,
+            nodes: result.nodes,
+            edges: result.edges,
+            stats: {
+              visibleNodes: result.nodes.length,
+              visibleEdges: result.edges.length,
+              totalNodes: Math.max(totals.nodes, result.nodes.length),
+              totalEdges: Math.max(totals.edges, result.edges.length),
+            },
+            graphFormat: "full-chunks",
+            transferredBytes: result.transferredBytes,
+            placeholderNodes: result.placeholderCount,
+          };
+          cacheGraph(requestKey, payload);
+          return payload;
+        })();
+        requestEntry = { controller, consumers: 0, promise };
+        graphInflightRef.current.set(requestKey, requestEntry);
+        promise.then(
+          () => {
+            if (graphInflightRef.current.get(requestKey) === requestEntry) {
+              graphInflightRef.current.delete(requestKey);
+            }
+          },
+          () => {
+            if (graphInflightRef.current.get(requestKey) === requestEntry) {
+              graphInflightRef.current.delete(requestKey);
+            }
+          }
+        );
+      }
+      activeRequest = requestEntry;
+      requestEntry.consumers += 1;
+      requestEntry.promise
+        .then((payload) => {
+          if (!active) return;
+          setGraph(payload);
+          setGraphLoading(false);
+          setGraphProgress(null);
+          setStatus(
+            payload.graphFormat === "full-chunks"
+              ? "전체 그래프 준비됨"
+              : "호환 모드로 불러옴 · 전체 그래프 아티팩트를 다시 생성하세요",
+          );
+        })
+        .catch((error: unknown) => {
+          if (!active || isAbortError(error)) return;
+          setGraph(null);
+          setSelectedNode(null);
+          setGraphDetail(null);
+          setGraphLoading(false);
+          setGraphProgress(null);
+          setStatus(error instanceof Error ? error.message : String(error));
+        });
+    }, GRAPH_FETCH_DEBOUNCE_MS);
+
     return () => {
       active = false;
+      window.clearTimeout(timeoutId);
+      if (!activeRequest) return;
+      activeRequest.consumers = Math.max(0, activeRequest.consumers - 1);
+      if (activeRequest.consumers === 0 && graphInflightRef.current.get(requestKey) === activeRequest) {
+        activeRequest.controller.abort();
+        graphInflightRef.current.delete(requestKey);
+      }
     };
-  }, [projects, selectedProjectId, selectedGraphPackIds, authToken]);
+  }, [activeTab, selectedProjectId, graphSelectionKey, authToken, graphDataRevision]);
 
   async function refreshPublicStatus(token = authToken) {
     const tasks: Promise<unknown>[] = [getJson<IndexStats>("/api/index/status").then(setIndexStats)];
     if (token) {
-      tasks.push(getJson<McpStatus>("/api/mcp/status", token).then(setMcpStatus));
+      tasks.push(getJson<McpStatus>("/api/mcp/status", { token }).then(setMcpStatus));
     }
     await Promise.all(tasks);
   }
@@ -750,36 +1089,40 @@ function App() {
       setUploadStatus("로그인 후 MCP URL을 재발급할 수 있습니다.");
       return;
     }
-    const res = await fetch("/api/mcp/user-url/regenerate", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${authToken}` },
-    });
-    if (!res.ok) {
-      setUploadStatus(await res.text());
-      return;
+    try {
+      const payload = await getJson<McpStatus>("/api/mcp/user-url/regenerate", { method: "POST", token: authToken });
+      setMcpStatus(payload);
+      setUploadStatus("MCP URL이 재발급되었습니다.");
+    } catch (error) {
+      setUploadStatus(error instanceof Error ? error.message : String(error));
     }
-    const payload = (await res.json()) as McpStatus;
-    setMcpStatus(payload);
-    setUploadStatus("MCP URL이 재발급되었습니다.");
   }
 
   async function refreshData(nextPackId?: string, token = authToken) {
-    const [packData, projectData, ifcModelData] = await Promise.all([
-      getJson<Pack[]>("/api/packs", token),
-      getJson<Project[]>("/api/projects", token),
-      getJson<IfcModel[]>("/api/ifc/models", token).catch(() => []),
-    ]);
+    const payload = await getJson<BootstrapPayload>("/api/bootstrap", { token });
+    if (!payload.authenticated || !payload.user) {
+      throw new Error("로그인 세션이 만료되었습니다.");
+    }
+    const packData = payload.packs;
+    const projectData = payload.projects;
+    const ifcModelData = payload.ifcModels;
+    invalidateGraphCache();
+    setCurrentUser(payload.user);
     setPacks(packData);
     setProjects(projectData);
     setIfcModels(ifcModelData);
-    refreshPublicStatus(token).catch(() => undefined);
+    if (payload.stats) setIndexStats(payload.stats);
     const nextProject =
       (nextPackId && projectData.find((project) => project.packIds.includes(nextPackId))) ||
       (selectedProjectId && projectData.find((project) => project.id === selectedProjectId)) ||
       projectData[0];
     if (nextProject) {
       setSelectedProjectId(nextProject.id);
-      setSelectedGraphPackIds(nextPackId && nextProject.packIds.includes(nextPackId) ? [nextPackId] : []);
+      setSelectedGraphPackIds(
+        nextPackId && nextProject.packIds.includes(nextPackId)
+          ? graphPackGroupSelection(nextProject, nextPackId, packData)
+          : [],
+      );
     } else {
       setSelectedProjectId("");
       setSelectedGraphPackIds([]);
@@ -792,12 +1135,25 @@ function App() {
       setCurrentUser(null);
       return;
     }
-    const res = await fetch("/api/auth/me", { headers: { Authorization: `Bearer ${token}` } });
-    const payload = (await res.json()) as { authenticated: boolean; user: CurrentUser | null };
+    const payload = await getJson<BootstrapPayload>("/api/bootstrap", { token });
     const user = payload.authenticated ? payload.user : null;
     setCurrentUser(user);
     if (user) {
-      await refreshData(undefined, token);
+      invalidateGraphCache();
+      setPacks(payload.packs);
+      setProjects(payload.projects);
+      setIfcModels(payload.ifcModels);
+      if (payload.stats) setIndexStats(payload.stats);
+      const nextProject =
+        (selectedProjectId && payload.projects.find((project) => project.id === selectedProjectId)) ||
+        payload.projects[0];
+      setSelectedProjectId(nextProject?.id ?? "");
+      setSelectedGraphPackIds([]);
+      setStatus("Ready");
+    } else {
+      setPacks([]);
+      setProjects([]);
+      setIfcModels([]);
     }
   }
 
@@ -806,17 +1162,17 @@ function App() {
       setUploadStatus("이메일과 비밀번호를 입력하세요.");
       return;
     }
-    const res = await fetch("/api/auth/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: loginEmail, password: loginPassword }),
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "로그인 실패");
+    let payload: { token: string; user: CurrentUser };
+    try {
+      payload = await getJson("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: loginEmail, password: loginPassword }),
+      });
+    } catch (error) {
+      setUploadStatus(httpErrorDetail(error, "로그인 실패"));
       return;
     }
-    const payload = (await res.json()) as { token: string; user: CurrentUser };
     localStorage.setItem("modularOntologyToken", payload.token);
     skipNextSessionRefreshRef.current = payload.token;
     setAuthToken(payload.token);
@@ -833,14 +1189,14 @@ function App() {
       setUploadStatus("회원가입에는 이메일과 비밀번호가 필요합니다.");
       return;
     }
-    const res = await fetch("/api/auth/register", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(signupForm),
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "회원가입 실패");
+    try {
+      await request("/api/auth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(signupForm),
+      });
+    } catch (error) {
+      setUploadStatus(httpErrorDetail(error, "회원가입 실패"));
       return;
     }
     setSignupForm({ name: "", company: "", email: "", password: "" });
@@ -850,31 +1206,19 @@ function App() {
 
   async function fetchAdminUsers() {
     if (!authToken) return;
-    const res = await fetch("/api/admin/users", {
-      headers: { Authorization: `Bearer ${authToken}` },
-    });
-    if (!res.ok) throw new Error(await res.text());
-    const payload = (await res.json()) as { users: ManagedUser[] };
+    const payload = await getJson<{ users: ManagedUser[] }>("/api/admin/users", { token: authToken });
     setManagedUsers(payload.users);
   }
 
   async function fetchAdminCompanies() {
     if (!authToken) return;
-    const res = await fetch("/api/admin/companies", {
-      headers: { Authorization: `Bearer ${authToken}` },
-    });
-    if (!res.ok) throw new Error(await res.text());
-    const payload = (await res.json()) as { companies: string[] };
+    const payload = await getJson<{ companies: string[] }>("/api/admin/companies", { token: authToken });
     setCompanies(payload.companies);
   }
 
   async function fetchCompanyProjectAccess() {
     if (!authToken) return;
-    const res = await fetch("/api/admin/company-project-access", {
-      headers: { Authorization: `Bearer ${authToken}` },
-    });
-    if (!res.ok) throw new Error(await res.text());
-    const payload = (await res.json()) as { access: CompanyProjectAccess };
+    const payload = await getJson<{ access: CompanyProjectAccess }>("/api/admin/company-project-access", { token: authToken });
     setCompanyProjectAccess(payload.access);
   }
 
@@ -883,12 +1227,14 @@ function App() {
   }
 
   async function approveManagedUser(email: string, role: "admin" | "member" = "member") {
-    const res = await fetch(`/api/admin/users/${encodeURIComponent(email)}/approve`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({ role }),
-    });
-    if (!res.ok) {
+    try {
+      await request(`/api/admin/users/${encodeURIComponent(email)}/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
+        body: JSON.stringify({ role }),
+      });
+    } catch {
       setUploadStatus("회원 승인 실패");
       return;
     }
@@ -897,12 +1243,14 @@ function App() {
   }
 
   async function updateManagedUserRole(email: string, role: "admin" | "member") {
-    const res = await fetch(`/api/admin/users/${encodeURIComponent(email)}/role`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({ role }),
-    });
-    if (!res.ok) {
+    try {
+      await request(`/api/admin/users/${encodeURIComponent(email)}/role`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
+        body: JSON.stringify({ role }),
+      });
+    } catch {
       setUploadStatus("권한 변경 실패");
       return;
     }
@@ -911,12 +1259,14 @@ function App() {
   }
 
   async function addManagedCompany(name: string) {
-    const res = await fetch("/api/admin/companies", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({ name }),
-    });
-    if (!res.ok) {
+    try {
+      await request("/api/admin/companies", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
+        body: JSON.stringify({ name }),
+      });
+    } catch {
       setUploadStatus("회사 추가 실패");
       return;
     }
@@ -925,12 +1275,14 @@ function App() {
   }
 
   async function renameManagedCompany(name: string, newName: string) {
-    const res = await fetch("/api/admin/companies/rename", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({ name, new_name: newName }),
-    });
-    if (!res.ok) {
+    try {
+      await request("/api/admin/companies/rename", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
+        body: JSON.stringify({ name, new_name: newName }),
+      });
+    } catch {
       setUploadStatus("회사명 수정 실패");
       return;
     }
@@ -940,28 +1292,25 @@ function App() {
 
   async function deleteManagedCompany(name: string, deleteUsers = false) {
     const query = deleteUsers ? "?delete_users=true" : "";
-    const res = await fetch(`/api/admin/companies/${encodeURIComponent(name)}${query}`, {
-      method: "DELETE",
-      headers: { Authorization: `Bearer ${authToken}` },
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "회사 삭제 실패");
+    let payload: { deletedUsers?: number };
+    try {
+      payload = await getJson(`/api/admin/companies/${encodeURIComponent(name)}${query}`, {
+        method: "DELETE",
+        token: authToken,
+      });
+    } catch (error) {
+      setUploadStatus(httpErrorDetail(error, "회사 삭제 실패"));
       return;
     }
     await refreshAdminDirectory();
-    const payload = (await res.json()) as { deletedUsers?: number };
     setUploadStatus(`${name} 회사를 삭제했습니다.${payload.deletedUsers ? ` 함께 삭제된 회원 ${payload.deletedUsers}명.` : ""}`);
   }
 
   async function deleteManagedUser(email: string) {
-    const res = await fetch(`/api/admin/users/${encodeURIComponent(email)}`, {
-      method: "DELETE",
-      headers: { Authorization: `Bearer ${authToken}` },
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "회원 삭제 실패");
+    try {
+      await request(`/api/admin/users/${encodeURIComponent(email)}`, { method: "DELETE", token: authToken });
+    } catch (error) {
+      setUploadStatus(httpErrorDetail(error, "회원 삭제 실패"));
       return;
     }
     await refreshAdminDirectory();
@@ -969,12 +1318,14 @@ function App() {
   }
 
   async function moveManagedUserCompany(email: string, company: string) {
-    const res = await fetch(`/api/admin/users/${encodeURIComponent(email)}/company`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({ company }),
-    });
-    if (!res.ok) {
+    try {
+      await request(`/api/admin/users/${encodeURIComponent(email)}/company`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
+        body: JSON.stringify({ company }),
+      });
+    } catch {
       setUploadStatus("회원 회사 이동 실패");
       return;
     }
@@ -983,17 +1334,18 @@ function App() {
   }
 
   async function updateCompanyProjectAccess(company: string, projectIds: string[]) {
-    const res = await fetch(`/api/admin/companies/${encodeURIComponent(company)}/projects`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({ project_ids: projectIds }),
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "프로젝트 접근권한 저장 실패");
+    let payload: { access: CompanyProjectAccess };
+    try {
+      payload = await getJson(`/api/admin/companies/${encodeURIComponent(company)}/projects`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
+        body: JSON.stringify({ project_ids: projectIds }),
+      });
+    } catch (error) {
+      setUploadStatus(httpErrorDetail(error, "프로젝트 접근권한 저장 실패"));
       return;
     }
-    const payload = (await res.json()) as { access: CompanyProjectAccess };
     setCompanyProjectAccess(payload.access);
     await refreshData(undefined, authToken);
     setUploadStatus(`${company} 회사의 프로젝트 접근권한을 저장했습니다.`);
@@ -1005,24 +1357,25 @@ function App() {
       return null;
     }
     const isUpdate = Boolean(form.id);
-    const res = await fetch(isUpdate ? `/api/admin/projects/${encodeURIComponent(form.id || "")}` : "/api/admin/projects", {
-      method: isUpdate ? "PUT" : "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({
-        name: form.name,
-        company: form.company,
-        manager: form.manager,
-        discipline: form.discipline,
-        description: form.description,
-        pack_ids: form.packIds,
-      }),
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "프로젝트 저장 실패");
+    let payload: { project: Project };
+    try {
+      payload = await getJson(isUpdate ? `/api/admin/projects/${encodeURIComponent(form.id || "")}` : "/api/admin/projects", {
+        method: isUpdate ? "PUT" : "POST",
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
+        body: JSON.stringify({
+          name: form.name,
+          company: form.company,
+          manager: form.manager,
+          discipline: form.discipline,
+          description: form.description,
+          pack_ids: form.packIds,
+        }),
+      });
+    } catch (error) {
+      setUploadStatus(httpErrorDetail(error, "프로젝트 저장 실패"));
       return null;
     }
-    const payload = (await res.json()) as { project: Project };
     await refreshData(undefined, authToken);
     setSelectedProjectId(payload.project.id);
     setSelectedGraphPackIds([]);
@@ -1035,13 +1388,10 @@ function App() {
       setUploadStatus("관리자 세션이 필요합니다");
       return;
     }
-    const res = await fetch(`/api/admin/projects/${encodeURIComponent(projectId)}`, {
-      method: "DELETE",
-      headers: { Authorization: `Bearer ${authToken}` },
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "프로젝트 삭제 실패");
+    try {
+      await request(`/api/admin/projects/${encodeURIComponent(projectId)}`, { method: "DELETE", token: authToken });
+    } catch (error) {
+      setUploadStatus(httpErrorDetail(error, "프로젝트 삭제 실패"));
       return;
     }
     await refreshData(undefined, authToken);
@@ -1053,14 +1403,15 @@ function App() {
       setUploadStatus("관리자 세션이 필요합니다");
       return;
     }
-    const res = await fetch(`/api/admin/projects/${encodeURIComponent(projectId)}/packs`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({ pack_ids: packIds }),
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "팩 연결 저장 실패");
+    try {
+      await request(`/api/admin/projects/${encodeURIComponent(projectId)}/packs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
+        body: JSON.stringify({ pack_ids: packIds }),
+      });
+    } catch (error) {
+      setUploadStatus(httpErrorDetail(error, "팩 연결 저장 실패"));
       return;
     }
     await refreshData(undefined, authToken);
@@ -1068,10 +1419,7 @@ function App() {
   }
 
   async function logout() {
-    await fetch("/api/auth/logout", {
-      method: "POST",
-      headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
-    }).catch(() => undefined);
+    await request("/api/auth/logout", { method: "POST", token: authToken }).catch(() => undefined);
     localStorage.removeItem("modularOntologyToken");
     setAuthToken("");
     setCurrentUser(null);
@@ -1092,17 +1440,18 @@ function App() {
       setUploadStatus("관리자 세션이 필요합니다");
       return;
     }
-    const res = await fetch("/api/admin/ifc/models/link", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({ model_id: modelId, project_id: projectId }),
-    });
-    if (!res.ok) {
-      const payload = await res.json().catch(() => null);
-      setUploadStatus(payload?.detail ?? "IFC 연결 저장 실패");
+    let payload: { models: IfcModel[] };
+    try {
+      payload = await getJson("/api/admin/ifc/models/link", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
+        body: JSON.stringify({ model_id: modelId, project_id: projectId }),
+      });
+    } catch (error) {
+      setUploadStatus(httpErrorDetail(error, "IFC 연결 저장 실패"));
       return;
     }
-    const payload = (await res.json()) as { models: IfcModel[] };
     setIfcModels(payload.models);
     setUploadStatus("IFC 연결 저장 완료");
   }
@@ -1178,7 +1527,7 @@ function App() {
     const project = projects.find((item) => item.packIds.includes(packId));
     if (project) {
       setSelectedProjectId(project.id);
-      setSelectedGraphPackIds([packId]);
+      setSelectedGraphPackIds(graphPackGroupSelection(project, packId, packs));
     }
     navigateToTab("Graph Explorer");
   }
@@ -1189,19 +1538,15 @@ function App() {
     setOpenAiKeyStatus("testing");
     setOpenAiKeyMessage("");
     try {
-      const res = await fetch("/api/llm/openai/validate", {
+      const payload = await getJson<{ valid?: boolean; error?: string }>("/api/llm/openai/validate", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-        },
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
         body: JSON.stringify({
           openai_api_key: userOpenAiKey,
           openai_model: OPENAI_CHAT_MODEL,
         }),
       });
-      if (!res.ok) throw new Error(await res.text());
-      const payload = (await res.json()) as { valid?: boolean; error?: string };
       if (payload.valid) {
         setOpenAiKeyStatus("valid");
         setOpenAiKeyMessage("OpenAI key validated.");
@@ -1250,12 +1595,15 @@ function App() {
     setAiQuestion("");
     setAiLoading(true);
     try {
-      const res = await fetch("/api/query", {
+      const payload = await getJson<{
+        answer?: string;
+        evidence?: QueryEvidence[];
+        llmError?: string | null;
+        mode?: string;
+      }>("/api/query", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-        },
+        headers: { "Content-Type": "application/json" },
+        token: authToken,
         body: JSON.stringify({
           pack_id: targetPackId,
           question,
@@ -1264,13 +1612,6 @@ function App() {
           openai_model: OPENAI_CHAT_MODEL,
         }),
       });
-      if (!res.ok) throw new Error(await res.text());
-      const payload = (await res.json()) as {
-        answer?: string;
-        evidence?: QueryEvidence[];
-        llmError?: string | null;
-        mode?: string;
-      };
       const fallbackAnswer = payload.answer || "답변을 생성하지 못했습니다.";
       const content = payload.llmError
         ? `${formatAiQueryWarning(payload.llmError)}\n\nFallback Graph RAG answer:\n${fallbackAnswer}`
@@ -1554,7 +1895,7 @@ function App() {
                   {localGraph
                     ? `${localGraph.pack.title} (세션 전용 · 서버 미등록)`
                     : selectedProject?.name ?? graph?.pack.title ?? status}
-                  {!localGraph && graphPackOptions.length ? ` / ${selectedGraphPackIds.length}개 팩 표시` : ""}
+                  {!localGraph && graphPackOptions.length ? ` / ${activeGraphPackIds.length}개 팩 표시` : ""}
                 </span>
               </div>
               <div className="graph-local-actions">
@@ -1588,6 +1929,25 @@ function App() {
               </div>
             </div>
             {localPackStatus ? <div className="graph-local-status">{localPackStatus}</div> : null}
+            {!localGraph && graphLoading && graph ? (
+              <div
+                className="graph-local-status graph-progress-status"
+                role="status"
+                aria-live="polite"
+                data-graph-phase={graphProgress?.phase ?? "manifest"}
+                data-loaded-nodes={graphProgress?.loadedNodes ?? 0}
+                data-total-nodes={graphProgress?.totalNodes ?? 0}
+                data-loaded-edges={graphProgress?.loadedEdges ?? 0}
+                data-total-edges={graphProgress?.totalEdges ?? 0}
+                data-loaded-chunks={graphProgress?.loadedChunks ?? 0}
+                data-total-chunks={graphProgress?.totalChunks ?? 0}
+              >
+                <LoaderCircle className="inline-loading-spinner" size={14} />
+                <span>
+                  {graphProgressText(graphProgress)} · 현재 그래프는 계속 탐색할 수 있습니다.
+                </span>
+              </div>
+            ) : null}
             {!localGraph && graphPackOptions.length ? (
               <div className="graph-pack-filter" aria-label="프로젝트 팩 필터">
                 <div>
@@ -1617,25 +1977,42 @@ function App() {
                 nodes={localGraph.nodes}
                 edges={localGraph.edges}
                 onSelectNode={setSelectedNode}
-                onDetail={setGraphDetail}
+                onDetail={handleGraphDetail}
                 controllerRef={ogControllerRef}
               />
             ) : graphPackOptions.length ? (
-              selectedGraphPackIds.length ? (
+              activeGraphPackIds.length ? (
                 graph ? (
                   <OntologyGraph
                     nodes={graph.nodes}
                     edges={graph.edges}
                     onSelectNode={setSelectedNode}
-                    onDetail={setGraphDetail}
+                    onDetail={handleGraphDetail}
                     controllerRef={ogControllerRef}
                     serverStats={graph.stats}
                   />
-                ) : (
-                  <div className="graph-project-empty-state project-empty-state graph-loading-state">
+                ) : graphLoading ? (
+                  <div
+                    className="graph-project-empty-state project-empty-state graph-loading-state"
+                    role="status"
+                    aria-live="polite"
+                    data-graph-phase={graphProgress?.phase ?? "manifest"}
+                    data-loaded-nodes={graphProgress?.loadedNodes ?? 0}
+                    data-total-nodes={graphProgress?.totalNodes ?? 0}
+                    data-loaded-edges={graphProgress?.loadedEdges ?? 0}
+                    data-total-edges={graphProgress?.totalEdges ?? 0}
+                    data-loaded-chunks={graphProgress?.loadedChunks ?? 0}
+                    data-total-chunks={graphProgress?.totalChunks ?? 0}
+                  >
                     <LoaderCircle className="loading-spinner" size={28} />
                     <strong>그래프 불러오는 중…</strong>
-                    <span>대용량 팩은 수 초 걸릴 수 있습니다.</span>
+                    <span>{graphProgressText(graphProgress)}</span>
+                  </div>
+                ) : (
+                  <div className="graph-project-empty-state project-empty-state">
+                    <AlertTriangle size={28} />
+                    <strong>그래프를 불러오지 못했습니다.</strong>
+                    <span>{status}</span>
                   </div>
                 )
               ) : (

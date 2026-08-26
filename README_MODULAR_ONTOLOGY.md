@@ -210,6 +210,18 @@ Run a Remote MCP server for ChatGPT-compatible HTTP access:
 .\scripts\run_remote_mcp.ps1
 ```
 
+The MCP server exposes the cost- and latency-optimized `core` tool profile by default. It keeps all implementations installed while sending only 12 everyday project QA tools to the client model:
+
+```powershell
+# Default: 12 project QA tools
+$env:MODULAR_ONTOLOGY_MCP_TOOL_PROFILE="core"
+
+# 59 canonical specialist tools
+$env:MODULAR_ONTOLOGY_MCP_TOOL_PROFILE="expert"
+```
+
+The same selection is available as `--tool-profile core|expert`. Use `core` for normal questions and `expert` for snapshot, schema, DXF, or low-level graph work. The 35 old unprefixed MCP aliases have been removed from the server registry.
+
 The local endpoint is `http://127.0.0.1:8011/mcp`. ChatGPT needs this same MCP endpoint on a public HTTPS URL, for example `https://graph.your-company.com/mcp` after deploying the server or putting an HTTPS tunnel/reverse proxy in front of port `8011`.
 
 The production Vercel deployment exposes the Remote MCP endpoint directly at:
@@ -256,6 +268,14 @@ Verify the HTTP Remote MCP endpoint:
 ```powershell
 python scripts\verify_mcp_http.py
 ```
+
+Project questions use the local SQLite FTS5 BM25 index by default, with Korean word and bigram tokens. Build or repair the index after importing an existing database:
+
+```powershell
+python scripts\rebuild_bm25_index.py
+```
+
+`GET /api/index/status` reports BM25 coverage. Set `MODULAR_ONTOLOGY_PROJECT_SEARCH_MODE=lexical` to roll back to the prior SQLite lexical ranking. BM25 and lexical project search do not call OpenAI; `mo_project_ask` returns evidence for the MCP client to synthesize.
 
 Optional OpenAI synthesis:
 

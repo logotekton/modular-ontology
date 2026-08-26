@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sqlite3
 import sys
 import urllib.error
 import zipfile
@@ -1468,6 +1469,11 @@ def test_public_read_endpoints_do_not_sync_without_session(monkeypatch) -> None:
 
     monkeypatch.setattr(app_module, "ensure_runtime_storage", fake_ensure_runtime_storage)
     monkeypatch.setattr(app_module, "index_stats", lambda: {"packs": 0, "documents": 0, "nodes": 0, "edges": 0})
+    monkeypatch.setattr(
+        app_module,
+        "bm25_index_status",
+        lambda: {"available": True, "ready": True, "documentCount": 0, "indexedDocumentCount": 0},
+    )
     monkeypatch.setattr(app_module, "list_users", lambda: [])
     monkeypatch.setattr(app_module, "list_projects", lambda: [])
     monkeypatch.setattr(app_module, "list_ifc_models", lambda: [])
@@ -1499,6 +1505,7 @@ def test_index_status_sync_query_runs_runtime_sync(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert sync_calls == [True]
+    assert response.json()["bm25"]["ready"] is True
 
 
 def test_google_drive_sync_on_startup_defaults_off_on_vercel(monkeypatch) -> None:
@@ -1566,7 +1573,8 @@ def test_mcp_tools_return_json_payloads() -> None:
     assert "mo_filtered_search_nodes" in manifest["canonicalTools"]
     assert "mo_aggregate_nodes" in manifest["canonicalTools"]
     assert "mo_list_project_modules" in manifest["canonicalTools"]
-    assert manifest["legacyAliases"]["ask_pack_question"] == "mo_question_answer"
+    assert "legacyAliases" not in manifest
+    assert all("legacy" not in tool for tool in manifest["tools"])
     assert ontology_manifest["schemas"][0]["queryableFields"]["nodeFields"]
     assert schema["nodeTypes"]
     assert schema["relationTypes"]
@@ -1605,6 +1613,301 @@ def test_mcp_tools_return_json_payloads() -> None:
     assert answer["evidence"]
     assert modules["module_count"] == 24
     assert fasteners["bolt_quantity"] == 1011
+
+
+def test_fast_project_search_uses_index_once_and_skips_zip_for_indexed_no_match(monkeypatch) -> None:
+    projects = {"sample-project": {"id": "sample-project", "packIds": ["pack-a", "pack-b"]}}
+    packs = {
+        "pack-a": {"id": "pack-a", "title": "Pack A", "commonScoped": False, "large": "omit"},
+        "pack-b": {"id": "pack-b", "title": "Pack B", "commonScoped": True, "large": "omit"},
+    }
+    fallback_calls: list[str] = []
+    multi_calls: list[tuple[list[str], str, int]] = []
+
+    monkeypatch.setattr(mcp_server, "_visible_project_by_id", lambda: projects)
+    monkeypatch.setattr(mcp_server, "_visible_pack_by_id", lambda: packs)
+    monkeypatch.setattr(mcp_server, "_pack_is_visible", lambda pack_id: pack_id in packs)
+    monkeypatch.setattr(mcp_server, "pack_ids_with_documents", lambda: frozenset(packs))
+
+    def fake_multi(pack_ids, query, limit_per_pack=3):
+        multi_calls.append((list(pack_ids), query, limit_per_pack))
+        return {
+            "pack-a": [
+                {
+                    "path": "documents/a.md",
+                    "title": "A",
+                    "snippet": "matched evidence",
+                    "score": 2.0,
+                    "source": "sqlite-index",
+                    "chunkId": None,
+                }
+            ],
+            "pack-b": [],
+        }
+
+    monkeypatch.setattr(mcp_server, "search_documents_multi", fake_multi)
+    monkeypatch.setattr(
+        mcp_server,
+        "search_pack_evidence",
+        lambda pack_id, query, limit: fallback_calls.append(pack_id) or [],
+    )
+
+    payload = json.loads(mcp_server.mo_project_search("sample-project", "evidence", 3))
+
+    assert multi_calls == [(["pack-a", "pack-b"], "evidence", 3)]
+    assert fallback_calls == []
+    assert payload["packCount"] == 2
+    assert payload["matchedPackCount"] == 1
+    assert payload["matchCount"] == 1
+    assert payload["results"][0]["pack"] == {
+        "id": "pack-a",
+        "title": "Pack A",
+        "displayName": "Pack A",
+        "commonScoped": False,
+    }
+    assert payload["results"][0]["matches"][0]["path"] == "documents/a.md"
+    assert payload["retrieval"]["fallbackPacks"] == 0
+    assert payload["retrieval"]["partial"] is False
+
+
+def test_fast_project_search_prefers_ready_bm25(monkeypatch) -> None:
+    projects = {"sample-project": {"id": "sample-project", "packIds": ["pack-a"]}}
+    packs = {"pack-a": {"id": "pack-a", "title": "Pack A"}}
+    monkeypatch.setattr(mcp_server, "_visible_project_by_id", lambda: projects)
+    monkeypatch.setattr(mcp_server, "_visible_pack_by_id", lambda: packs)
+    monkeypatch.setattr(mcp_server, "_pack_is_visible", lambda pack_id: pack_id in packs)
+    monkeypatch.setattr(mcp_server, "pack_ids_with_documents", lambda: frozenset(packs))
+    monkeypatch.setattr(
+        mcp_server,
+        "bm25_index_status",
+        lambda: {"available": True, "ready": True, "indexedDocumentCount": 1},
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "search_documents_bm25_multi",
+        lambda pack_ids, query, limit_per_pack=3: {
+            "pack-a": [
+                {
+                    "path": "documents/a.md",
+                    "title": "BM25",
+                    "snippet": "ranked evidence",
+                    "score": 4.2,
+                    "source": "sqlite-bm25",
+                    "retrievalSource": "bm25",
+                    "chunkId": None,
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "search_documents_multi",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("lexical fallback must not run")),
+    )
+
+    payload = json.loads(mcp_server.mo_project_search("sample-project", "evidence", 3))
+    ask = json.loads(mcp_server.mo_project_ask("sample-project", "evidence", 1))
+
+    assert payload["retrieval"]["mode"] == "bm25"
+    assert payload["retrieval"]["bm25Ready"] is True
+    assert payload["results"][0]["matches"][0]["source"] == "sqlite-bm25"
+    assert ask["evidence"][0]["signals"] == {"bm25": 4.2}
+
+
+def test_fast_project_search_caps_unindexed_zip_fallback(monkeypatch) -> None:
+    pack_ids = [f"pack-{index}" for index in range(12)]
+    projects = {"sample-project": {"id": "sample-project", "packIds": pack_ids}}
+    packs = {pack_id: {"id": pack_id, "title": pack_id} for pack_id in pack_ids}
+    fallback_calls: list[str] = []
+
+    monkeypatch.setattr(mcp_server, "_visible_project_by_id", lambda: projects)
+    monkeypatch.setattr(mcp_server, "_visible_pack_by_id", lambda: packs)
+    monkeypatch.setattr(mcp_server, "_pack_is_visible", lambda pack_id: pack_id in packs)
+    monkeypatch.setattr(mcp_server, "pack_ids_with_documents", lambda: frozenset())
+    monkeypatch.setattr(mcp_server, "search_documents_multi", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        mcp_server,
+        "search_pack_evidence",
+        lambda pack_id, query, limit: fallback_calls.append(pack_id) or [],
+    )
+
+    payload = json.loads(mcp_server.mo_project_search("sample-project", "missing", 3))
+
+    assert fallback_calls == pack_ids[:10]
+    assert payload["retrieval"]["fallbackPacks"] == 10
+    assert payload["retrieval"]["skippedFallbackPacks"] == 2
+    assert payload["retrieval"]["partial"] is True
+    assert len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) < 50_000
+
+
+def test_fast_project_search_caps_broad_match_payload_under_50kb(monkeypatch) -> None:
+    pack_ids = [f"pack-{index}" for index in range(100)]
+    projects = {"sample-project": {"id": "sample-project", "packIds": pack_ids}}
+    packs = {pack_id: {"id": pack_id, "title": pack_id} for pack_id in pack_ids}
+
+    monkeypatch.setattr(mcp_server, "_visible_project_by_id", lambda: projects)
+    monkeypatch.setattr(mcp_server, "_visible_pack_by_id", lambda: packs)
+    monkeypatch.setattr(mcp_server, "_pack_is_visible", lambda pack_id: pack_id in packs)
+    monkeypatch.setattr(mcp_server, "pack_ids_with_documents", lambda: frozenset(pack_ids))
+    monkeypatch.setattr(
+        mcp_server,
+        "search_documents_multi",
+        lambda scoped_ids, query, limit_per_pack=3: {
+            pack_id: [
+                {
+                    "path": f"documents/{match_index}.md",
+                    "title": f"Evidence {match_index}",
+                    "snippet": "evidence " * 30,
+                    "score": float(300 - pack_index * 3 - match_index),
+                    "source": "sqlite-index",
+                    "chunkId": None,
+                }
+                for match_index in range(3)
+            ]
+            for pack_index, pack_id in enumerate(scoped_ids)
+        },
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "search_pack_evidence",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("zip fallback must not run")),
+    )
+
+    raw = mcp_server.mo_project_search("sample-project", "broad", 3)
+    payload = json.loads(raw)
+
+    assert payload["matchCount"] == 300
+    assert payload["returnedMatchCount"] == 40
+    assert payload["truncated"] is True
+    assert len(raw.encode("utf-8")) < 50_000
+
+
+def test_project_search_fast_path_can_be_rolled_back(monkeypatch) -> None:
+    monkeypatch.setenv("MODULAR_ONTOLOGY_FAST_PROJECT_SEARCH", "0")
+    monkeypatch.setattr(
+        mcp_server,
+        "_legacy_project_search_payload",
+        lambda project_id, search_text, limit_per_pack=3: {"mode": "legacy"},
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "_fast_project_search_payload",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("fast path must not run")),
+    )
+
+    assert mcp_server._project_search_payload("sample-project", "query", 3) == {"mode": "legacy"}
+
+
+def test_project_ask_returns_ranked_client_synthesis_evidence_without_openai(monkeypatch) -> None:
+    projects = {"sample-project": {"id": "sample-project", "packIds": ["pack-a"]}}
+    monkeypatch.setattr(mcp_server, "_visible_project_by_id", lambda: projects)
+    monkeypatch.setattr(
+        mcp_server,
+        "_fast_project_search_payload",
+        lambda project_id, question, limit_per_pack=3: {
+            "results": [
+                {
+                    "pack": {"id": "pack-a"},
+                    "matches": [
+                        {"path": "documents/low.md", "title": "Low", "snippet": "low", "score": 1.0},
+                        {"path": "documents/high.md", "title": "High", "snippet": "high", "score": 3.0},
+                    ],
+                }
+            ],
+            "retrieval": {
+                "mode": "lexical",
+                "scannedPacks": 1,
+                "indexedPacks": 1,
+                "fallbackPacks": 0,
+                "candidateCount": 2,
+                "partial": False,
+                "skippedFallbackPacks": 0,
+                "dbMs": 1.0,
+                "fallbackMs": 0.0,
+                "elapsedMs": 1.0,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "answer_pack_question",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("OpenAI/QA path must not run")),
+    )
+
+    payload = json.loads(mcp_server.mo_project_ask("sample-project", "question", top_k=1))
+
+    assert payload["status"] == "evidence_ready"
+    assert payload["answerMode"] == "client_synthesis"
+    assert [item["title"] for item in payload["evidence"]] == ["High"]
+    assert payload["evidence"][0]["signals"] == {"lexical": 3.0}
+
+
+def test_project_ask_removes_redundant_project_scope_words(monkeypatch) -> None:
+    projects = {"경기도-모듈러-공동주택": {"id": "경기도-모듈러-공동주택", "packIds": []}}
+    captured: list[str] = []
+    monkeypatch.setattr(mcp_server, "_visible_project_by_id", lambda: projects)
+
+    def fake_search(project_id, search_text, limit_per_pack=3):
+        captured.append(search_text)
+        return {
+            "results": [],
+            "retrieval": {
+                "mode": "bm25",
+                "scannedPacks": 0,
+                "indexedPacks": 0,
+                "fallbackPacks": 0,
+                "candidateCount": 0,
+                "partial": False,
+                "skippedFallbackPacks": 0,
+                "dbMs": 0.0,
+                "fallbackMs": 0.0,
+                "elapsedMs": 0.0,
+            },
+        }
+
+    monkeypatch.setattr(mcp_server, "_fast_project_search_payload", fake_search)
+
+    payload = json.loads(
+        mcp_server.mo_project_ask(
+            "경기도-모듈러-공동주택",
+            "모듈러 공동주택의 화장실 면적은 얼마인가?",
+        )
+    )
+
+    assert captured == ["화장실 면적은"]
+    assert payload["status"] == "no_answer"
+
+
+def test_project_ask_no_answer_and_manifest_guidance(monkeypatch) -> None:
+    projects = {"sample-project": {"id": "sample-project", "packIds": []}}
+    monkeypatch.setattr(mcp_server, "_visible_project_by_id", lambda: projects)
+    monkeypatch.setattr(
+        mcp_server,
+        "_fast_project_search_payload",
+        lambda *args, **kwargs: {
+            "results": [],
+            "retrieval": {
+                "mode": "lexical",
+                "scannedPacks": 0,
+                "indexedPacks": 0,
+                "fallbackPacks": 0,
+                "candidateCount": 0,
+                "partial": False,
+                "skippedFallbackPacks": 0,
+                "dbMs": 0.0,
+                "fallbackMs": 0.0,
+                "elapsedMs": 0.0,
+            },
+        },
+    )
+
+    payload = json.loads(mcp_server.mo_project_ask("sample-project", "unknown"))
+    manifest = json.loads(mcp_server.mo_tool_manifest())
+
+    assert payload["status"] == "no_answer"
+    assert payload["evidence"] == []
+    assert "mo_project_ask" in manifest["canonicalTools"]
+    assert manifest["workflow"]["recommendedStart"][0] == "mo_project_ask"
 
 
 def test_anchor_resolve_and_coverage_share_cloud_chunk_payload(monkeypatch) -> None:
@@ -1934,7 +2237,10 @@ def test_mcp_stdio_server_lists_and_calls_tools() -> None:
             command=sys.executable,
             args=["-m", "modular_ontology.mcp_server"],
             cwd=root,
-            env={"MODULAR_ONTOLOGY_ROOT": str(root)},
+            env={
+                "MODULAR_ONTOLOGY_ROOT": str(root),
+                "MODULAR_ONTOLOGY_MCP_TOOL_PROFILE": "expert",
+            },
         )
         async with stdio_client(params) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as session:
@@ -1973,16 +2279,8 @@ def test_mcp_stdio_server_lists_and_calls_tools() -> None:
             "mo_evidence_search",
             "mo_evidence_trace",
             "mo_question_answer",
-            "list_projects",
-            "list_packs",
-            "get_graph",
-            "search_pack",
-            "ask_pack_question",
-            "list_pack_documents",
-            "read_pack_document",
-            "list_modules",
-            "get_fasteners",
         }.issubset(names)
+        assert {"list_projects", "get_graph", "search_pack", "ask_pack_question"}.isdisjoint(names)
         assert payload["mode"] == "local-graph-rag"
         assert payload["evidence"]
 
@@ -2373,6 +2671,30 @@ def test_admin_reindex_api_requires_admin_session(monkeypatch, tmp_path) -> None
 
 
 def test_google_drive_sync_downloads_runtime_storage(tmp_path) -> None:
+    source_database = tmp_path / "source.sqlite3"
+    conn = sqlite3.connect(source_database)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE packs (id TEXT PRIMARY KEY);
+            CREATE TABLE projects (id TEXT PRIMARY KEY);
+            CREATE TABLE project_packs (project_id TEXT, pack_id TEXT);
+            INSERT INTO packs VALUES ('sample-pack');
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    registry = {
+        "version": 1,
+        "projects": [],
+        "commonPackIds": [],
+        "packs": [{"id": "sample-pack", "drive": {"fileId": "pack"}}],
+    }
+    pack_stream = io.BytesIO()
+    with zipfile.ZipFile(pack_stream, "w") as zf:
+        zf.writestr("manifest.json", json.dumps({"pack_id": "sample-pack"}))
+
     class FakeDriveClient:
         children = {
             "root": [
@@ -2385,7 +2707,10 @@ def test_google_drive_sync_downloads_runtime_storage(tmp_path) -> None:
                 DriveItem("mcp", "mcp_remote.json", "application/json"),
                 DriveItem("mcp_tokens", "mcp_tokens.json", "application/json"),
             ],
-            "database": [DriveItem("db", "modular_ontology.sqlite3", "application/octet-stream")],
+            "database": [
+                DriveItem("registry", "pack_registry.json", "application/json"),
+                DriveItem("db", "modular_ontology.sqlite3", "application/octet-stream"),
+            ],
             "packs": [DriveItem("indexed", "indexed", "application/vnd.google-apps.folder")],
             "indexed": [
                 DriveItem("pack", "sample-pack.zip", "application/x-zip-compressed"),
@@ -2397,8 +2722,9 @@ def test_google_drive_sync_downloads_runtime_storage(tmp_path) -> None:
             "users": b'{"users":[]}',
             "mcp": b'{"publicUrl":""}',
             "mcp_tokens": b'{"tokens":[]}',
-            "db": b"sqlite-bytes",
-            "pack": b"zip-bytes",
+            "registry": json.dumps(registry).encode("utf-8"),
+            "db": source_database.read_bytes(),
+            "pack": pack_stream.getvalue(),
         }
 
         def list_children(self, folder_id):
@@ -2419,8 +2745,8 @@ def test_google_drive_sync_downloads_runtime_storage(tmp_path) -> None:
     assert (tmp_path / "00_Admin" / "users.json").read_text(encoding="utf-8") == '{"users":[]}'
     assert (tmp_path / "00_Admin" / "mcp_remote.json").exists()
     assert (tmp_path / "00_Admin" / "mcp_tokens.json").exists()
-    assert (tmp_path / "01_Database" / "modular_ontology.sqlite3").read_bytes() == b"sqlite-bytes"
-    assert (tmp_path / "04_Ontology_Packs" / "indexed" / "sample-pack.zip").read_bytes() == b"zip-bytes"
+    assert (tmp_path / "01_Database" / "modular_ontology.sqlite3").read_bytes() == source_database.read_bytes()
+    assert (tmp_path / "04_Ontology_Packs" / "indexed" / "sample-pack.zip").read_bytes() == pack_stream.getvalue()
     assert not (tmp_path / "04_Ontology_Packs" / "indexed" / "README.md").exists()
 
 
@@ -3104,9 +3430,20 @@ def test_google_drive_sync_updates_project_metadata_when_xkt_is_added(tmp_path) 
 
 
 def test_google_drive_sync_prunes_removed_project_ifc_metadata(tmp_path) -> None:
+    registry = {
+        "version": 1,
+        "projects": [{"id": "samcheok-building-b", "driveFolderId": "project", "packIds": []}],
+        "commonPackIds": [],
+        "packs": [{"id": "inventory-anchor", "drive": {"fileId": "anchor-file"}}],
+    }
+
     class FakeDriveClient:
         children = {
-            "root": [DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder")],
+            "root": [
+                DriveItem("database", "01_Database", "application/vnd.google-apps.folder"),
+                DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder"),
+            ],
+            "database": [DriveItem("registry", "pack_registry.json", "application/json")],
             "projects-root": [DriveItem("project", "samcheok-building-b", "application/vnd.google-apps.folder")],
             "project": [DriveItem("ifc-folder", "ifc-models", "application/vnd.google-apps.folder")],
             "ifc-folder": [DriveItem("ifc", "sample.ifc", "application/octet-stream", "2026-06-11T00:00:00Z", 1200)],
@@ -3116,7 +3453,9 @@ def test_google_drive_sync_prunes_removed_project_ifc_metadata(tmp_path) -> None
             return self.children.get(folder_id, [])
 
         def download_file(self, file_id, target):
-            raise AssertionError("manual IFC registration should not download raw model files")
+            assert file_id == "registry"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(registry), encoding="utf-8")
 
     fake_client = FakeDriveClient()
     sync_google_drive_storage(client=fake_client, root_folder_id="root", data_dir=tmp_path, force=True)
@@ -3130,9 +3469,20 @@ def test_google_drive_sync_prunes_removed_project_ifc_metadata(tmp_path) -> None
 
 
 def test_google_drive_sync_prunes_deleted_project_assets(tmp_path) -> None:
+    registry = {
+        "version": 1,
+        "projects": [{"id": "active-project", "driveFolderId": "active-project", "packIds": []}],
+        "commonPackIds": [],
+        "packs": [{"id": "inventory-anchor", "drive": {"fileId": "anchor-file"}}],
+    }
+
     class FakeDriveClient:
         children = {
-            "root": [DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder")],
+            "root": [
+                DriveItem("database", "01_Database", "application/vnd.google-apps.folder"),
+                DriveItem("projects-root", "02_Projects", "application/vnd.google-apps.folder"),
+            ],
+            "database": [DriveItem("registry", "pack_registry.json", "application/json")],
             "projects-root": [DriveItem("active-project", "active-project", "application/vnd.google-apps.folder")],
             "active-project": [DriveItem("ifc-folder", "ifc-models", "application/vnd.google-apps.folder")],
             "ifc-folder": [],
@@ -3142,7 +3492,9 @@ def test_google_drive_sync_prunes_deleted_project_assets(tmp_path) -> None:
             return self.children.get(folder_id, [])
 
         def download_file(self, file_id, target):
-            raise AssertionError("No files should be downloaded")
+            assert file_id == "registry"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(registry), encoding="utf-8")
 
     deleted_metadata_dir = tmp_path / "03_IFC_Models" / "deleted-project" / "metadata"
     deleted_metadata_dir.mkdir(parents=True)
@@ -3173,6 +3525,26 @@ def test_google_drive_sync_prunes_deleted_project_assets(tmp_path) -> None:
 
 def test_google_drive_sync_downloads_legacy_database_filename(tmp_path) -> None:
     legacy_db_name = "mod" + "dular_" + "graph.sqlite3"
+    source_database = tmp_path / "legacy-source.sqlite3"
+    conn = sqlite3.connect(source_database)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE packs (id TEXT PRIMARY KEY);
+            CREATE TABLE projects (id TEXT PRIMARY KEY);
+            CREATE TABLE project_packs (project_id TEXT, pack_id TEXT);
+            INSERT INTO packs VALUES ('inventory-anchor');
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    registry = {
+        "version": 1,
+        "projects": [],
+        "commonPackIds": [],
+        "packs": [{"id": "inventory-anchor", "drive": {"fileId": "anchor-file"}}],
+    }
 
     class FakeDriveClient:
         children = {
@@ -3182,7 +3554,10 @@ def test_google_drive_sync_downloads_legacy_database_filename(tmp_path) -> None:
                 DriveItem("packs", "04_Ontology_Packs", "application/vnd.google-apps.folder"),
             ],
             "admin": [],
-            "database": [DriveItem("db", legacy_db_name, "application/octet-stream")],
+            "database": [
+                DriveItem("registry", "pack_registry.json", "application/json"),
+                DriveItem("db", legacy_db_name, "application/octet-stream"),
+            ],
             "packs": [],
         }
 
@@ -3191,7 +3566,10 @@ def test_google_drive_sync_downloads_legacy_database_filename(tmp_path) -> None:
 
         def download_file(self, file_id, target):
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(b"legacy-sqlite-bytes")
+            if file_id == "registry":
+                target.write_text(json.dumps(registry), encoding="utf-8")
+            else:
+                target.write_bytes(source_database.read_bytes())
 
     result = sync_google_drive_storage(
         client=FakeDriveClient(),
@@ -3201,7 +3579,7 @@ def test_google_drive_sync_downloads_legacy_database_filename(tmp_path) -> None:
     )
 
     assert result["status"] == "synced"
-    assert (tmp_path / "01_Database" / "modular_ontology.sqlite3").read_bytes() == b"legacy-sqlite-bytes"
+    assert (tmp_path / "01_Database" / "modular_ontology.sqlite3").read_bytes() == source_database.read_bytes()
 
 
 def test_new_env_helper_reads_legacy_prefix(monkeypatch) -> None:
