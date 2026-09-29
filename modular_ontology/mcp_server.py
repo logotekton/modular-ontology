@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import json
+import math
 import re
 import zipfile
 from collections import Counter
 from collections.abc import Sequence
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 from .auth import get_company_project_access
@@ -36,6 +37,15 @@ from .pack_index import (
     score_terms,
 )
 from .qa import answer_pack_question
+from .query import (
+    OPERATORS as _WHERE_OPERATORS,
+    compile_where,
+    equal_values,
+    numeric_value,
+    sort_records,
+    sort_value_key,
+    split_where_key,
+)
 from .source_anchor import anchors_from_chunk, coverage as source_anchor_coverage
 from .store import connect as connect_index_db, init_db as init_index_db, search_documents as search_indexed_documents
 
@@ -354,6 +364,12 @@ def _tool_manifest_payload() -> dict:
         "canonicalTools": TOOL_NAMES,
         "legacyTools": LEGACY_TOOL_NAMES,
         "legacyAliases": TOOL_ALIASES,
+        "queryLanguage": {
+            "where": {"operators": sorted(_WHERE_OPERATORS), "logical": ["$and", "$or", "$not"], "forms": ["field: value", "field: {operator: value}", "field__operator: value"]},
+            "orderBy": {"directions": ["asc", "desc"], "nulls": ["first", "last"], "defaultNulls": "last", "natural": True},
+            "numericCoercion": "Finite whole numeric values only; embedded digits in identifiers are text.",
+            "invalidQueries": "Invalid operators, regexes, sort directions and metrics raise tool errors.",
+        },
     }
 
 
@@ -597,66 +613,16 @@ def _to_number(value: object) -> float | None:
 
 
 def _loose_equal(left: object, right: object) -> bool:
-    left_number = _to_number(left)
-    right_number = _to_number(right)
-    if left_number is not None and right_number is not None:
-        return left_number == right_number
-    return left == right or str(left) == str(right)
+    return equal_values(left, right)
 
 
 def _match_one(value: object, operator: str, expected: object, *, exists: bool) -> bool:
-    if operator == "exists":
-        return exists if bool(expected) else not exists
-    if not exists:
-        return operator == "ne" and expected is not None
-    if operator == "eq":
-        return _loose_equal(value, expected)
-    if operator == "ne":
-        return not _loose_equal(value, expected)
-    if operator == "in":
-        return any(_loose_equal(value, item) for item in _normalize_tool_list(expected if isinstance(expected, Sequence) and not isinstance(expected, str) else [expected]))
-    if operator == "not_in":
-        return not any(_loose_equal(value, item) for item in _normalize_tool_list(expected if isinstance(expected, Sequence) and not isinstance(expected, str) else [expected]))
-    if operator == "contains":
-        return str(expected).casefold() in str(value).casefold()
-    if operator == "startswith":
-        return str(value).casefold().startswith(str(expected).casefold())
-    if operator == "endswith":
-        return str(value).casefold().endswith(str(expected).casefold())
-    if operator == "regex":
-        try:
-            return bool(re.search(str(expected), str(value)))
-        except re.error:
-            return False
-    if operator in {"gt", "gte", "lt", "lte"}:
-        left_number = _to_number(value)
-        right_number = _to_number(expected)
-        if left_number is None or right_number is None:
-            return False
-        if operator == "gt":
-            return left_number > right_number
-        if operator == "gte":
-            return left_number >= right_number
-        if operator == "lt":
-            return left_number < right_number
-        return left_number <= right_number
-    if operator == "wildcard":
-        return fnmatch.fnmatchcase(str(value), str(expected))
-    return False
+    predicate = compile_where({"value": {operator: expected}}, lambda row, field: row.get(field, _MISSING), _MISSING)
+    return predicate({"value": value} if exists else {})
 
 
 def _matches_where(node: dict, where: dict | None) -> bool:
-    for field, condition in _normalize_tool_dict(where).items():
-        value = _node_field(node, str(field))
-        exists = value is not _MISSING
-        if isinstance(condition, dict):
-            if not condition:
-                continue
-            if not all(_match_one(value, str(operator), expected, exists=exists) for operator, expected in condition.items()):
-                return False
-        elif not _match_one(value, "eq", condition, exists=exists):
-            return False
-    return True
+    return compile_where(where, _node_field, _MISSING)(node)
 
 
 def _natural_key(value: object) -> tuple:
@@ -675,47 +641,32 @@ def _natural_key(value: object) -> tuple:
 
 
 def _hashable_value(value: object) -> object:
-    if value is _MISSING:
-        return None
-    if isinstance(value, list | dict):
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
-    return value
+    number = numeric_value(value) if isinstance(value, (int, float, Decimal)) else None
+    if number is not None:
+        if not number:
+            return ("number", 0)
+        sign, digits, exponent = number.as_tuple()
+        digits = list(digits)
+        while len(digits) > 1 and digits[-1] == 0:
+            digits.pop()
+            exponent += 1
+        return ("number", sign, tuple(digits), exponent)
+    return ("json", json.dumps(None if value is _MISSING else value, ensure_ascii=False, sort_keys=True))
 
 
 def _sort_value_key(value: object) -> tuple:
     if value is None or value is _MISSING:
         return (1, 0, "")
-    number = _to_number(value)
-    if number is not None:
-        return (0, 0, number)
-    return (0, 1, str(value).casefold())
+    return (0, *sort_value_key(value))
 
 
 def _sort_rows(rows: list[dict], order_by: Sequence | None) -> list[dict]:
-    specs = _normalize_tool_list(order_by)
-    if not specs:
-        return rows
-    ordered = list(rows)
-    for raw_spec in reversed(specs):
-        if isinstance(raw_spec, str):
-            spec = {"field": raw_spec}
-        elif isinstance(raw_spec, dict):
-            spec = raw_spec
-        else:
-            continue
-        field = str(spec.get("field") or "")
-        if not field:
-            continue
-        reverse = str(spec.get("direction", "asc")).lower() == "desc"
-        natural = bool(spec.get("natural", False))
-        ordered.sort(
-            key=lambda row: _natural_key(row.get(field)) if natural else _sort_value_key(row.get(field)),
-            reverse=reverse,
-        )
-    return ordered
+    return sort_records(rows, order_by, _row_get, _MISSING)
 
 
 def _sort_values(values: list[object], order: str = "asc") -> list[object]:
+    if str(order).lower() not in {"asc", "desc"}:
+        raise ValueError("order must be asc or desc")
     return sorted(values, key=_natural_key, reverse=str(order).lower() == "desc")
 
 
@@ -729,20 +680,55 @@ def _compact_sample_value(value: object) -> object:
 
 def _project_node(node: dict, fields: Sequence | None = None, *, include_heavy_fields: bool = False) -> dict:
     selected_fields = _normalize_tool_list(fields) or _DEFAULT_NODE_FIELDS
+    selected_fields = [str(field) for field in selected_fields if include_heavy_fields or not _is_heavy_field(str(field))]
     row: dict[str, object] = {}
-    for field_obj in selected_fields:
-        field = str(field_obj)
-        if not include_heavy_fields and _is_heavy_field(field):
-            continue
+    for field, key in _projection_keys(selected_fields):
         value = _node_field(node, field)
         if value is not _MISSING:
-            row[field.split(".", 1)[-1]] = value
+            row[key] = value
     return row
 
 
-def _pack_nodes(pack_id: str, *, node_limit: int = 50000) -> tuple[dict, list[dict]]:
-    graph = read_graph(pack_id, max_nodes=max(1, node_limit), max_edges=0)
+def _projection_keys(fields: Sequence) -> list[tuple[str, str]]:
+    """Keep legacy compact names unless they would overwrite another field."""
+    fields = list(dict.fromkeys(str(field) for field in fields))
+    aliases = Counter(field.split(".", 1)[-1] for field in fields)
+    requested = set(fields)
+    result = []
+    for field in fields:
+        compact = field.split(".", 1)[-1]
+        key = compact if aliases[compact] == 1 and (compact == field or compact not in requested) else field
+        result.append((field, key))
+    return result
+
+
+def _pack_nodes(pack_id: str, *, node_limit: int | None = None) -> tuple[dict, list[dict]]:
+    graph = read_graph(pack_id, max_nodes=None if node_limit is None else max(0, node_limit), max_edges=0)
     return graph, list(graph.get("nodes", []))
+
+
+def _node_query_scope(graph: dict) -> dict:
+    """Distinguish paginated results from an incomplete/legacy source index."""
+    stats = graph.get("stats", {})
+    scanned = len(graph.get("nodes", []))
+    available = int(stats.get("totalNodes", scanned))
+    declared = graph.get("pack", {}).get("counts", {}).get("nodes")
+    if not isinstance(declared, int) or isinstance(declared, bool) or declared < 0:
+        declared = None
+    source = graph.get("source", "pack")
+    if source == "sqlite-index" and declared == 0 and scanned > 0:
+        declared = None  # Older DB summaries coerced unknown source counts to zero.
+    complete = not stats.get("nodesTruncated", scanned < available)
+    if declared is not None and scanned < declared:
+        complete = False
+    elif source == "sqlite-index" and declared is None and complete:
+        complete = None  # No source count against which to verify this index.
+    scope = {"source": source, "scanned_nodes": scanned, "available_nodes": available, "declared_nodes": declared, "complete": complete}
+    if complete is False:
+        scope["warning"] = "Results cover only available nodes; restore the source pack and rebuild its index for complete results."
+    elif complete is None:
+        scope["warning"] = "All indexed nodes were scanned, but source completeness cannot be verified."
+    return scope
 
 
 def _filtered_nodes(
@@ -750,12 +736,13 @@ def _filtered_nodes(
     *,
     node_type: str | None = None,
     where: dict | None = None,
-    node_limit: int = 50000,
+    node_limit: int | None = None,
 ) -> tuple[dict, list[dict]]:
+    matches = compile_where(where, _node_field, _MISSING)
     graph, nodes = _pack_nodes(pack_id, node_limit=node_limit)
     if node_type:
         nodes = [node for node in nodes if str(node.get("type", "")).casefold() == str(node_type).casefold()]
-    nodes = [node for node in nodes if _matches_where(node, where)]
+    nodes = [node for node in nodes if matches(node)]
     return graph, nodes
 
 
@@ -766,7 +753,7 @@ def _filtered_rows(
     where: dict | None = None,
     fields: Sequence | None = None,
     include_heavy_fields: bool = False,
-    node_limit: int = 50000,
+    node_limit: int | None = None,
 ) -> tuple[dict, list[dict]]:
     graph, nodes = _filtered_nodes(pack_id, node_type=node_type, where=where, node_limit=node_limit)
     return graph, [_project_node(node, fields, include_heavy_fields=include_heavy_fields) for node in nodes]
@@ -774,8 +761,58 @@ def _filtered_rows(
 
 def _metric_name(metric: dict) -> str:
     field = str(metric.get("field") or "")
-    agg = str(metric.get("agg") or "count")
+    agg = str(metric.get("agg") or "count").lower()
     return str(metric.get("as") or (f"{field}_{agg}" if field else agg))
+
+
+def _query_number_result(value: object, *, precision: int | None = 6) -> int | float | None:
+    if value is None:
+        return None
+    if isinstance(value, Decimal) and precision is not None:
+        with localcontext() as context:
+            context.prec = max(28, len(value.as_tuple().digits), value.adjusted() + precision + 2)
+            rounded = round(value, precision)
+    else:
+        rounded = round(value, precision) if precision is not None else value
+    if rounded == int(rounded):
+        return int(rounded)
+    number = float(rounded)
+    if not math.isfinite(number):
+        raise ValueError("Numeric aggregate exceeds the supported result range")
+    return number
+
+
+def _sum_query_numbers(numbers: list[Decimal]) -> Decimal:
+    if not numbers:
+        return Decimal(0)
+    with localcontext() as context:
+        # Enough places for the entire integer/fraction range plus carry digits.
+        context.prec = max(28, max(value.adjusted() for value in numbers) - min(value.as_tuple().exponent for value in numbers) + len(str(len(numbers))) + 2)
+        return sum(numbers, Decimal(0))
+
+
+def _validated_metrics(metrics: Sequence | None, group_fields: list[str]) -> list[dict]:
+    specs = []
+    names = set(group_fields)
+    allowed = {"count", "count_distinct", "sum", "avg", "min", "max", "first", "collect_set", "collect_list"}
+    for raw in _normalize_tool_list(metrics) or [{"agg": "count", "as": "row_count"}]:
+        if not isinstance(raw, (dict, str)):
+            raise ValueError("metrics entries must be aggregate names or objects")
+        metric = dict(raw) if isinstance(raw, dict) else {"agg": raw}
+        agg = str(metric.get("agg") or "count").lower()
+        if agg not in allowed:
+            raise ValueError(f"Unknown aggregate: {agg!r}")
+        field = metric.get("field")
+        if field is not None and (not isinstance(field, str) or not field):
+            raise ValueError("metric field must be a non-empty string")
+        if agg != "count" and not field:
+            raise ValueError(f"Aggregate {agg!r} requires a field")
+        name = _metric_name(metric)
+        if name in names:
+            raise ValueError(f"Duplicate aggregate output field: {name!r}")
+        names.add(name)
+        specs.append({**metric, "agg": agg})
+    return specs
 
 
 def _aggregate_filtered_nodes(
@@ -784,49 +821,61 @@ def _aggregate_filtered_nodes(
     group_by: Sequence | None,
     metrics: Sequence | None,
 ) -> tuple[list[dict], dict]:
-    group_fields = [str(field) for field in _normalize_tool_list(group_by)]
-    metric_specs = [
-        metric if isinstance(metric, dict) else {"agg": str(metric)}
-        for metric in (_normalize_tool_list(metrics) or [{"agg": "count", "as": "row_count"}])
-    ]
+    group_fields = _normalize_tool_list(group_by)
+    if any(not isinstance(field, str) or not field for field in group_fields):
+        raise ValueError("group_by fields must be non-empty strings")
+    if len(set(group_fields)) != len(group_fields):
+        raise ValueError("group_by fields must be unique")
+    metric_specs = _validated_metrics(metrics, group_fields)
     groups: dict[tuple, list[dict]] = {}
     for node in nodes:
         key = tuple(_hashable_value(_node_field(node, field)) for field in group_fields)
         groups.setdefault(key, []).append(node)
+    if not group_fields and not groups:
+        groups[()] = []
 
     skipped_rows: dict[str, int] = {}
     rows: list[dict] = []
     for key, group_nodes in groups.items():
-        row = {field: key[index] for index, field in enumerate(group_fields)}
+        row = {}
+        for field in group_fields:
+            value = _node_field(group_nodes[0], field)
+            row[field] = None if value is _MISSING else value
+        present_by_field: dict[str, list] = {}
+        numeric_by_field: dict[str, tuple[list, int]] = {}
         for metric in metric_specs:
             agg = str(metric.get("agg") or "count").lower()
             field = str(metric.get("field") or "")
             name = _metric_name(metric)
-            values = [_node_field(node, field) for node in group_nodes] if field else []
-            present_values = [value for value in values if value is not _MISSING and value is not None]
+            if field and field not in present_by_field:
+                values = [_node_field(node, field) for node in group_nodes]
+                present_by_field[field] = [value for value in values if value is not _MISSING and value is not None]
+            present_values = present_by_field.get(field, [])
             if agg == "count":
                 row[name] = len(group_nodes if not field else present_values)
             elif agg == "count_distinct":
                 row[name] = len({json.dumps(value, ensure_ascii=False, sort_keys=True) for value in present_values})
             elif agg in {"sum", "avg", "min", "max"}:
-                numbers = []
-                skipped = 0
-                for value in present_values:
-                    number = _to_number(value)
-                    if number is None:
-                        skipped += 1
-                    else:
-                        numbers.append(number)
+                if field not in numeric_by_field:
+                    converted = [numeric_value(value) for value in present_values]
+                    numeric_by_field[field] = ([value for value in converted if value is not None], converted.count(None))
+                numbers, skipped = numeric_by_field[field]
                 if skipped:
                     skipped_rows[name] = skipped_rows.get(name, 0) + skipped
                 if agg == "sum":
-                    row[name] = round(sum(numbers), 6)
+                    row[name] = _query_number_result(_sum_query_numbers(numbers))
                 elif agg == "avg":
-                    row[name] = round(sum(numbers) / len(numbers), 6) if numbers else None
+                    if numbers:
+                        total = _sum_query_numbers(numbers)
+                        with localcontext() as context:
+                            context.prec = max(28, len(total.as_tuple().digits) + 8, total.adjusted() + 8)
+                            row[name] = _query_number_result(total / len(numbers))
+                    else:
+                        row[name] = None
                 elif agg == "min":
-                    row[name] = min(numbers) if numbers else None
+                    row[name] = _query_number_result(min(numbers), precision=None) if numbers else None
                 else:
-                    row[name] = max(numbers) if numbers else None
+                    row[name] = _query_number_result(max(numbers), precision=None) if numbers else None
             elif agg == "first":
                 row[name] = present_values[0] if present_values else None
             elif agg == "collect_set":
@@ -840,8 +889,6 @@ def _aggregate_filtered_nodes(
                 row[name] = _sort_values(unique)
             elif agg == "collect_list":
                 row[name] = present_values
-            else:
-                row[name] = None
         rows.append(row)
     return rows, {"skipped_rows": skipped_rows}
 
@@ -890,22 +937,6 @@ def _module_candidates_from_nodes(
     return modules
 
 
-_WHERE_OPERATORS = {
-    "eq",
-    "ne",
-    "contains",
-    "startswith",
-    "endswith",
-    "in",
-    "not_in",
-    "regex",
-    "gt",
-    "gte",
-    "lt",
-    "lte",
-    "exists",
-    "wildcard",
-}
 _MEASURE_DISPLAY_RE = re.compile(r"(-?\d[\d,]*(?:\.\d+)?)\s*([^\d\s]+)?")
 _AREA_TAG_RE = re.compile(
     r"(?P<label>[\w가-힣\s()/_\-.]{1,60}?)\s*(?P<area>\d+(?:\.\d+)?)\s*(?P<unit>m2|㎡|m\^2|제곱미터|평방미터)",
@@ -1085,6 +1116,8 @@ def _measurement_value_unit(row: dict) -> tuple[float | None, str | None]:
 
 
 def _row_get(row: dict, field: str) -> object:
+    if field in row:
+        return row[field]
     aliases = {
         "parameter": "parameter_name",
         "display": "parameter_display",
@@ -1117,29 +1150,11 @@ def _row_get(row: dict, field: str) -> object:
 
 
 def _split_where_key(field: str) -> tuple[str, str | None]:
-    if "__" not in field:
-        return field, None
-    base, operator = field.rsplit("__", 1)
-    if operator in _WHERE_OPERATORS:
-        return base, operator
-    return field, None
+    return split_where_key(field)
 
 
 def _row_matches_where(row: dict, where: dict | None) -> bool:
-    for raw_field, condition in _normalize_tool_dict(where).items():
-        field, suffix_operator = _split_where_key(str(raw_field))
-        value = _row_get(row, field)
-        exists = value is not _MISSING
-        if suffix_operator:
-            if not _match_one(value, suffix_operator, condition, exists=exists):
-                return False
-            continue
-        if isinstance(condition, dict):
-            if not all(_match_one(value, str(operator), expected, exists=exists) for operator, expected in condition.items()):
-                return False
-        elif not _match_one(value, "eq", condition, exists=exists):
-            return False
-    return True
+    return compile_where(where, _row_get, _MISSING)(row)
 
 
 def _project_row(row: dict, fields: Sequence | None = None) -> dict:
@@ -1167,31 +1182,15 @@ def _project_row(row: dict, fields: Sequence | None = None) -> dict:
             "source_refs",
         ]
     projected = {}
-    for field in requested:
-        key = str(field)
-        value = _row_get(row, key)
+    for field, key in _projection_keys(requested):
+        value = _row_get(row, field)
         if value is not _MISSING:
-            projected[key.split(".", 1)[-1]] = value
+            projected[key] = value
     return projected
 
 
 def _sort_chunk_rows(rows: list[dict], order_by: Sequence | None) -> list[dict]:
-    specs = _normalize_tool_list(order_by)
-    if not specs:
-        return rows
-    ordered = list(rows)
-    for raw_spec in reversed(specs):
-        spec = {"field": raw_spec} if isinstance(raw_spec, str) else raw_spec if isinstance(raw_spec, dict) else {}
-        field = str(spec.get("field") or "")
-        if not field:
-            continue
-        reverse = str(spec.get("direction", "asc")).lower() == "desc"
-        natural = bool(spec.get("natural", False))
-        ordered.sort(
-            key=lambda row: _natural_key(_row_get(row, field)) if natural else _sort_value_key(_row_get(row, field)),
-            reverse=reverse,
-        )
-    return ordered
+    return sort_records(rows, order_by, _row_get, _MISSING)
 
 
 def _iter_cloud_chunk_rows(pack_id: str):
@@ -1922,6 +1921,7 @@ def _dxf_entity_search_payload(
     limit: int = 50,
     offset: int = 0,
 ) -> dict:
+    matches_where = compile_where(where, _row_get, _MISSING)
     active_pack_ids = _dxf_request_pack_ids(project_id=project_id, pack_id=pack_id, pack_ids=pack_ids)
     entity_types = _entity_type_filter(entity_type)
     terms = query_terms(query)
@@ -1941,7 +1941,7 @@ def _dxf_entity_search_payload(
         if not matched:
             continue
         payload = _dxf_payload_for_match(row, root, source_pack_id, score=score)
-        if where and not _row_matches_where(payload, where):
+        if not matches_where(payload):
             continue
         total += 1
         scored_rows.append((score, _project_payload(payload, select_fields)))
@@ -2125,6 +2125,7 @@ def _query_chunk_rows_payload(
     offset: int = 0,
     include_sibling_shards: bool = True,
 ) -> dict:
+    matches_where = compile_where(where, _row_get, _MISSING)
     active_pack_ids = _resolve_pack_ids(
         pack_id=pack_id,
         pack_ids=pack_ids,
@@ -2135,7 +2136,7 @@ def _query_chunk_rows_payload(
     rows: list[dict] = []
     for active_pack_id in active_pack_ids:
         for row in _iter_cloud_chunk_rows(active_pack_id):
-            if _row_matches_where(row, where):
+            if matches_where(row):
                 rows.append(row)
     ordered = _sort_chunk_rows(rows, order_by)
     start = max(0, offset)
@@ -3234,18 +3235,21 @@ def mo_filtered_search_nodes(
     offset: int = 0,
     include_heavy_fields: bool = False,
 ) -> str:
-    """Filter graph nodes by exact property conditions and return only requested fields."""
+    """Filter nodes with field/operator or field__operator conditions and $and/$or/$not.
+
+    Sort before projection/pagination. order_by supports -field shorthand and
+    {field, direction, natural, nulls}; nulls default to last in both directions.
+    Invalid query syntax raises a tool error; numeric comparisons never parse IDs.
+    """
 
     if not _pack_is_visible(pack_id):
         return _forbidden_pack(pack_id)
-    graph, rows = _filtered_rows(
+    graph, nodes = _filtered_nodes(
         pack_id,
         node_type=node_type,
         where=where,
-        fields=fields,
-        include_heavy_fields=include_heavy_fields,
     )
-    ordered = _sort_rows(rows, order_by)
+    ordered = sort_records(nodes, order_by, _node_field, _MISSING)
     start = max(0, offset)
     end = start + max(0, limit)
     return _json(
@@ -3253,10 +3257,11 @@ def mo_filtered_search_nodes(
             "pack_id": graph["pack"]["id"],
             "node_type": node_type,
             "where": _normalize_tool_dict(where),
+            "scope": _node_query_scope(graph),
             "count": len(ordered),
             "offset": start,
             "limit": max(0, limit),
-            "rows": ordered[start:end],
+            "rows": [_project_node(node, fields, include_heavy_fields=include_heavy_fields) for node in ordered[start:end]],
             "truncated": len(ordered) > end,
             "projection": {
                 "fields": list(_normalize_tool_list(fields) or _DEFAULT_NODE_FIELDS),
@@ -3300,6 +3305,7 @@ def mo_distinct_property_values(
             "node_type": node_type,
             "property": property,
             "where": _normalize_tool_dict(where),
+            "scope": _node_query_scope(graph),
             "count": len(ordered),
             "values": ordered[:max_limit],
             "truncated": len(ordered) > max_limit,
@@ -3327,12 +3333,13 @@ def mo_aggregate_nodes(
     ordered = _sort_rows(rows, order_by)
     start = max(0, offset)
     end = start + max(0, limit)
-    metric_names = [_metric_name(metric if isinstance(metric, dict) else {"agg": str(metric)}) for metric in _normalize_tool_list(metrics)]
+    metric_names = [_metric_name(metric) for metric in _validated_metrics(metrics, list(_normalize_tool_list(group_by)))]
     return _json(
         {
             "pack_id": graph["pack"]["id"],
             "node_type": node_type,
             "where": _normalize_tool_dict(where),
+            "scope": _node_query_scope(graph),
             "group_by": list(_normalize_tool_list(group_by)),
             "metrics": metric_names,
             "input_count": len(nodes),
@@ -3407,29 +3414,30 @@ def mo_query_quantity_evidence(
             {"agg": "count", "as": "row_count"},
         ]
         rows, diagnostics = _aggregate_filtered_nodes(nodes, group_by=group_by, metrics=metric_specs)
+        ordered = _sort_rows(rows, order_by)
     else:
-        rows = [_project_node(node, fields) for node in nodes]
+        ordered = [_project_node(node, fields) for node in sort_records(nodes, order_by, _node_field, _MISSING)]
         diagnostics = {"skipped_rows": {}}
-    ordered = _sort_rows(rows, order_by)
-    total = 0.0
+    total_values = []
     skipped_total = 0
     for node in nodes:
-        number = _to_number(_node_field(node, sum_field))
+        number = numeric_value(_node_field(node, sum_field))
         if number is None:
             skipped_total += 1
         else:
-            total += number
+            total_values.append(number)
     max_limit = max(0, limit)
     return _json(
         {
             "pack_id": graph["pack"]["id"],
             "query_type": "quantity_evidence",
             "where": where,
+            "scope": _node_query_scope(graph),
             "count": len(ordered),
             "rows": ordered[:max_limit],
             "truncated": len(ordered) > max_limit,
             "totals": {
-                f"{sum_field}_sum": round(total, 6),
+                f"{sum_field}_sum": _query_number_result(_sum_query_numbers(total_values)),
                 "unit": unit or None,
                 "normalized_unit": normalized_unit or None,
                 "skipped_rows": skipped_total,
@@ -3640,17 +3648,22 @@ def _join_side_rows(side: dict) -> tuple[str, str, list[dict]]:
     join_field = str(side.get("join_field") or "")
     if not join_field:
         raise ValueError("join side requires join_field")
-    raw_fields = side.get("fields") if isinstance(side.get("fields"), Sequence) and not isinstance(side.get("fields"), str) else None
-    fields = list(raw_fields) if raw_fields else None
-    if fields is not None and join_field not in fields:
+    fields = _normalize_tool_list(side.get("fields")) or list(_DEFAULT_NODE_FIELDS)
+    if join_field not in fields:
         fields = [join_field, *fields]
-    graph, rows = _filtered_rows(
+    graph, nodes = _filtered_nodes(
         pack_id,
         node_type=side.get("node_type"),
-        where=side.get("where") if isinstance(side.get("where"), dict) else None,
-        fields=fields,
-        include_heavy_fields=bool(side.get("include_heavy_fields", False)),
+        where=side.get("where"),
     )
+    rows = []
+    for node in nodes:
+        row = _project_node(node, fields, include_heavy_fields=bool(side.get("include_heavy_fields", False)))
+        value = _node_field(node, join_field)
+        if value is not _MISSING:
+            # Matching always uses the requested source path, regardless of aliases.
+            row[join_field] = value
+        rows.append(row)
     return graph["pack"]["id"], join_field, rows
 
 
@@ -3690,8 +3703,15 @@ def mo_join_by_property(
     limit: int = 10000,
     summarize_right: bool = True,
 ) -> str:
-    """Join two packs by property value, for example BOQ module_type to BIM workset_name."""
+    """Join packs by a property path, preserving each left row and grouped right rows.
 
+    join_type accepts inner/left/right/outer/full; missing keys are excluded.
+    Each side's join_field is included even when fields uses the default projection.
+    """
+
+    lowered_join_type = str(join_type).lower()
+    if lowered_join_type not in {"inner", "left", "right", "outer", "full"}:
+        return _tool_payload_error("join_type must be inner, left, right, outer or full")
     try:
         left_pack_id, left_join_field, left_rows = _join_side_rows(_normalize_tool_dict(left))
         right_pack_id, right_join_field, right_rows = _join_side_rows(_normalize_tool_dict(right))
@@ -3704,7 +3724,6 @@ def mo_join_by_property(
     right_groups = _group_rows_by_key(right_rows, right_join_field)
     left_keys = set(left_groups)
     right_keys = set(right_groups)
-    lowered_join_type = str(join_type).lower()
     if lowered_join_type == "left":
         keys = left_keys
     elif lowered_join_type == "right":
@@ -3714,8 +3733,12 @@ def mo_join_by_property(
     else:
         keys = left_keys & right_keys
 
+    max_limit = max(0, limit)
+    total_rows = sum(max(1, len(left_groups.get(key, []))) for key in keys)
     rows = []
     for key in _sort_values(list(keys)):
+        if len(rows) >= max_limit:
+            break
         left_group = left_groups.get(str(key), [])
         right_group = right_groups.get(str(key), [])
         if not left_group and lowered_join_type in {"inner", "left"}:
@@ -3729,10 +3752,8 @@ def mo_join_by_property(
             else:
                 row["right"] = right_group
             rows.append(row)
-            if len(rows) >= max(0, limit):
+            if len(rows) >= max_limit:
                 break
-        if len(rows) >= max(0, limit):
-            break
 
     return _json(
         {
@@ -3743,7 +3764,7 @@ def mo_join_by_property(
             "matched_keys": len(left_keys & right_keys),
             "join_type": lowered_join_type,
             "rows": rows,
-            "truncated": len(rows) >= max(0, limit) and len(keys) > len(rows),
+            "truncated": len(rows) < total_rows,
             "unmatched_left": _sort_values(list(left_keys - right_keys))[:1000],
             "unmatched_right": _sort_values(list(right_keys - left_keys))[:1000],
         }
@@ -3787,7 +3808,7 @@ def mo_schema_profile(
                 seen = set()
                 numeric_count = 0
                 for value in present_values:
-                    if _to_number(value) is not None:
+                    if numeric_value(value) is not None:
                         numeric_count += 1
                     sample_value = _compact_sample_value(value)
                     key = json.dumps(sample_value, ensure_ascii=False, sort_keys=True)

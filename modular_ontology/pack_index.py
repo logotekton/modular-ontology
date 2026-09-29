@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .config import DB_PATH, LEGACY_STRUCTURED_PACKS_DIR, PACKS_DIR, ROOT, USE_STRUCTURED_DATA_DIR
+from .pack_documents import iter_cloud_chunks, iter_markdown_documents
+# Re-export existing helpers for callers that import them from pack_index.
+from .search import first_term_hit, query_terms, score_terms, search_snippet
 
 UPLOAD_DIR = PACKS_DIR
 
@@ -145,6 +148,8 @@ def _kind_for(node_id: str, obj: dict[str, Any]) -> str:
     labels = obj.get("labels")
     if isinstance(labels, list) and labels:
         return str(labels[0])
+    if obj.get("type"):
+        return str(obj["type"])
     if ":module_type:" in node_id:
         return "ModuleType"
     if ":module:" in node_id:
@@ -175,17 +180,18 @@ def _node(node_id: str, obj: dict[str, Any], pack_id: str) -> dict[str, Any]:
         "id": node_id,
         "label": _label_for(obj, node_id),
         "type": kind,
+        "labels": obj.get("labels") if isinstance(obj.get("labels"), list) and obj["labels"] else [kind],
         "packId": pack_id,
         "size": size,
         "color": TYPE_COLORS.get(kind, "#737373"),
-        "properties": obj.get("properties", obj),
+        "properties": obj["properties"] if isinstance(obj.get("properties"), dict) else obj,
     }
 
 
 def _edge(source: str, target: str, relation: str, pack_id: str, raw: dict[str, Any] | None = None) -> dict[str, Any]:
-    key = f"{pack_id}:{source}:{relation}:{target}"
+    key = json.dumps([pack_id, source, relation, target], ensure_ascii=False)
     return {
-        "id": hashlib.sha1(key.encode("utf-8")).hexdigest()[:16],
+        "id": str(raw["id"]) if raw and raw.get("id") is not None else hashlib.sha1(key.encode("utf-8")).hexdigest()[:16],
         "source": source,
         "target": target,
         "label": relation,
@@ -846,70 +852,6 @@ def get_section_weight_index(pack_id: str) -> dict[str, Any]:
     }
 
 
-_QUERY_TOKEN_RE = re.compile(r"[a-z0-9]+|[가-힣]+")
-_QUERY_STOPWORDS = {
-    "the", "and", "for", "with", "what", "which", "how", "are", "is", "of", "to",
-    "this", "that", "from", "about", "tell", "show", "list", "give", "please",
-    "설명", "알려", "무엇", "어떤", "어떻게", "그리고", "그것", "대해", "해줘", "주세요", "입니까", "인가요",
-}
-
-
-def query_terms(query: str) -> list[str]:
-    """Tokenize a query into searchable substrings.
-
-    ASCII/number words are kept whole; Hangul runs are kept whole (when short) and
-    also split into character bigrams so morphological variants (조사 등) still match
-    document text. Without this, substring search requires the whole phrase verbatim,
-    which makes natural-language Korean questions return nothing.
-    """
-    terms: list[str] = []
-    seen: set[str] = set()
-
-    def push(term: str) -> None:
-        if term and term not in seen:
-            seen.add(term)
-            terms.append(term)
-
-    for token in _QUERY_TOKEN_RE.findall(query.lower()):
-        if "가" <= token[0] <= "힣":  # Hangul run
-            if 2 <= len(token) <= 4 and token not in _QUERY_STOPWORDS:
-                push(token)
-            for i in range(len(token) - 1):
-                push(token[i : i + 2])
-        elif token.isdigit():
-            push(token)
-        elif len(token) >= 2 and token not in _QUERY_STOPWORDS:
-            push(token)
-    return terms
-
-
-def score_terms(text_lower: str, terms: list[str]) -> float:
-    """Score text by how many distinct query terms it contains, weighting longer
-    terms and rewarding coverage of more distinct terms."""
-    if not terms:
-        return 0.0
-    score = 0.0
-    matched = 0
-    for term in terms:
-        count = text_lower.count(term)
-        if count:
-            matched += 1
-            length_weight = 1.0 + 0.4 * (len(term) - 1)
-            score += length_weight * (1.0 + 0.2 * min(count, 5))
-    if not matched:
-        return 0.0
-    return score * (1.0 + 0.5 * matched)
-
-
-def first_term_hit(text_lower: str, terms: list[str]) -> int:
-    first = -1
-    for term in terms:
-        pos = text_lower.find(term)
-        if pos >= 0 and (first < 0 or pos < first):
-            first = pos
-    return first
-
-
 def search_packs(query: str = "", limit: int = 20) -> list[dict[str, Any]]:
     packs = list_packs()
     terms = query_terms(query)
@@ -963,7 +905,21 @@ def list_sources(pack_id: str | None = None) -> dict[str, Any]:
     }
 
 
-def build_graph(pack_id: str, max_nodes: int = 900, max_edges: int = 1600) -> dict[str, Any]:
+def _graph_stats(node_count: int, edge_count: int, total_nodes: int, total_edges: int) -> dict[str, Any]:
+    total_nodes = max(node_count, total_nodes)
+    total_edges = max(edge_count, total_edges)
+    return {
+        "visibleNodes": node_count,
+        "visibleEdges": edge_count,
+        "totalNodes": total_nodes,
+        "totalEdges": total_edges,
+        "nodesTruncated": node_count < total_nodes,
+        "edgesTruncated": edge_count < total_edges,
+        "truncated": node_count < total_nodes or edge_count < total_edges,
+    }
+
+
+def build_graph(pack_id: str, max_nodes: int | None = 900, max_edges: int | None = 1600) -> dict[str, Any]:
     try:
         pack = find_pack(pack_id)
         return build_graph_from_pack(pack, max_nodes=max_nodes, max_edges=max_edges)
@@ -984,7 +940,7 @@ def _node_size_for_type(node_type: str) -> int:
     return 5
 
 
-def _build_graph_from_db(pack_id: str, max_nodes: int = 900, max_edges: int = 1600) -> dict[str, Any] | None:
+def _build_graph_from_db(pack_id: str, max_nodes: int | None = 900, max_edges: int | None = 1600) -> dict[str, Any] | None:
     summary = _db_pack_summary(pack_id)
     if not summary:
         _sync_registry_from_drive()
@@ -1002,21 +958,30 @@ def _build_graph_from_db(pack_id: str, max_nodes: int = 900, max_edges: int = 16
             SELECT id, label, type, properties_json
             FROM nodes
             WHERE pack_id = ?
-            ORDER BY type, label
+            ORDER BY type, label, id
             LIMIT ?
             """,
-            (summary["id"], max(0, max_nodes)),
+            (summary["id"], -1 if max_nodes is None else max(0, max_nodes)),
         ).fetchall()
-        visible_node_ids = {str(row["id"]) for row in node_rows}
+        # Filter to the displayed induced subgraph before applying the edge
+        # budget. A prefix of unrelated edges can otherwise hide every link.
         edge_rows = conn.execute(
             """
-            SELECT id, source, target, relation, properties_json
-            FROM edges
-            WHERE pack_id = ?
+            WITH visible AS (
+                SELECT id FROM nodes WHERE pack_id = ?
+                ORDER BY type, label, id LIMIT ?
+            )
+            SELECT e.id, e.source, e.target, e.relation, e.properties_json
+            FROM edges AS e
+            JOIN visible AS source_node ON source_node.id = e.source
+            JOIN visible AS target_node ON target_node.id = e.target
+            WHERE e.pack_id = ?
+            ORDER BY e.id
             LIMIT ?
             """,
-            (summary["id"], max(0, max_edges) * 4 + 200),
-        ).fetchall()
+            (summary["id"], -1 if max_nodes is None else max(0, max_nodes),
+             summary["id"], -1 if max_edges is None else max(0, max_edges)),
+        ).fetchall() if node_rows and (max_edges is None or max_edges > 0) else []
     except sqlite3.Error:
         return None
     finally:
@@ -1034,6 +999,7 @@ def _build_graph_from_db(pack_id: str, max_nodes: int = 900, max_edges: int = 16
                 "id": str(row["id"]),
                 "label": str(row["label"] or row["id"]),
                 "type": node_type,
+                "labels": [node_type],
                 "packId": summary["id"],
                 "size": _node_size_for_type(node_type),
                 "color": TYPE_COLORS.get(node_type, "#737373"),
@@ -1045,8 +1011,6 @@ def _build_graph_from_db(pack_id: str, max_nodes: int = 900, max_edges: int = 16
     for row in edge_rows:
         source = str(row["source"] or "")
         target = str(row["target"] or "")
-        if source not in visible_node_ids or target not in visible_node_ids:
-            continue
         try:
             properties = json.loads(row["properties_json"] or "{}")
         except json.JSONDecodeError:
@@ -1062,19 +1026,12 @@ def _build_graph_from_db(pack_id: str, max_nodes: int = 900, max_edges: int = 16
                 "properties": properties,
             }
         )
-        if len(edges) >= max_edges:
-            break
 
     return {
         "pack": summary,
         "nodes": nodes,
         "edges": edges,
-        "stats": {
-            "visibleNodes": len(nodes),
-            "visibleEdges": len(edges),
-            "totalNodes": total_nodes,
-            "totalEdges": total_edges,
-        },
+        "stats": _graph_stats(len(nodes), len(edges), total_nodes, total_edges),
         "source": "sqlite-index",
     }
 
@@ -1087,6 +1044,8 @@ def build_multi_pack_graph(
     max_nodes: int = 900,
     max_edges: int = 1600,
 ) -> dict[str, Any]:
+    max_nodes = max(0, max_nodes)
+    max_edges = max(0, max_edges)
     active_pack_ids = [pack_id for pack_id in dict.fromkeys(pack_ids) if pack_id]
     if not active_pack_ids:
         return {
@@ -1103,20 +1062,26 @@ def build_multi_pack_graph(
             "activePackIds": [],
             "nodes": [],
             "edges": [],
-            "stats": {"visibleNodes": 0, "visibleEdges": 0, "totalNodes": 0, "totalEdges": 0},
+            "stats": _graph_stats(0, 0, 0, 0),
         }
 
-    per_pack_nodes = max(1, max_nodes // len(active_pack_ids))
-    per_pack_edges = max(1, max_edges // len(active_pack_ids))
     merged_nodes: list[dict[str, Any]] = []
     merged_edges: list[dict[str, Any]] = []
     pack_summaries: list[dict[str, Any]] = []
+    resolved_pack_ids: set[str] = set()
     total_nodes = 0
     total_edges = 0
 
-    for pack_id in active_pack_ids:
+    for pack_index, pack_id in enumerate(active_pack_ids):
+        remaining_packs = len(active_pack_ids) - pack_index
+        per_pack_nodes = (max_nodes - len(merged_nodes) + remaining_packs - 1) // remaining_packs
+        per_pack_edges = (max_edges - len(merged_edges) + remaining_packs - 1) // remaining_packs
         graph = build_graph(pack_id, max_nodes=per_pack_nodes, max_edges=per_pack_edges)
         summary = graph["pack"]
+        # A manifest ID and its ZIP filename can resolve to the same pack.
+        if summary["id"] in resolved_pack_ids:
+            continue
+        resolved_pack_ids.add(summary["id"])
         pack_summaries.append(summary)
         total_nodes += int(graph["stats"].get("totalNodes") or 0)
         total_edges += int(graph["stats"].get("totalEdges") or 0)
@@ -1168,25 +1133,42 @@ def build_multi_pack_graph(
         "activePackIds": active_pack_ids,
         "nodes": merged_nodes,
         "edges": merged_edges,
-        "stats": {
-            "visibleNodes": len(merged_nodes),
-            "visibleEdges": len(merged_edges),
-            "totalNodes": total_nodes,
-            "totalEdges": total_edges,
-        },
+        "stats": _graph_stats(len(merged_nodes), len(merged_edges), total_nodes, total_edges),
     }
+
+
+def _query_sample_scope(graph: dict[str, Any], *, include_edges: bool = False) -> dict[str, Any]:
+    stats = graph.get("stats", {})
+    scanned_nodes = len(graph.get("nodes", []))
+    scanned_edges = len(graph.get("edges", []))
+    total_nodes = int(stats.get("totalNodes", scanned_nodes))
+    total_edges = int(stats.get("totalEdges", scanned_edges))
+    sampled = scanned_nodes < total_nodes or (include_edges and scanned_edges < total_edges)
+    scope: dict[str, Any] = {
+        "coverage": "sampled_graph" if sampled else "available_graph",
+        "sampled": sampled,
+        "scanned_nodes": scanned_nodes,
+        "available_nodes": total_nodes,
+    }
+    if include_edges:
+        scope.update(scanned_edges=scanned_edges, available_edges=total_edges)
+    if sampled:
+        scope["warning"] = "Counts and missing matches apply only to the graph sample; use structured node queries for all available nodes."
+    return scope
 
 
 def list_nodes(pack_id: str, node_type: str | None = None, limit: int = 100) -> dict[str, Any]:
     graph = build_graph(pack_id, max_nodes=max(1000, limit * 5), max_edges=0)
+    scope = _query_sample_scope(graph)
     nodes = graph["nodes"]
     if node_type:
         nodes = [node for node in nodes if str(node.get("type", "")).lower() == node_type.lower()]
     return {
         "pack_id": graph["pack"]["id"],
         "count": len(nodes),
+        "scope": scope,
         "nodes": nodes[: max(0, limit)],
-        "truncated": len(nodes) > max(0, limit),
+        "truncated": scope["sampled"] or len(nodes) > max(0, limit),
     }
 
 
@@ -1195,6 +1177,7 @@ def search_nodes(pack_id: str, query: str, limit: int = 20) -> dict[str, Any]:
     if not terms:
         return {"pack_id": pack_id, "count": 0, "nodes": []}
     graph = build_graph(pack_id, max_nodes=5000, max_edges=0)
+    scope = _query_sample_scope(graph)
     scored: list[tuple[float, dict[str, Any]]] = []
     for node in graph["nodes"]:
         haystack = (
@@ -1210,8 +1193,9 @@ def search_nodes(pack_id: str, query: str, limit: int = 20) -> dict[str, Any]:
         "pack_id": graph["pack"]["id"],
         "query": query,
         "count": len(matches),
+        "scope": scope,
         "nodes": matches[: max(0, limit)],
-        "truncated": len(matches) > max(0, limit),
+        "truncated": scope["sampled"] or len(matches) > max(0, limit),
     }
 
 
@@ -1223,6 +1207,7 @@ def list_edges(
     limit: int = 200,
 ) -> dict[str, Any]:
     graph = build_graph(pack_id, max_nodes=5000, max_edges=max(1000, limit * 5))
+    scope = _query_sample_scope(graph, include_edges=True)
     edges = graph["edges"]
     if source:
         edges = [edge for edge in edges if edge_endpoint_id(edge["source"]) == source]
@@ -1233,19 +1218,22 @@ def list_edges(
     return {
         "pack_id": graph["pack"]["id"],
         "count": len(edges),
+        "scope": scope,
         "edges": edges[: max(0, limit)],
-        "truncated": len(edges) > max(0, limit),
+        "truncated": scope["sampled"] or len(edges) > max(0, limit),
     }
 
 
 def get_node_context(pack_id: str, node_id: str, limit: int = 50) -> dict[str, Any]:
     graph = build_graph(pack_id, max_nodes=5000, max_edges=12000)
+    scope = _query_sample_scope(graph, include_edges=True)
     node_by_id = {node["id"]: node for node in graph["nodes"]}
-    edges = [
+    matching_edges = [
         edge
         for edge in graph["edges"]
         if edge_endpoint_id(edge["source"]) == node_id or edge_endpoint_id(edge["target"]) == node_id
-    ][: max(0, limit)]
+    ]
+    edges = matching_edges[: max(0, limit)]
     neighbor_ids = {
         endpoint
         for edge in edges
@@ -1255,45 +1243,77 @@ def get_node_context(pack_id: str, node_id: str, limit: int = 50) -> dict[str, A
     return {
         "pack_id": graph["pack"]["id"],
         "node": node_by_id.get(node_id),
+        "node_status": "found" if node_id in node_by_id else "not_in_sample" if scope["scanned_nodes"] < scope["available_nodes"] else "not_found",
+        "scope": scope,
+        "truncated": scope["sampled"] or len(matching_edges) > max(0, limit),
         "neighbors": [node_by_id[node] for node in sorted(neighbor_ids) if node in node_by_id],
         "edges": edges,
     }
 
 
-def edge_endpoint_id(endpoint: str | dict[str, Any]) -> str:
-    return endpoint if isinstance(endpoint, str) else str(endpoint.get("id", ""))
+def edge_endpoint_id(endpoint: Any) -> str:
+    if isinstance(endpoint, dict):
+        endpoint = endpoint.get("id")
+    return "" if endpoint is None else str(endpoint)
 
 
-def build_graph_from_pack(pack: PackFile, max_nodes: int = 900, max_edges: int = 1600) -> dict[str, Any]:
+def build_graph_from_pack(pack: PackFile, max_nodes: int | None = 900, max_edges: int | None = 1600) -> dict[str, Any]:
+    max_nodes = None if max_nodes is None else max(0, max_nodes)
+    max_edges = None if max_edges is None else max(0, max_edges)
     summary = summarize_pack(pack)
     nodes: dict[str, dict[str, Any]] = {}
     edges: list[dict[str, Any]] = []
+    total_nodes = int(summary["counts"].get("nodes") or 0)
+    total_edges = int(summary["counts"].get("edges") or 0)
 
     with zipfile.ZipFile(pack.path) as zf:
-        if "graph/nodes.jsonl" in zf.namelist() and "graph/edges.jsonl" in zf.namelist():
-            for obj in _iter_jsonl(zf, "graph/nodes.jsonl", max_nodes):
-                node_id = str(obj.get("id"))
+        entrypoints = summary.get("entrypoints") if isinstance(summary.get("entrypoints"), dict) else {}
+        nodes_path = entrypoints.get("nodes", "graph/nodes.jsonl")
+        edges_path = entrypoints.get("edges", "graph/edges.jsonl")
+        if nodes_path in zf.namelist():
+            nodes_complete = True
+            for obj in _iter_jsonl(zf, nodes_path):
+                if max_nodes is not None and len(nodes) >= max_nodes:
+                    nodes_complete = False
+                    break
+                if not isinstance(obj, dict) or obj.get("id") is None:
+                    continue
+                node_id = str(obj["id"])
+                if not node_id:
+                    continue
                 nodes[node_id] = _node(node_id, obj, summary["id"])
-            for obj in _iter_jsonl(zf, "graph/edges.jsonl", max_edges * 3):
-                source = str(obj.get("source", ""))
-                target = str(obj.get("target", ""))
-                if source in nodes and target in nodes:
-                    edges.append(_edge(source, target, str(obj.get("relation", "related_to")), summary["id"], obj))
-                    if len(edges) >= max_edges:
+            if nodes_complete:
+                total_nodes = len(nodes)
+            seen_edge_ids: set[str] = set()
+            if nodes and (max_edges is None or max_edges > 0):
+                edges_complete = True
+                for obj in _iter_jsonl(zf, edges_path):
+                    if not isinstance(obj, dict):
+                        continue
+                    source = edge_endpoint_id(obj.get("source", ""))
+                    target = edge_endpoint_id(obj.get("target", ""))
+                    if source not in nodes or target not in nodes:
+                        continue
+                    edge = _edge(source, target, str(obj.get("relation") or "related_to"), summary["id"], obj)
+                    if edge["id"] in seen_edge_ids:
+                        continue
+                    seen_edge_ids.add(edge["id"])
+                    edges.append(edge)
+                    if max_edges is not None and len(edges) >= max_edges:
+                        edges_complete = False
                         break
+                if nodes_complete and edges_complete:
+                    total_edges = len(edges)
         else:
-            _build_producer_graph(zf, summary["id"], nodes, edges, max_nodes, max_edges)
+            total_nodes, total_edges = _build_producer_graph(
+                zf, summary["id"], nodes, edges, max_nodes, max_edges, total_edges_hint=total_edges,
+            )
 
     return {
         "pack": summary,
         "nodes": list(nodes.values()),
         "edges": edges,
-        "stats": {
-            "visibleNodes": len(nodes),
-            "visibleEdges": len(edges),
-            "totalNodes": summary["counts"].get("nodes") or len(nodes),
-            "totalEdges": summary["counts"].get("edges") or len(edges),
-        },
+        "stats": _graph_stats(len(nodes), len(edges), total_nodes, total_edges),
     }
 
 
@@ -1302,46 +1322,78 @@ def _build_producer_graph(
     pack_id: str,
     nodes: dict[str, dict[str, Any]],
     edges: list[dict[str, Any]],
-    max_nodes: int,
-    max_edges: int,
-) -> None:
+    max_nodes: int | None,
+    max_edges: int | None,
+    *,
+    total_edges_hint: int = 0,
+) -> tuple[int, int]:
     node_sources = [
-        ("backdata/jsonl/module_types.jsonl", 120),
-        ("backdata/jsonl/modules.jsonl", 160),
-        ("backdata/jsonl/materials.jsonl", 120),
-        ("backdata/jsonl/sections.jsonl", 180),
-        ("backdata/jsonl/assemblies.jsonl", 360),
-        ("backdata/jsonl/single_parts.jsonl", 500),
+        ("backdata/jsonl/module_types.jsonl", "ModuleType"),
+        ("backdata/jsonl/modules.jsonl", "Module"),
+        ("backdata/jsonl/materials.jsonl", "Material"),
+        ("backdata/jsonl/sections.jsonl", "Section"),
+        ("backdata/jsonl/assemblies.jsonl", "Assembly"),
+        ("backdata/jsonl/single_parts.jsonl", "SinglePart"),
     ]
-    for path, limit in node_sources:
-        for obj in _iter_jsonl(zf, path, limit):
-            if len(nodes) >= max_nodes:
-                break
-            node_id = str(obj.get("id") or obj.get("module_id") or obj.get("name"))
-            if node_id and node_id != "None":
-                nodes[node_id] = _node(node_id, obj, pack_id)
+    all_node_ids: set[str] = set()
+    inferred: dict[tuple[str, str, str], None] = {}
+    for path, node_type in node_sources:
+        for obj in _iter_jsonl(zf, path):
+            if not isinstance(obj, dict):
+                continue
+            node_id = str(obj.get("id") or obj.get("module_id") or obj.get("name") or "")
+            if not node_id or node_id in all_node_ids:
+                continue
+            all_node_ids.add(node_id)
+            if max_nodes is None or len(nodes) < max_nodes:
+                nodes[node_id] = _node(node_id, {"type": node_type, **obj}, pack_id)
+            if max_edges == 0:
+                continue
+            props = obj.get("properties") if isinstance(obj.get("properties"), dict) else obj
+            for key, relation in [
+                ("module_id", "belongs_to_module"),
+                ("assembly_id", "belongs_to_assembly"),
+                ("material_id", "uses_material"),
+                ("section_id", "uses_section"),
+            ]:
+                target = str(props.get(key) or "")
+                if target and target != node_id:
+                    inferred[node_id, target, relation] = None
 
-    for obj in _iter_jsonl(zf, "backdata/jsonl/edges.jsonl", max_edges * 4):
-        source = str(obj.get("from") or obj.get("source") or "")
-        target = str(obj.get("to") or obj.get("target") or "")
-        if source in nodes and target in nodes:
-            edges.append(_edge(source, target, str(obj.get("relation", "related_to")), pack_id, obj))
-            if len(edges) >= max_edges:
-                return
+    # Structured queries request nodes only. Avoid parsing the entire edge
+    # stream or retaining relationship keys for an unused visualization.
+    if max_edges == 0:
+        return len(all_node_ids), total_edges_hint
 
-    for node in list(nodes.values()):
-        props = node["properties"]
-        for key, relation in [
-            ("module_id", "belongs_to_module"),
-            ("assembly_id", "belongs_to_assembly"),
-            ("material_id", "uses_material"),
-            ("section_id", "uses_section"),
-        ]:
-            target_value = props.get(key)
-            if target_value and target_value in nodes:
-                edges.append(_edge(node["id"], str(target_value), relation, pack_id))
-                if len(edges) >= max_edges:
-                    return
+    total_edges = 0
+    seen_edge_ids: set[str] = set()
+    explicit_relations: set[tuple[str, str, str]] = set()
+
+    def add_edge(source: str, target: str, relation: str, raw: dict[str, Any] | None = None) -> None:
+        nonlocal total_edges
+        if source not in all_node_ids or target not in all_node_ids:
+            return
+        edge = _edge(source, target, relation, pack_id, raw)
+        if edge["id"] in seen_edge_ids:
+            return
+        seen_edge_ids.add(edge["id"])
+        total_edges += 1
+        if source in nodes and target in nodes and (max_edges is None or len(edges) < max_edges):
+            edges.append(edge)
+
+    for obj in _iter_jsonl(zf, "backdata/jsonl/edges.jsonl"):
+        if not isinstance(obj, dict):
+            continue
+        source = edge_endpoint_id(obj.get("from") or obj.get("source") or "")
+        target = edge_endpoint_id(obj.get("to") or obj.get("target") or "")
+        relation = str(obj.get("relation") or "related_to")
+        if source in all_node_ids and target in all_node_ids:
+            explicit_relations.add((source, target, relation))
+            add_edge(source, target, relation, obj)
+    for source, target, relation in inferred:
+        if (source, target, relation) not in explicit_relations:
+            add_edge(source, target, relation)
+    return len(all_node_ids), total_edges
 
 
 def list_projects() -> list[dict[str, Any]]:
@@ -1361,79 +1413,49 @@ def search_pack(pack_id: str, query: str, limit: int = 8) -> list[dict[str, Any]
         return []
     scored: list[tuple[float, dict[str, Any]]] = []
     with zipfile.ZipFile(pack.path) as zf:
-        for info in zf.infolist():
-            if not (info.filename.startswith("documents/") and info.filename.endswith(".md")):
-                continue
-            text = zf.read(info.filename).decode("utf-8-sig", errors="replace")
+        for path, text in iter_markdown_documents(zf):
             lower = text.lower()
-            score = score_terms(lower + " " + info.filename.lower(), terms)
+            score = score_terms(lower + " " + path.lower(), terms)
             if score <= 0:
                 continue
-            hit = first_term_hit(lower, terms)
-            if hit < 0:
-                hit = 0
-            start = max(0, hit - 120)
-            end = min(len(text), hit + 260)
             scored.append(
                 (
                     score,
                     {
-                        "path": info.filename,
-                        "title": Path(info.filename).stem,
-                        "snippet": re.sub(r"\s+", " ", text[start:end]).strip(),
+                        "path": path,
+                        "title": Path(path).stem,
+                        "snippet": search_snippet(text, terms),
                         "score": round(score, 3),
                     },
                 )
             )
-        if "cloud/chunks.jsonl" in zf.namelist():
-            for raw_line in zf.read("cloud/chunks.jsonl").decode("utf-8-sig", errors="replace").splitlines():
-                if not raw_line.strip():
-                    continue
-                try:
-                    chunk = json.loads(raw_line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(chunk, dict):
-                    continue
-                content = str(chunk.get("content") or chunk.get("text") or "")
-                chunk_id = str(chunk.get("chunk_id") or chunk.get("id") or "").strip()
-                title = str(chunk.get("title") or chunk.get("heading") or chunk_id or "Evidence chunk")
-                metadata = chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else {}
-                haystack = " ".join(
-                    [
-                        content,
-                        title,
-                        chunk_id,
-                        str(chunk.get("document_id") or chunk.get("parent_document_id") or ""),
-                        json.dumps(metadata, ensure_ascii=False),
-                    ]
-                ).lower()
-                score = score_terms(haystack, terms)
-                if score <= 0:
-                    continue
-                hit = first_term_hit(content.lower(), terms)
-                if hit < 0:
-                    hit = 0
-                start = max(0, hit - 120)
-                end = min(len(content), hit + 260)
-                scored.append(
-                    (
-                        score,
-                        {
-                            "path": f"cloud/chunks.jsonl#{chunk_id}" if chunk_id else "cloud/chunks.jsonl",
-                            "title": title,
-                            "snippet": re.sub(r"\s+", " ", content[start:end]).strip(),
-                            "score": round(score, 3),
-                            "source": "cloud-chunk",
-                            "chunkId": chunk_id or None,
-                            "documentId": chunk.get("document_id") or chunk.get("parent_document_id"),
-                            "sourceUrl": chunk.get("source_url"),
-                            "sourceRef": chunk.get("source_ref"),
-                            "compactSourceRefs": chunk.get("compact_source_refs"),
-                            "metadata": metadata,
-                        },
-                    )
+        for chunk in iter_cloud_chunks(zf):
+            document_id = chunk.raw.get("document_id") or chunk.raw.get("parent_document_id")
+            haystack = " ".join([
+                chunk.content, chunk.title, chunk.id, str(document_id or ""),
+                json.dumps(chunk.metadata, ensure_ascii=False),
+            ]).lower()
+            score = score_terms(haystack, terms)
+            if score <= 0:
+                continue
+            scored.append(
+                (
+                    score,
+                    {
+                        "path": chunk.path,
+                        "title": chunk.title,
+                        "snippet": search_snippet(chunk.content, terms),
+                        "score": round(score, 3),
+                        "source": "cloud-chunk",
+                        "chunkId": chunk.id or None,
+                        "documentId": document_id,
+                        "sourceUrl": chunk.raw.get("source_url"),
+                        "sourceRef": chunk.raw.get("source_ref"),
+                        "compactSourceRefs": chunk.raw.get("compact_source_refs"),
+                        "metadata": chunk.metadata,
+                    },
                 )
+            )
     scored.sort(key=lambda item: item[0], reverse=True)
     return [item[1] for item in scored[:limit]]
 
@@ -1475,18 +1497,13 @@ def _search_pack_from_db(pack_id: str, query: str, limit: int = 8) -> list[dict[
         score = score_terms(lower + " " + str(row["title"]).lower() + " " + str(row["path"]).lower(), terms)
         if score <= 0:
             continue
-        hit = first_term_hit(lower, terms)
-        if hit < 0:
-            hit = 0
-        start = max(0, hit - 120)
-        end = min(len(text), hit + 260)
         scored.append(
             (
                 score,
                 {
                     "path": row["path"],
                     "title": row["title"],
-                    "snippet": re.sub(r"\s+", " ", text[start:end]).strip(),
+                    "snippet": search_snippet(text, terms),
                     "score": round(score, 3),
                     "source": "sqlite-index",
                 },

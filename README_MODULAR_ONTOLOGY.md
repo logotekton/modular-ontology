@@ -66,6 +66,9 @@ Long conversions use `MODULAR_ONTOLOGY_XKT_CONVERTER_TIMEOUT_SECONDS` and defaul
 
 The default graph experience should use `/api/projects/{project_id}/graph` because one project can contain multiple packs. Keep `/api/graph/{pack_id}` for focused pack inspection and compatibility.
 
+See [Graph representation and structured queries](docs/graph-query.md) for directed
+relationships, display limits, MCP filter syntax, sorting, and aggregation examples.
+
 ## Local verification
 
 Run these before handing off a local change:
@@ -267,4 +270,3 @@ $env:MODULAR_ONTOLOGY_OPENAI_MODEL="gpt-4.1-mini"
 Then call `/api/query` or `mo_question_answer` with `use_openai: true`. If `MODULAR_ONTOLOGY_OPENAI_MODEL` is unset, the default model is `gpt-4.1-mini`.
 
 For the hosted web UI, production does not need a shared `OPENAI_API_KEY`. Users can enter their own OpenAI API key in the AI Query panel; the key is sent only with that request and is not written to server storage.
-

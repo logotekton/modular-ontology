@@ -28,6 +28,8 @@ export function AiChatPanel({
   onQuestionChange,
   onSubmit,
   onHighlight,
+  scopeLabel,
+  unavailableReason,
 }: {
   keyReady: boolean;
   loading: boolean;
@@ -36,6 +38,8 @@ export function AiChatPanel({
   onQuestionChange: (value: string) => void;
   onSubmit: () => void;
   onHighlight?: (ids: string[] | null) => void;
+  scopeLabel?: string;
+  unavailableReason?: string;
 }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const hasContent = messages.length > 0 || loading;
@@ -49,6 +53,11 @@ export function AiChatPanel({
   return (
     <div className="ai-chat-astryx" data-astryx-theme="neutral" data-astryx-media="light">
       <div className="ai-chat-scroll" ref={scrollRef}>
+        {unavailableReason ? (
+          <div className="ai-chat-keywarn">
+            <Banner status="warning" title="질의 범위를 확인하세요" description={unavailableReason} />
+          </div>
+        ) : null}
         {!keyReady ? (
           <div className="ai-chat-keywarn">
             <Banner
@@ -123,7 +132,7 @@ export function AiChatPanel({
         ) : (
           <div className="ai-chat-empty">
             <Text type="label" weight="semibold">
-              프로젝트 데이터에 바로 질문하세요
+              선택한 팩에 질문하세요
             </Text>
             <Text type="supporting" color="secondary">
               지식그래프를 근거로 답변합니다.
@@ -133,13 +142,16 @@ export function AiChatPanel({
       </div>
 
       <div className="ai-chat-dock">
+        {scopeLabel && !unavailableReason ? (
+          <Text type="supporting" color="secondary">질의 대상: {scopeLabel} (한 팩)</Text>
+        ) : null}
         <ChatComposer
           density="compact"
           value={question}
           onChange={onQuestionChange}
           onSubmit={() => onSubmit()}
-          placeholder={keyReady ? "그래프에 질문하기…" : "OpenAI API key를 먼저 등록·검증하세요"}
-          isDisabled={!keyReady || loading}
+          placeholder={unavailableReason ? "질의할 프로젝트 팩을 선택하세요" : keyReady ? "그래프에 질문하기…" : "OpenAI API key를 먼저 등록·검증하세요"}
+          isDisabled={!keyReady || loading || Boolean(unavailableReason)}
         />
       </div>
     </div>

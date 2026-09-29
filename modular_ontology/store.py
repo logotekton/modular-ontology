@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 import zipfile
 from pathlib import Path
@@ -11,13 +10,11 @@ from .config import DB_PATH
 from .pack_index import (
     PackFile,
     build_graph_from_pack,
-    discover_pack_files,
-    first_term_hit,
-    query_terms,
-    score_terms,
     summarize_pack,
     unique_pack_files,
 )
+from .pack_documents import iter_cloud_chunks, iter_markdown_documents
+from .search import query_terms, score_terms, search_snippet
 
 
 def connect(db_path: Path | None = None) -> sqlite3.Connection:
@@ -121,48 +118,31 @@ def _index_documents(conn: sqlite3.Connection, pack: PackFile, pack_id: str) -> 
     with zipfile.ZipFile(pack.path) as zf:
         with conn:
             conn.execute("DELETE FROM documents WHERE pack_id = ?", (pack_id,))
-            for info in zf.infolist():
-                if not (info.filename.startswith("documents/") and info.filename.endswith(".md")):
-                    continue
-                body = zf.read(info.filename).decode("utf-8-sig", errors="replace")
-                title = Path(info.filename).stem
-                conn.execute(
-                    """
-                    INSERT INTO documents (pack_id, path, title, body)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(pack_id, path) DO UPDATE SET title = excluded.title, body = excluded.body
-                    """,
-                    (pack_id, info.filename, title, body),
-                )
+            for path, body in iter_markdown_documents(zf):
+                _upsert_document(conn, pack_id, path, Path(path).stem, body)
                 count += 1
-            if "cloud/chunks.jsonl" in zf.namelist():
-                for raw_line in zf.read("cloud/chunks.jsonl").decode("utf-8-sig", errors="replace").splitlines():
-                    if not raw_line.strip():
-                        continue
-                    try:
-                        chunk = json.loads(raw_line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(chunk, dict):
-                        continue
-                    chunk_id = str(chunk.get("chunk_id") or chunk.get("id") or "").strip()
-                    body = str(chunk.get("content") or chunk.get("text") or "")
-                    title = str(chunk.get("title") or chunk.get("heading") or chunk_id or "Evidence chunk")
-                    path = f"cloud/chunks.jsonl#{chunk_id}" if chunk_id else f"cloud/chunks.jsonl#{count + 1}"
-                    conn.execute(
-                        """
-                        INSERT INTO documents (pack_id, path, title, body)
-                        VALUES (?, ?, ?, ?)
-                        ON CONFLICT(pack_id, path) DO UPDATE SET title = excluded.title, body = excluded.body
-                        """,
-                        (pack_id, path, title, body),
-                    )
-                    count += 1
+            for chunk in iter_cloud_chunks(zf):
+                # Keep the existing ordinal path for anonymous indexed chunks.
+                path = chunk.path if chunk.id else f"{chunk.path}#{count + 1}"
+                _upsert_document(conn, pack_id, path, chunk.title, chunk.content)
+                count += 1
     return count
 
 
+def _upsert_document(conn: sqlite3.Connection, pack_id: str, path: str, title: str, body: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO documents (pack_id, path, title, body)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(pack_id, path) DO UPDATE SET title = excluded.title, body = excluded.body
+        """,
+        (pack_id, path, title, body),
+    )
+
+
 def _index_graph(conn: sqlite3.Connection, pack: PackFile, pack_id: str) -> dict[str, int]:
-    graph = build_graph_from_pack(pack, max_nodes=5000, max_edges=12000)
+    # The index is the query source of truth, not a visualization sample.
+    graph = build_graph_from_pack(pack, max_nodes=None, max_edges=None)
     with conn:
         for node in graph["nodes"]:
             conn.execute(
@@ -261,18 +241,13 @@ def search_documents(pack_id: str, query: str, limit: int = 8, db_path: Path | N
         score = score_terms(lower + " " + str(row["title"]).lower() + " " + path.lower(), terms)
         if score <= 0:
             continue
-        hit = first_term_hit(lower, terms)
-        if hit < 0:
-            hit = 0
-        start = max(0, hit - 120)
-        end = min(len(body), hit + 260)
         scored.append(
             (
                 score,
                 {
                     "path": path,
                     "title": row["title"],
-                    "snippet": re.sub(r"\s+", " ", body[start:end]).strip(),
+                    "snippet": search_snippet(body, terms),
                     "score": round(score, 3),
                     "source": "sqlite-index",
                     "chunkId": chunk_id,

@@ -4,6 +4,8 @@
 // 노드 상세 다이얼로그를 포함한다.
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { edgePath, indexEdges, neighborhood, visibleNodes } from "./graphModel";
+import type { EdgePath, IndexedEdge } from "./graphModel";
 
 export type OgNode = {
   id: string;
@@ -38,7 +40,7 @@ type SimNode<N> = {
   r: number;
 };
 
-type SimEdge = { a: string; b: string; rel: string };
+type SimEdge = IndexedEdge;
 
 type LegendEntry = { type: string; count: number; color: string };
 
@@ -63,6 +65,7 @@ export type OgController = {
 };
 
 type EngineApi = {
+  setSearch: (value: string) => void;
   setMinDeg: (value: number) => void;
   setHop: (value: number) => void;
   setRep: (value: number) => void;
@@ -93,10 +96,6 @@ const FALLBACK_PALETTE = [
 ];
 const MAX_VISIBLE_DEFAULT = 4000;
 
-function endpointId(value: string | { id: string }): string {
-  return typeof value === "object" ? String(value.id) : String(value);
-}
-
 export function OntologyGraph<N extends OgNode, E extends OgEdge>({
   nodes,
   edges,
@@ -116,9 +115,12 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const engineRef = useRef<EngineApi | null>(null);
+  const callbacksRef = useRef({ onSelectNode, onDetail });
+  callbacksRef.current = { onSelectNode, onDetail };
 
   const [legend, setLegend] = useState<LegendEntry[]>([]);
   const [hiddenTypes, setHiddenTypes] = useState<Set<string>>(new Set());
+  const [search, setSearch] = useState("");
   const [minDeg, setMinDeg] = useState(0);
   const [maxDegSlider, setMaxDegSlider] = useState(20);
   const [hop, setHop] = useState(1);
@@ -126,7 +128,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
   const [link, setLink] = useState(60);
   const [focusOn, setFocusOn] = useState(false);
   const [paused, setPaused] = useState(false);
-  const [stats, setStats] = useState({ shownNodes: 0, shownEdges: 0, totalNodes: 0, totalEdges: 0 });
+  const [stats, setStats] = useState({ shownNodes: 0, shownEdges: 0, totalNodes: 0, totalEdges: 0, capped: false });
   const [controlHost, setControlHost] = useState<HTMLElement | null>(null);
 
   // 필터·물리 패널은 그래프 안이 아니라 왼쪽 사이드바(#graph-sidebar-controls)로 포털
@@ -178,24 +180,12 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       byId.set(id, node);
       simNodes.push(node);
     }
-    const simEdges: SimEdge[] = [];
-    const adj = new Map<string, { id: string; rel: string; dir: string }[]>();
-    for (const node of simNodes) adj.set(node.id, []);
-    for (const edge of edges) {
-      const a = endpointId(edge.source);
-      const b = endpointId(edge.target);
-      if (a === b) continue;
-      const na = byId.get(a);
-      const nb = byId.get(b);
-      if (!na || !nb) continue;
-      const rel = edge.relation ?? "";
-      simEdges.push({ a, b, rel });
-      adj.get(a)!.push({ id: b, rel, dir: "→" });
-      adj.get(b)!.push({ id: a, rel, dir: "←" });
-      na.degree++;
-      nb.degree++;
+    const { links: simEdges, adjacency: adj, degrees } = indexEdges(new Set(byId.keys()), edges);
+    for (const node of simNodes) {
+      node.degree = degrees.get(node.id)!;
+      node.r = 3.5 + Math.min(36, Math.sqrt(node.degree) * 1.6);
     }
-    for (const node of simNodes) node.r = 3.5 + Math.min(36, Math.sqrt(node.degree) * 1.6);
+    const rankedNodes = [...simNodes].sort((a, b) => b.degree - a.degree);
 
     // 골든앵글 나선 초기 배치 — 사전 레이아웃 계산 없이 바로 그리기 시작
     const GA = Math.PI * (3 - Math.sqrt(5));
@@ -211,9 +201,11 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
     let selected: SimNode<N> | null = null;
     let hovered: SimNode<N> | null = null;
     let aiHighlight: Set<string> | null = null; // AI 참조 노드 강조
+    let selectedNeighbors = new Set<string>();
 
     let alpha = 0;
     let engMinDeg = 0;
+    let engSearch = "";
     let engHop = 1;
     let engRep = 1;
     let engLink = 60;
@@ -225,47 +217,36 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
     let H = 0;
     let dpr = 1;
     let disposed = false;
+    let raf = 0;
+    let focusTimer = 0;
+    // Request a frame only while moving or after a visible change. Idle/paused graphs sleep.
+    const invalidate = () => {
+      if (!disposed && !raf) raf = requestAnimationFrame(frame);
+    };
 
     // 대용량 가드: 표시 노드가 한도 이하가 되도록 최소 차수 자동 상향
-    while (engMinDeg < 200 && simNodes.filter((n) => n.degree >= engMinDeg).length > MAX_VISIBLE_DEFAULT) engMinDeg++;
-    // 균일 차수 그래프에서 가드가 오버슈트하면 표시 0개(빈 캔버스)가 되므로 되돌린다
-    while (engMinDeg > 0 && simNodes.filter((n) => n.degree >= engMinDeg).length === 0) engMinDeg--;
+    if (rankedNodes.length > MAX_VISIBLE_DEFAULT) engMinDeg = rankedNodes[MAX_VISIBLE_DEFAULT - 1].degree;
 
     const focusSet = (): Set<string> | null => {
       if (!engFocus || !selected) return null;
-      const set = new Set<string>([selected.id]);
-      let frontier = [selected.id];
-      for (let h = 0; h < engHop; h++) {
-        const next: string[] = [];
-        for (const id of frontier) {
-          for (const nb of adj.get(id) ?? []) {
-            if (!set.has(nb.id)) {
-              set.add(nb.id);
-              next.push(nb.id);
-            }
-          }
-        }
-        frontier = next;
-      }
-      return set;
+      return neighborhood(adj, selected.id, engHop);
     };
 
     const rebuildVisible = () => {
-      const fs = focusSet();
-      vNodes = simNodes.filter(
-        (n) =>
-          (n.degree >= engMinDeg && !typeOff.has(n.type) && (!fs || fs.has(n.id))) ||
-          (aiHighlight !== null && aiHighlight.has(n.id)) ||
-          (selected !== null && n.id === selected.id), // 선택 노드는 필터에 걸려도 항상 표시
-      );
+      const forced = new Set(aiHighlight);
+      if (selected) forced.add(selected.id);
+      const result = visibleNodes(rankedNodes, { minDegree: engMinDeg, hiddenTypes: typeOff, focus: focusSet(), forced, limit: MAX_VISIBLE_DEFAULT, search: engSearch });
+      vNodes = result.nodes;
       const visible = new Set(vNodes.map((n) => n.id));
       vEdges = simEdges.filter((e) => visible.has(e.a) && visible.has(e.b));
-      setStats({ shownNodes: vNodes.length, shownEdges: vEdges.length, totalNodes: simNodes.length, totalEdges: simEdges.length });
+      if (hovered && !visible.has(hovered.id)) hovered = null;
+      setStats({ shownNodes: vNodes.length, shownEdges: vEdges.length, totalNodes: simNodes.length, totalEdges: simEdges.length, capped: result.capped });
       reheat(0.5);
     };
 
     const reheat = (value = 1) => {
       alpha = Math.max(alpha, value);
+      invalidate();
     };
 
     /* ── 물리 (Barnes-Hut + 안정화 가드) ── */
@@ -378,6 +359,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
         n.vy -= n.y * 0.012 * alpha;
       }
       for (const e of vEdges) {
+        if (e.a === e.b) continue; // Reflexive statements are drawn, not used as springs.
         const a = byId.get(e.a)!;
         const b = byId.get(e.b)!;
         const dx = b.x - a.x;
@@ -423,6 +405,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       H = rect.height;
       canvas.width = Math.round(W * dpr);
       canvas.height = Math.round(H * dpr);
+      invalidate();
     };
     const draw = () => {
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -431,69 +414,54 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       ctx.translate(cam.x, cam.y);
       ctx.scale(cam.k, cam.k);
 
-      const highlight = new Set<string>();
-      if (selected) {
-        highlight.add(selected.id);
-        for (const nb of adj.get(selected.id) ?? []) highlight.add(nb.id);
-      }
-
-      ctx.lineWidth = 1 / cam.k;
-      ctx.strokeStyle = selected || aiHighlight ? THEME.edgeDim : THEME.edge;
-      ctx.beginPath();
+      const highlight = selectedNeighbors;
+      const margin = 100 / cam.k;
+      const left = -cam.x / cam.k - margin, right = (W - cam.x) / cam.k + margin;
+      const top = -cam.y / cam.k - margin, bottom = (H - cam.y) / cam.k + margin;
+      const onScreen = (n: SimNode<N>) => n.x + n.r >= left && n.x - n.r <= right && n.y + n.r >= top && n.y - n.r <= bottom;
+      const batches: { edge: SimEdge; path: EdgePath }[][] = [[], [], []];
       for (const e of vEdges) {
-        if (selected && (e.a === selected.id || e.b === selected.id)) continue;
-        if (aiHighlight && aiHighlight.has(e.a) && aiHighlight.has(e.b)) continue;
-        const a = byId.get(e.a)!;
-        const b = byId.get(e.b)!;
-        ctx.moveTo(a.x, a.y);
-        ctx.lineTo(b.x, b.y);
+        const path = edgePath(byId.get(e.a)!, byId.get(e.b)!, e);
+        const c2 = path.control2 ?? path.control;
+        if (Math.max(path.start.x, path.end.x, path.control.x, c2.x) < left || Math.min(path.start.x, path.end.x, path.control.x, c2.x) > right ||
+          Math.max(path.start.y, path.end.y, path.control.y, c2.y) < top || Math.min(path.start.y, path.end.y, path.control.y, c2.y) > bottom) continue;
+        const batch = selected && (e.a === selected.id || e.b === selected.id) ? 2 : aiHighlight?.has(e.a) && aiHighlight.has(e.b) ? 1 : 0;
+        batches[batch].push({ edge: e, path });
       }
-      ctx.stroke();
-      if (aiHighlight) {
-        // AI 참조 노드 사이의 엣지 — 앰버 강조
-        ctx.strokeStyle = "rgba(192, 153, 14, 0.6)";
-        ctx.lineWidth = 1.6 / cam.k;
+      for (let i = 0; i < batches.length; i++) {
+        ctx.strokeStyle = i === 2 ? THEME.sel : i === 1 ? "rgba(192, 153, 14, 0.6)" : selected || aiHighlight ? THEME.edgeDim : THEME.edge;
+        ctx.lineWidth = (i === 2 ? 1.8 : i === 1 ? 1.6 : 1) / cam.k;
         ctx.beginPath();
-        for (const e of vEdges) {
-          if (!aiHighlight.has(e.a) || !aiHighlight.has(e.b)) continue;
-          const a = byId.get(e.a)!;
-          const b = byId.get(e.b)!;
-          ctx.moveTo(a.x, a.y);
-          ctx.lineTo(b.x, b.y);
-        }
-        ctx.stroke();
-        ctx.lineWidth = 1 / cam.k;
-      }
-      if (selected) {
-        const lit: SimEdge[] = [];
-        ctx.strokeStyle = THEME.sel;
-        ctx.globalAlpha = 0.85;
-        ctx.lineWidth = 1.8 / cam.k;
-        ctx.beginPath();
-        for (const e of vEdges) {
-          if (e.a !== selected.id && e.b !== selected.id) continue;
-          const a = byId.get(e.a)!;
-          const b = byId.get(e.b)!;
-          ctx.moveTo(a.x, a.y);
-          ctx.lineTo(b.x, b.y);
-          lit.push(e);
-        }
-        ctx.stroke();
-        ctx.globalAlpha = 1;
-        ctx.lineWidth = 1 / cam.k;
-        if (cam.k > 0.5) {
-          ctx.fillStyle = THEME.rel;
-          ctx.font = `${10 / cam.k}px sans-serif`;
-          ctx.textAlign = "center";
-          for (const e of lit) {
-            if (!e.rel) continue;
-            const a = byId.get(e.a)!;
-            const b = byId.get(e.b)!;
-            ctx.fillText(e.rel, (a.x + b.x) / 2, (a.y + b.y) / 2 - 3 / cam.k);
+        for (const { path: p } of batches[i]) {
+          ctx.moveTo(p.start.x, p.start.y);
+          if (p.control2) ctx.bezierCurveTo(p.control.x, p.control.y, p.control2.x, p.control2.y, p.end.x, p.end.y);
+          else ctx.quadraticCurveTo(p.control.x, p.control.y, p.end.x, p.end.y);
+          // Keep an overview uncluttered; emphasized predicates always show direction.
+          if (cam.k >= 0.2 || i > 0) {
+            const arrow = Math.min(8 / cam.k, 12);
+            ctx.moveTo(p.end.x - Math.cos(p.angle - 0.45) * arrow, p.end.y - Math.sin(p.angle - 0.45) * arrow);
+            ctx.lineTo(p.end.x, p.end.y);
+            ctx.lineTo(p.end.x - Math.cos(p.angle + 0.45) * arrow, p.end.y - Math.sin(p.angle + 0.45) * arrow);
           }
+        }
+        ctx.stroke();
+      }
+      if (selected && cam.k > 0.5) {
+        ctx.fillStyle = THEME.rel;
+        ctx.font = `${10 / cam.k}px sans-serif`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "bottom";
+        // High-degree hubs keep the text pass bounded; all predicates remain in the inspector.
+        for (const { edge, path } of batches[2].slice(0, 200)) {
+          if (!edge.rel) continue;
+          ctx.strokeStyle = THEME.halo;
+          ctx.lineWidth = 3 / cam.k;
+          ctx.strokeText(edge.rel, path.label.x, path.label.y - 3 / cam.k);
+          ctx.fillText(edge.rel, path.label.x, path.label.y - 3 / cam.k);
         }
       }
       for (const n of vNodes) {
+        if (!onScreen(n)) continue;
         const isSelHl = highlight.has(n.id);
         const isAiHl = aiHighlight !== null && aiHighlight.has(n.id);
         let nodeAlpha = 1;
@@ -525,10 +493,12 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       let labelBudget = 350;
       const aiLabelable = aiHighlight !== null && aiHighlight.size <= 60;
       for (const n of vNodes) {
+        if (!onScreen(n)) continue;
         const isHl = highlight.has(n.id) || hovered === n || (aiLabelable && aiHighlight!.has(n.id));
-        const show = isHl || (cam.k * n.r > 5 && labelBudget > 0);
+        const mustShow = n === selected || n === hovered || (aiLabelable && aiHighlight!.has(n.id));
+        const show = mustShow || (labelBudget > 0 && (isHl || cam.k * n.r > 5));
         if (!show) continue;
-        if (!isHl) labelBudget--;
+        if (!mustShow) labelBudget--;
         let fsScreen = Math.max(10, Math.min(15, n.r * 1.4)) * Math.min(cam.k, 1.4);
         if (isHl) fsScreen = Math.max(fsScreen, 11);
         const fs = fsScreen / cam.k;
@@ -543,12 +513,12 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
         ctx.globalAlpha = 1;
       }
     };
-    let raf = 0;
     const frame = () => {
+      raf = 0;
       if (disposed) return;
       tick();
       draw();
-      raf = requestAnimationFrame(frame);
+      if (!engPaused && alpha >= 0.003 && vNodes.length) invalidate();
     };
 
     /* ── 카메라 · 인터랙션 ── */
@@ -573,15 +543,16 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       if (!ns.length || !W || !H) return;
       let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
       for (const n of ns) {
-        x0 = Math.min(x0, n.x);
-        x1 = Math.max(x1, n.x);
-        y0 = Math.min(y0, n.y);
-        y1 = Math.max(y1, n.y);
+        x0 = Math.min(x0, n.x - n.r);
+        x1 = Math.max(x1, n.x + n.r);
+        y0 = Math.min(y0, n.y - n.r);
+        y1 = Math.max(y1, n.y + n.r);
       }
       const pad = 70;
-      cam.k = Math.min(2.5, Math.min((W - pad * 2) / Math.max(x1 - x0, 10), (H - pad * 2) / Math.max(y1 - y0, 10)));
+      cam.k = Math.max(0.001, Math.min(2.5, Math.max(W - pad * 2, W * 0.2) / Math.max(x1 - x0, 10), Math.max(H - pad * 2, H * 0.2) / Math.max(y1 - y0, 10)));
       cam.x = W / 2 - ((x0 + x1) / 2) * cam.k;
       cam.y = H / 2 - ((y0 + y1) / 2) * cam.k;
+      invalidate();
     };
     const fitView = () => fitTo(vNodes);
     const applyHighlight = (ids: string[] | null) => {
@@ -596,6 +567,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       cam.k = Math.max(cam.k, 1.1);
       cam.x = W / 2 - n.x * cam.k;
       cam.y = H / 2 - n.y * cam.k;
+      invalidate();
     };
 
     const buildDetail = (node: SimNode<N>): OgDetail<N> => {
@@ -625,14 +597,12 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       };
     };
     const select = (node: SimNode<N> | null) => {
-      const previous = selected;
       selected = node;
-      if (engFocus || (node && !vNodes.some((v) => v.id === node.id)) || (previous && !node)) {
-        // 필터에 숨겨진 노드 선택(이웃 점프) 시 강제 표시를 위해 재계산
-        rebuildVisible();
-      }
-      onDetail?.(node ? buildDetail(node) : null);
-      onSelectNode?.(node ? node.input : null);
+      selectedNeighbors = node ? neighborhood(adj, node.id, 1) : new Set();
+      // Recompute on every selection: the previous forced node may need hiding again.
+      rebuildVisible();
+      callbacksRef.current.onDetail?.(node ? buildDetail(node) : null);
+      callbacksRef.current.onSelectNode?.(node ? node.input : null);
     };
 
     const local = (ev: PointerEvent | WheelEvent | MouseEvent) => {
@@ -644,7 +614,12 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
     let moved = false;
     let px = 0;
     let py = 0;
+    let startX = 0;
+    let startY = 0;
+    let pointerId: number | null = null;
     const onPointerDown = (ev: PointerEvent) => {
+      if (ev.button !== 0 || pointerId !== null) return;
+      pointerId = ev.pointerId;
       try {
         canvas.setPointerCapture(ev.pointerId);
       } catch {
@@ -653,20 +628,27 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       const p = local(ev);
       px = p.x;
       py = p.y;
+      startX = p.x;
+      startY = p.y;
       moved = false;
       dragNode = nodeAt(p.x, p.y);
       panning = !dragNode;
       canvas.style.cursor = "grabbing";
     };
     const onPointerMove = (ev: PointerEvent) => {
+      if (pointerId !== null && ev.pointerId !== pointerId) return;
       const p = local(ev);
       const dx = p.x - px;
       const dy = p.y - py;
-      if ((dragNode || panning) && Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+      if ((dragNode || panning) && Math.hypot(p.x - startX, p.y - startY) > 3) moved = true;
       if (dragNode) {
         const w = toWorld(p.x, p.y);
         dragNode.fx = w.x;
         dragNode.fy = w.y;
+        // Drag remains responsive with the simulation paused.
+        dragNode.x = w.x;
+        dragNode.y = w.y;
+        dragNode.vx = dragNode.vy = 0;
         reheat(0.35);
       } else if (panning) {
         cam.x += dx;
@@ -677,8 +659,10 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       }
       px = p.x;
       py = p.y;
+      invalidate();
     };
     const onPointerUp = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId) return;
       canvas.style.cursor = "grab";
       if (dragNode) dragNode.fx = dragNode.fy = null;
       if (!moved) {
@@ -687,6 +671,23 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       }
       dragNode = null;
       panning = false;
+      pointerId = null;
+      if (canvas.hasPointerCapture(ev.pointerId)) canvas.releasePointerCapture(ev.pointerId);
+      invalidate();
+    };
+    const onPointerCancel = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId) return;
+      if (dragNode) dragNode.fx = dragNode.fy = null;
+      dragNode = null;
+      panning = false;
+      pointerId = null;
+      canvas.style.cursor = "grab";
+      invalidate();
+    };
+    const onPointerLeave = () => {
+      if (pointerId !== null) return;
+      hovered = null;
+      invalidate();
     };
     const onWheel = (ev: WheelEvent) => {
       ev.preventDefault();
@@ -697,11 +698,15 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       cam.x = p.x - w.x * k2;
       cam.y = p.y - w.y * k2;
       cam.k = k2;
+      invalidate();
     };
 
     canvas.addEventListener("pointerdown", onPointerDown);
     canvas.addEventListener("pointermove", onPointerMove);
     canvas.addEventListener("pointerup", onPointerUp);
+    canvas.addEventListener("pointercancel", onPointerCancel);
+    canvas.addEventListener("lostpointercapture", onPointerCancel);
+    canvas.addEventListener("pointerleave", onPointerLeave);
     canvas.addEventListener("wheel", onWheel, { passive: false });
     const observer = new ResizeObserver(() => {
       resize();
@@ -710,6 +715,13 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
 
     /* ── React 패널 ↔ 엔진 API ── */
     engineRef.current = {
+      setSearch: (value) => {
+        engSearch = value;
+        rebuildVisible();
+        fitView();
+        window.clearTimeout(focusTimer);
+        focusTimer = window.setTimeout(fitView, 400);
+      },
       setMinDeg: (value) => {
         engMinDeg = value;
         rebuildVisible();
@@ -729,11 +741,13 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       setFocus: (on) => {
         engFocus = on;
         rebuildVisible();
-        if (on && selected) setTimeout(fitView, 400);
+        window.clearTimeout(focusTimer);
+        if (on && selected) focusTimer = window.setTimeout(fitView, 400);
       },
       setPaused: (on) => {
         engPaused = on;
         if (!on) reheat(0.3);
+        else invalidate();
       },
       toggleType: (type) => {
         if (typeOff.has(type)) typeOff.delete(type);
@@ -758,13 +772,16 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
     }
     setLegend([...counts.entries()].map(([type, v]) => ({ type, count: v.count, color: v.color })).sort((a, b) => b.count - a.count));
     setHiddenTypes(new Set());
+    setSearch("");
     setMinDeg(engMinDeg);
     setMaxDegSlider(Math.max(20, engMinDeg + 10));
     setHop(1);
     setFocusOn(false);
     setPaused(false);
-    onDetail?.(null);
-    onSelectNode?.(null); // 그래프 교체 시 부모의 selectedNode(AI 컨텍스트)도 함께 초기화
+    setRep(1);
+    setLink(60);
+    callbacksRef.current.onDetail?.(null);
+    callbacksRef.current.onSelectNode?.(null); // 그래프 교체 시 부모의 selectedNode(AI 컨텍스트)도 함께 초기화
     if (controllerRef)
       controllerRef.current = {
         selectById: (id) => engineRef.current?.selectById(id),
@@ -777,7 +794,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
     rebuildVisible();
     reheat(1);
     const fitTimer = window.setTimeout(fitView, 600);
-    raf = requestAnimationFrame(frame);
+    invalidate();
     // 헤드리스 검증/e2e용 디버그 훅 — 숨김 탭에서도 수동으로 프레임을 돌릴 수 있다
     (container as HTMLDivElement & { __og?: unknown }).__og = {
       pump: (frames = 1) => {
@@ -785,7 +802,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
         draw();
       },
       fit: fitView,
-      stats: () => ({ visible: vNodes.length, edges: vEdges.length, alpha, k: cam.k }),
+      stats: () => ({ visible: vNodes.length, edges: vEdges.length, alpha, k: cam.k, framePending: Boolean(raf), paused: engPaused }),
       select: (id: string | null) => {
         select(id ? byId.get(id) ?? null : null);
         draw();
@@ -801,13 +818,18 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       disposed = true;
       cancelAnimationFrame(raf);
       window.clearTimeout(fitTimer);
+      window.clearTimeout(focusTimer);
       observer.disconnect();
       canvas.removeEventListener("pointerdown", onPointerDown);
       canvas.removeEventListener("pointermove", onPointerMove);
       canvas.removeEventListener("pointerup", onPointerUp);
+      canvas.removeEventListener("pointercancel", onPointerCancel);
+      canvas.removeEventListener("lostpointercapture", onPointerCancel);
+      canvas.removeEventListener("pointerleave", onPointerLeave);
       canvas.removeEventListener("wheel", onWheel);
       engineRef.current = null;
       if (controllerRef) controllerRef.current = null;
+      delete (container as HTMLDivElement & { __og?: unknown }).__og;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodes, edges]);
@@ -817,6 +839,21 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
   const controlsPanel = (
     <aside className={controlHost ? "og-panel og-controls in-sidebar" : "og-panel og-controls"} aria-label="필터 · 물리">
       <div className="og-panel-title">필터 · 물리</div>
+      <label>
+        <span>노드 검색 (이름·ID)</span>
+        <input
+          type="search"
+          value={search}
+          placeholder="로드된 노드에서 검색"
+          title="차수·타입·포커스 필터도 함께 적용됩니다. 선택·강조 노드는 계속 표시됩니다."
+          style={{ height: 30, padding: "4px 6px", boxSizing: "border-box" }}
+          onChange={(ev) => {
+            const value = ev.target.value;
+            setSearch(value);
+            engine()?.setSearch(value);
+          }}
+        />
+      </label>
       <label>
         <span>최소 차수 (degree)</span>
         <strong>{minDeg}</strong>
@@ -945,6 +982,7 @@ export function OntologyGraph<N extends OgNode, E extends OgEdge>({
       <div className="og-panel og-stats">
         노드 <strong>{stats.shownNodes.toLocaleString()}</strong> / {stats.totalNodes.toLocaleString()} · 엣지{" "}
         <strong>{stats.shownEdges.toLocaleString()}</strong> / {stats.totalEdges.toLocaleString()}
+        {stats.capped ? <em className="og-stats-truncated"> · 표시 한도 {MAX_VISIBLE_DEFAULT.toLocaleString()}개 (선택·강조 노드 우선)</em> : null}
         {serverStats && (serverStats.totalNodes > stats.totalNodes || serverStats.totalEdges > stats.totalEdges) ? (
           <em className="og-stats-truncated">
             {" "}· 서버 전체 {serverStats.totalNodes.toLocaleString()} / {serverStats.totalEdges.toLocaleString()} 중 일부만 로드됨
