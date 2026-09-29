@@ -209,6 +209,39 @@ def test_sqlite_index_is_complete_beyond_old_visualization_caps(tmp_path):
         conn.close()
 
 
+@pytest.mark.parametrize("node_file", [True, False])
+def test_index_preserves_cross_pack_edges_in_relationship_only_shards(tmp_path, node_file):
+    files = {"graph/edges.jsonl": [
+        {"id": "external", "source": "other:a", "target": "other:b", "relation": "contains"},
+        {"id": "invalid", "source": "", "target": "other:b"},
+    ]}
+    if node_file:
+        files["graph/nodes.jsonl"] = []
+    pack = make_pack(tmp_path, files)
+    # Drawing a pack alone still requires visible endpoints.
+    assert pack_index.build_graph_from_pack(pack)["edges"] == []
+    conn = store.connect(tmp_path / "index.sqlite3")
+    try:
+        store.init_db(conn)
+        result = store.index_pack(conn, pack)
+        assert result["nodes"] == 0
+        assert result["edges"] == 1
+        row = conn.execute("SELECT id, source, target FROM edges").fetchone()
+        assert tuple(row) == ("external", "other:a", "other:b")
+    finally:
+        conn.close()
+
+
+def test_producer_index_preserves_external_assertions(tmp_path):
+    pack = make_pack(tmp_path, {
+        "backdata/jsonl/modules.jsonl": [{"id": "a"}],
+        "backdata/jsonl/edges.jsonl": [{"id": "external", "from": "a", "to": "other:b"}],
+    })
+    assert pack_index.build_graph_from_pack(pack)["edges"] == []
+    graph = pack_index.build_graph_from_pack(pack, None, None, include_external_edges=True)
+    assert [e["id"] for e in graph["edges"]] == ["external"]
+
+
 @pytest.fixture
 def tail_match_pack(tmp_path, monkeypatch):
     pack = make_pack(tmp_path, {

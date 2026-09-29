@@ -142,7 +142,9 @@ def _upsert_document(conn: sqlite3.Connection, pack_id: str, path: str, title: s
 
 def _index_graph(conn: sqlite3.Connection, pack: PackFile, pack_id: str) -> dict[str, int]:
     # The index is the query source of truth, not a visualization sample.
-    graph = build_graph_from_pack(pack, max_nodes=None, max_edges=None)
+    # Relationship-only shards may reference nodes owned by another pack.
+    # Preserve those assertions in storage; only visualization filters endpoints.
+    graph = build_graph_from_pack(pack, max_nodes=None, max_edges=None, include_external_edges=True)
     with conn:
         for node in graph["nodes"]:
             conn.execute(

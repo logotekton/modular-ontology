@@ -1257,7 +1257,10 @@ def edge_endpoint_id(endpoint: Any) -> str:
     return "" if endpoint is None else str(endpoint)
 
 
-def build_graph_from_pack(pack: PackFile, max_nodes: int | None = 900, max_edges: int | None = 1600) -> dict[str, Any]:
+def build_graph_from_pack(
+    pack: PackFile, max_nodes: int | None = 900, max_edges: int | None = 1600,
+    *, include_external_edges: bool = False,
+) -> dict[str, Any]:
     max_nodes = None if max_nodes is None else max(0, max_nodes)
     max_edges = None if max_edges is None else max(0, max_edges)
     summary = summarize_pack(pack)
@@ -1270,7 +1273,7 @@ def build_graph_from_pack(pack: PackFile, max_nodes: int | None = 900, max_edges
         entrypoints = summary.get("entrypoints") if isinstance(summary.get("entrypoints"), dict) else {}
         nodes_path = entrypoints.get("nodes", "graph/nodes.jsonl")
         edges_path = entrypoints.get("edges", "graph/edges.jsonl")
-        if nodes_path in zf.namelist():
+        if nodes_path in zf.namelist() or edges_path in zf.namelist():
             nodes_complete = True
             for obj in _iter_jsonl(zf, nodes_path):
                 if max_nodes is not None and len(nodes) >= max_nodes:
@@ -1285,14 +1288,16 @@ def build_graph_from_pack(pack: PackFile, max_nodes: int | None = 900, max_edges
             if nodes_complete:
                 total_nodes = len(nodes)
             seen_edge_ids: set[str] = set()
-            if nodes and (max_edges is None or max_edges > 0):
+            if (nodes or include_external_edges) and (max_edges is None or max_edges > 0):
                 edges_complete = True
                 for obj in _iter_jsonl(zf, edges_path):
                     if not isinstance(obj, dict):
                         continue
                     source = edge_endpoint_id(obj.get("source", ""))
                     target = edge_endpoint_id(obj.get("target", ""))
-                    if source not in nodes or target not in nodes:
+                    if not source or not target:
+                        continue
+                    if not include_external_edges and (source not in nodes or target not in nodes):
                         continue
                     edge = _edge(source, target, str(obj.get("relation") or "related_to"), summary["id"], obj)
                     if edge["id"] in seen_edge_ids:
@@ -1307,6 +1312,7 @@ def build_graph_from_pack(pack: PackFile, max_nodes: int | None = 900, max_edges
         else:
             total_nodes, total_edges = _build_producer_graph(
                 zf, summary["id"], nodes, edges, max_nodes, max_edges, total_edges_hint=total_edges,
+                include_external_edges=include_external_edges,
             )
 
     return {
@@ -1326,6 +1332,7 @@ def _build_producer_graph(
     max_edges: int | None,
     *,
     total_edges_hint: int = 0,
+    include_external_edges: bool = False,
 ) -> tuple[int, int]:
     node_sources = [
         ("backdata/jsonl/module_types.jsonl", "ModuleType"),
@@ -1371,14 +1378,16 @@ def _build_producer_graph(
 
     def add_edge(source: str, target: str, relation: str, raw: dict[str, Any] | None = None) -> None:
         nonlocal total_edges
-        if source not in all_node_ids or target not in all_node_ids:
+        if not source or not target:
+            return
+        if not include_external_edges and (source not in all_node_ids or target not in all_node_ids):
             return
         edge = _edge(source, target, relation, pack_id, raw)
         if edge["id"] in seen_edge_ids:
             return
         seen_edge_ids.add(edge["id"])
         total_edges += 1
-        if source in nodes and target in nodes and (max_edges is None or len(edges) < max_edges):
+        if (include_external_edges or (source in nodes and target in nodes)) and (max_edges is None or len(edges) < max_edges):
             edges.append(edge)
 
     for obj in _iter_jsonl(zf, "backdata/jsonl/edges.jsonl"):
@@ -1387,7 +1396,7 @@ def _build_producer_graph(
         source = edge_endpoint_id(obj.get("from") or obj.get("source") or "")
         target = edge_endpoint_id(obj.get("to") or obj.get("target") or "")
         relation = str(obj.get("relation") or "related_to")
-        if source in all_node_ids and target in all_node_ids:
+        if include_external_edges or (source in all_node_ids and target in all_node_ids):
             explicit_relations.add((source, target, relation))
             add_edge(source, target, relation, obj)
     for source, target, relation in inferred:
